@@ -1,0 +1,10 @@
+build/
+*.o
+*.a
+*.so
+*.ath
+/models/
+tests/golden/data/
+docs/results/raw/
+__pycache__/
+.venv/
