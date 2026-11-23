@@ -4,8 +4,8 @@ Maps each article and lesson of the course to the athanor code that implements i
 
 | # | Article / lesson | Step | Code | Status |
 | --- | --- | --- | --- | --- |
-| 1 | Reading a model from disk: safetensors, mmap and zero-copy | 1 | `src/core/file.c`, `safetensors.c` | planned |
-| 2 | What is inside a Qwen checkpoint | 1–2 | `tools/athanor.c inspect`, `src/models/qwen35/weights.c` | planned |
+| 1 | Reading a model from disk: safetensors, mmap and zero-copy | 1 | `src/core/file.c`, `safetensors.c`, `json.c`, `arena.c` | code landed (step 1) |
+| 2 | What is inside a Qwen checkpoint | 1–2 | `tools/inspect.c`, `src/models/qwen35/weights.c`; tensor groups in `docs/contract/qwen35-0.8b.md` | inspect landed (step 1); roles in step 2 |
 | 3 | The forward pass in plain C: embeddings, norms, attention, MLP | 3–4 | `src/ops/*.c`, `src/models/qwen35/forward.c` | planned |
 | 4 | Linear attention and Gated DeltaNet, from the recurrence | 3–4 | `src/ops/gdn.c` | planned |
 | 5 | Byte-level BPE from scratch | 5 | `src/text/bpe.c` | planned |

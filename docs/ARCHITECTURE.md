@@ -113,7 +113,7 @@ athanor/
 ├── Makefile                     targets: cpu (default), cuda, hip, test, clean; FAMILIES=qwen35
 ├── include/athanor.h            public C API
 ├── src/
-│   ├── core/      base.h arena.c tensor.c file.c json.c safetensors.c threads.c rng.c
+│   ├── core/      base.c arena.c tensor.c file.c json.c safetensors.c threads.c rng.c (each with its .h)
 │   ├── backend/   backend.h compat.h cpu.c gpu.cu
 │   ├── ops/       ops.h; per op a .c reference and a .cu kernel:
 │   │              norm rope act embed matmul attn gdn conv moe sample quant
@@ -126,8 +126,8 @@ athanor/
 │   ├── ablit/     capture.c direction.c edit.c search.c eval.c
 │   ├── train/     loop.c optim.c lora.c hotcold.c data.c planner.c ckpt.c
 │   └── net/       http.c api.c
-├── tools/         athanor.c (dispatch), dev/ (Python helpers, development only)
-├── tests/         test_core.c test_ops.c test_model.c ... golden/dump.py
+├── tools/         athanor.c (dispatch), one file per subcommand (inspect.c, ...), dev/ (development helpers)
+├── tests/         test.h (runner) test_core.c test_ops.c test_model.c ... golden/dump.py
 └── docs/          ARCHITECTURE.md PLAN.md STATUS.md MODELS.md BENCHMARKS.md contract/ program/ results/
 ```
 

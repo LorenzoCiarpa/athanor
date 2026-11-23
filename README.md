@@ -9,7 +9,7 @@ It follows the thesis of [DwarfStar](https://github.com/antirez/ds4), [Strata](h
 
 ## Status
 
-Pre-alpha. Design done, code starting at step 1. Live status: [docs/STATUS.md](docs/STATUS.md).
+Pre-alpha. Step 1 done: the core library and `athanor inspect` read a checkpoint without copying it (CPU only, no model math yet). Live status: [docs/STATUS.md](docs/STATUS.md).
 
 ## What it does
 
