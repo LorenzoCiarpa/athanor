@@ -2,11 +2,15 @@
 #
 #   make            CPU build (default), output in build/
 #   make test       build and run the test suites
+#   make check-alloc  verify that inspect allocates only through arenas
 #   make DEBUG=1    -O0 -g, ATH_ASSERT enabled, address and UB sanitizers
 #   make cuda/hip   GPU builds (arrive in step 6 and step 11)
 #   make clean
 
 FAMILIES ?= qwen35
+# Checkpoint used by the tests that need real weights (skipped if absent).
+ATH_MODEL_DIR ?= models/Qwen3.5-0.8B
+export ATH_MODEL_DIR
 CC       ?= cc
 ifeq ($(DEBUG),1)
 BUILD    ?= build/debug
@@ -33,10 +37,11 @@ CORE_SRC := $(wildcard src/core/*.c)
 LIB_SRC  := $(CORE_SRC) $(FAMILY_SRC)
 LIB_OBJ  := $(LIB_SRC:%.c=$(BUILD)/obj/%.o)
 
-TOOL_OBJ := $(BUILD)/obj/tools/athanor.o
+TOOL_SRC := $(wildcard tools/*.c)
+TOOL_OBJ := $(TOOL_SRC:%.c=$(BUILD)/obj/%.o)
 TESTS    := $(BUILD)/test_core
 
-.PHONY: all cpu cuda hip test clean
+.PHONY: all cpu cuda hip test check-alloc clean
 .SECONDARY:
 .DEFAULT_GOAL := cpu
 
@@ -53,8 +58,20 @@ $(BUILD)/obj/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-test: $(TESTS)
+test: $(TESTS) $(BUILD)/athanor
 	@set -e; for t in $(TESTS); do echo "== $$t"; ./$$t; done
+	@if [ -d "$(ATH_MODEL_DIR)" ]; then \
+		echo "== athanor inspect $(ATH_MODEL_DIR)"; \
+		./$(BUILD)/athanor inspect "$(ATH_MODEL_DIR)" > /dev/null && echo "ok"; \
+	else echo "== athanor inspect: skipped, no $(ATH_MODEL_DIR)"; fi
+ifneq ($(DEBUG),1)
+	@if [ -d "$(ATH_MODEL_DIR)" ]; then $(MAKE) --no-print-directory check-alloc; fi
+endif
+
+# Fails if `athanor inspect` allocates heap memory outside the arenas.
+check-alloc: $(BUILD)/athanor
+	@echo "== heap allocations of athanor inspect"
+	@sh tools/dev/check_alloc.sh $(BUILD)/athanor inspect "$(ATH_MODEL_DIR)"
 
 cuda:
 	@echo "make cuda: the CUDA backend arrives in step 6 (docs/PLAN.md section 4)" >&2; exit 1
