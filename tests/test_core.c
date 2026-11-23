@@ -9,6 +9,7 @@
 #include "core/arena.h"
 #include "core/file.h"
 #include "core/json.h"
+#include "core/safetensors.h"
 #include "core/tensor.h"
 
 #include <stdint.h>
@@ -42,6 +43,9 @@ static bool tmpdir_write(tmpdir *d, const char *name, const void *data, size_t n
         return false;
     bool ok = fwrite(data, 1, n, f) == n;
     ok = (fclose(f) == 0) && ok;
+    for (int i = 0; ok && i < d->n_files; i++)
+        if (strcmp(d->files[i], name) == 0)
+            return true;
     if (ok && d->n_files < (int)ATH_ARRAY_LEN(d->files)) {
         snprintf(d->files[d->n_files], sizeof d->files[0], "%s", name);
         d->n_files++;
@@ -629,6 +633,305 @@ ATH_TEST(tensor_init_and_views)
                       ATH_ERR_UNSUPPORTED);
 }
 
+/* ---- safetensors ---------------------------------------------------------- */
+
+/* Write a safetensors file: 8-byte little-endian header length, the header
+ * padded with spaces to a multiple of 8 (as the reference writer does), data. */
+static bool write_st(tmpdir *d, const char *name, const char *header, const void *data, size_t n)
+{
+    unsigned char buf[4096];
+    size_t hl = strlen(header), padded = (hl + 7) & ~(size_t)7;
+    if (8 + padded + n > sizeof buf)
+        return false;
+    for (int i = 0; i < 8; i++)
+        buf[i] = (unsigned char)((uint64_t)padded >> (8 * i));
+    memcpy(buf + 8, header, hl);
+    memset(buf + 8 + hl, ' ', padded - hl);
+    if (n)
+        memcpy(buf + 8 + padded, data, n);
+    return tmpdir_write(d, name, buf, 8 + padded + n);
+}
+
+ATH_TEST(safetensors_name_order)
+{
+    ATH_EXPECT(ath_safetensors_name_cmp("layers.2.w", "layers.10.w") < 0);
+    ATH_EXPECT(ath_safetensors_name_cmp("layers.10.w", "layers.2.w") > 0);
+    ATH_EXPECT(ath_safetensors_name_cmp("layers.10.a", "layers.10.b") < 0);
+    ATH_EXPECT(ath_safetensors_name_cmp("a", "a") == 0);
+    ATH_EXPECT(ath_safetensors_name_cmp("a", "a.b") < 0);
+    ATH_EXPECT(ath_safetensors_name_cmp("x9", "x10") < 0);
+    ATH_EXPECT(ath_safetensors_name_cmp("x010", "x9") > 0);
+    ATH_EXPECT(ath_safetensors_name_cmp("x01", "x1") != 0);   /* total order */
+    ATH_EXPECT(ath_safetensors_name_cmp("x01", "x1") == -ath_safetensors_name_cmp("x1", "x01"));
+    ATH_EXPECT(ath_safetensors_name_cmp("model-00002-of-00010", "model-00010-of-00010") < 0);
+}
+
+ATH_TEST(safetensors_single_file)
+{
+    tmpdir d;
+    ATH_REQUIRE(tmpdir_make(&d));
+    unsigned char data[43];
+    float f[6] = {0, 1, 2, 3, 4, 5};
+    uint16_t bf[4] = {0x3f80, 0x4000, 0xbf80, 0x0000}; /* 1, 2, -1, 0 in bf16 */
+    int64_t scalar = -42;
+    memcpy(data, f, 24);
+    memcpy(data + 24, bf, 8);
+    memcpy(data + 32, &scalar, 8);
+    data[40] = 7; data[41] = 8; data[42] = 9;
+    const char *header =
+        "{\"__metadata__\":{\"format\":\"pt\"},"
+        "\"layers.10.w\":{\"dtype\":\"F32\",\"shape\":[2,3],\"data_offsets\":[0,24]},"
+        "\"layers.2.w\":{\"dtype\":\"BF16\",\"shape\":[4],\"data_offsets\":[24,32]},"
+        "\"emb\":{\"dtype\":\"I64\",\"shape\":[],\"data_offsets\":[32,40]},"
+        "\"empty\":{\"dtype\":\"U8\",\"shape\":[0,3],\"data_offsets\":[40,40]},"
+        "\"b\":{\"dtype\":\"U8\",\"shape\":[3],\"data_offsets\":[40,43]}}";
+    ATH_REQUIRE(write_st(&d, "model.safetensors", header, data, sizeof data));
+
+    ath_arena a;
+    ath_arena_init(&a, 0);
+    ath_safetensors st;
+    ATH_REQUIRE_OK(ath_safetensors_open(&st, &a, d.path));
+    ATH_EXPECT_EQ_U64(st.n_shards, 1);
+    ATH_EXPECT_EQ_U64(st.n_tensors, 5);
+    ATH_EXPECT_EQ_U64(st.tensor_bytes, 43);
+    ATH_EXPECT_EQ_U64(st.data_bytes, 43);
+    ATH_EXPECT_EQ_INT(st.index_total_size, -1);
+    ATH_EXPECT_EQ_U64(st.shards[0].header_bytes % 8, 0);
+    ATH_EXPECT_EQ_U64(st.shards[0].data_offset, 8 + st.shards[0].header_bytes);
+    const char *fmt;
+    ATH_EXPECT_OK(ath_json_to_str(ath_json_path(st.shards[0].header, "__metadata__.format"), &fmt, NULL));
+    ATH_EXPECT_STR_EQ(fmt, "pt");
+
+    const char *order[] = {"b", "emb", "empty", "layers.2.w", "layers.10.w"};
+    for (uint32_t i = 0; i < st.n_tensors && i < 5; i++)
+        ATH_EXPECT_STR_EQ(st.tensors[i].name, order[i]);
+
+    const ath_safetensors_entry *e = ath_safetensors_find(&st, "layers.10.w");
+    ATH_REQUIRE(e != NULL);
+    ATH_EXPECT(e->t.dtype == ATH_DTYPE_F32 && e->t.ndim == 2);
+    ATH_EXPECT(e->t.shape[0] == 2 && e->t.shape[1] == 3);
+    ATH_EXPECT(e->t.tier == ATH_TIER_RAM);
+    /* zero-copy: the view points into the mapping, at data_offset + begin */
+    ATH_EXPECT((const char *)e->t.data == (const char *)st.shards[0].file.data + st.shards[0].data_offset);
+    float row1[3];
+    memcpy(row1, (const float *)e->t.data + e->t.stride[0], sizeof row1);
+    ATH_EXPECT(row1[0] == 3.0f && row1[2] == 5.0f);
+
+    e = ath_safetensors_find(&st, "layers.2.w");
+    ATH_REQUIRE(e != NULL);
+    ATH_EXPECT(e->t.dtype == ATH_DTYPE_BF16 && e->begin == 24 && e->end == 32);
+    ATH_EXPECT(((const uint16_t *)e->t.data)[2] == 0xbf80);
+    e = ath_safetensors_find(&st, "emb");
+    ATH_REQUIRE(e != NULL);
+    ATH_EXPECT(e->t.ndim == 0 && ath_tensor_numel(&e->t) == 1);
+    int64_t got;
+    memcpy(&got, e->t.data, 8);
+    ATH_EXPECT_EQ_INT(got, -42);
+    e = ath_safetensors_find(&st, "empty");
+    ATH_REQUIRE(e != NULL);
+    ATH_EXPECT(ath_tensor_numel(&e->t) == 0);
+    ATH_EXPECT(ath_safetensors_find(&st, "layers.3.w") == NULL);
+    ATH_EXPECT(ath_safetensors_find(&st, "") == NULL);
+    ath_safetensors_close(&st);
+
+    /* the same file opened directly */
+    char p[1024];
+    ATH_REQUIRE_OK(ath_path_join(p, sizeof p, d.path, "model.safetensors"));
+    ATH_REQUIRE_OK(ath_safetensors_open_file(&st, &a, p));
+    ATH_EXPECT_EQ_U64(st.n_tensors, 5);
+    ath_safetensors_close(&st);
+    ath_arena_free(&a);
+    tmpdir_remove(&d);
+}
+
+ATH_TEST(safetensors_rejects_bad_headers)
+{
+    tmpdir d;
+    ATH_REQUIRE(tmpdir_make(&d));
+    ath_arena a;
+    ath_arena_init(&a, 0);
+    char p[1024];
+    ATH_REQUIRE_OK(ath_path_join(p, sizeof p, d.path, "bad.safetensors"));
+    static const unsigned char zeros[64];
+    ath_safetensors st;
+
+    static const struct {
+        const char *header;
+        size_t      data_bytes;
+        ath_status  want;
+    } cases[] = {
+        {"[1,2]", 0, ATH_ERR_FORMAT},                                   /* not an object  */
+        {"{\"a\":", 0, ATH_ERR_PARSE},                                  /* not JSON       */
+        {"{\"a\":{\"dtype\":\"F64\",\"shape\":[1],\"data_offsets\":[0,8]}}", 8, ATH_ERR_UNSUPPORTED},
+        {"{\"a\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[0,4]}}", 4, ATH_ERR_FORMAT},
+        {"{\"a\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}", 2, ATH_ERR_FORMAT},
+        {"{\"a\":{\"dtype\":\"U8\",\"shape\":[1],\"data_offsets\":[1,0]}}", 1, ATH_ERR_FORMAT},
+        {"{\"a\":{\"dtype\":\"U8\",\"shape\":[8],\"data_offsets\":[0,8]},"
+         "\"b\":{\"dtype\":\"U8\",\"shape\":[8],\"data_offsets\":[4,12]}}", 12, ATH_ERR_FORMAT},
+        {"{\"a\":{\"dtype\":\"U8\",\"shape\":[4],\"data_offsets\":[0,4]},"
+         "\"b\":{\"dtype\":\"U8\",\"shape\":[4],\"data_offsets\":[8,12]}}", 12, ATH_ERR_FORMAT},
+        {"{\"a\":{\"dtype\":\"U8\",\"shape\":[4],\"data_offsets\":[0,4]}}", 8, ATH_ERR_FORMAT},
+        {"{\"a\":{\"dtype\":\"U8\",\"shape\":[4],\"data_offsets\":[0,4]},"
+         "\"a\":{\"dtype\":\"U8\",\"shape\":[4],\"data_offsets\":[4,8]}}", 8, ATH_ERR_FORMAT},
+        {"{\"a\":{\"dtype\":\"U8\",\"shape\":[-4],\"data_offsets\":[0,4]}}", 4, ATH_ERR_FORMAT},
+        {"{\"a\":{\"dtype\":\"U8\",\"shape\":[4]}}", 4, ATH_ERR_FORMAT},
+        {"{\"a\":{\"dtype\":\"U8\",\"shape\":[4],\"data_offsets\":[0]}}", 4, ATH_ERR_FORMAT},
+        {"{\"a\":{\"dtype\":\"U8\",\"shape\":[4],\"data_offsets\":[0,-4]}}", 4, ATH_ERR_FORMAT},
+        {"{\"a\":{\"shape\":[4],\"data_offsets\":[0,4]}}", 4, ATH_ERR_FORMAT},
+        {"{\"a\":{\"dtype\":\"U8\",\"shape\":4,\"data_offsets\":[0,4]}}", 4, ATH_ERR_FORMAT},
+        {"{\"a\":{\"dtype\":\"U8\",\"shape\":[1,1,1,1,1,1,1,1,1],\"data_offsets\":[0,1]}}", 1,
+         ATH_ERR_UNSUPPORTED},
+        {"{\"a\":[1]}", 0, ATH_ERR_FORMAT},
+        {"{\"\":{\"dtype\":\"U8\",\"shape\":[1],\"data_offsets\":[0,1]}}", 1, ATH_ERR_FORMAT},
+        {"{\"a\\u0000b\":{\"dtype\":\"U8\",\"shape\":[1],\"data_offsets\":[0,1]}}", 1, ATH_ERR_FORMAT},
+    };
+    for (size_t k = 0; k < ATH_ARRAY_LEN(cases); k++) {
+        ATH_REQUIRE(write_st(&d, "bad.safetensors", cases[k].header, zeros, cases[k].data_bytes));
+        ath_status got = ath_safetensors_open_file(&st, &a, p);
+        if (got != cases[k].want) {
+            char msg[512];
+            snprintf(msg, sizeof msg, "case %zu: got '%s', want '%s': %s", k, ath_status_str(got),
+                     ath_status_str(cases[k].want), cases[k].header);
+            ath_test_fail_(t_, __FILE__, __LINE__, msg);
+        }
+        if (got == ATH_OK)
+            ath_safetensors_close(&st);
+    }
+
+    /* broken framing */
+    ATH_REQUIRE(tmpdir_write(&d, "bad.safetensors", "\x02\x00\x00", 3));
+    ATH_EXPECT_STATUS(ath_safetensors_open_file(&st, &a, p), ATH_ERR_FORMAT);
+    ATH_REQUIRE(tmpdir_write(&d, "bad.safetensors", "\xff\x00\x00\x00\x00\x00\x00\x00{}", 10));
+    ATH_EXPECT_STATUS(ath_safetensors_open_file(&st, &a, p), ATH_ERR_FORMAT);
+    ATH_REQUIRE(tmpdir_write(&d, "bad.safetensors", "\x02\x00\x00\x00\x00\x00\x00\x00{}", 10));
+    ATH_EXPECT_OK(ath_safetensors_open_file(&st, &a, p)); /* an empty checkpoint is valid */
+    ATH_EXPECT_EQ_U64(st.n_tensors, 0);
+    ath_safetensors_close(&st);
+    /* a directory without a checkpoint */
+    ATH_EXPECT_STATUS(ath_safetensors_open(&st, &a, d.path), ATH_ERR_NOT_FOUND);
+    ath_arena_free(&a);
+    tmpdir_remove(&d);
+}
+
+ATH_TEST(safetensors_sharded)
+{
+    tmpdir d;
+    ATH_REQUIRE(tmpdir_make(&d));
+    unsigned char data[16];
+    for (int i = 0; i < 16; i++)
+        data[i] = (unsigned char)i;
+    ATH_REQUIRE(write_st(&d, "model-00001-of-00002.safetensors",
+        "{\"layers.0.w\":{\"dtype\":\"U8\",\"shape\":[2,2],\"data_offsets\":[0,4]},"
+        "\"embed\":{\"dtype\":\"BF16\",\"shape\":[2],\"data_offsets\":[4,8]}}", data, 8));
+    ATH_REQUIRE(write_st(&d, "model-00002-of-00002.safetensors",
+        "{\"layers.1.w\":{\"dtype\":\"U8\",\"shape\":[2,2],\"data_offsets\":[0,4]},"
+        "\"head\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[4,8]}}", data + 8, 8));
+    const char *index =
+        "{\"metadata\":{\"total_size\":16},\"weight_map\":{"
+        "\"head\":\"model-00002-of-00002.safetensors\","
+        "\"layers.1.w\":\"model-00002-of-00002.safetensors\","
+        "\"layers.0.w\":\"model-00001-of-00002.safetensors\","
+        "\"embed\":\"model-00001-of-00002.safetensors\"}}";
+    ATH_REQUIRE(tmpdir_write(&d, "model.safetensors.index.json", index, strlen(index)));
+
+    ath_arena a;
+    ath_arena_init(&a, 0);
+    ath_safetensors st;
+    ATH_REQUIRE_OK(ath_safetensors_open(&st, &a, d.path));
+    ATH_EXPECT_EQ_U64(st.n_shards, 2);
+    ATH_EXPECT(strstr(st.shards[0].path, "00001-of") != NULL); /* sorted by name */
+    ATH_EXPECT_EQ_U64(st.n_tensors, 4);
+    ATH_EXPECT_EQ_U64(st.tensor_bytes, 16);
+    ATH_EXPECT_EQ_U64(st.data_bytes, 16);
+    ATH_EXPECT_EQ_INT(st.index_total_size, 16);
+    const ath_safetensors_entry *e = ath_safetensors_find(&st, "layers.1.w");
+    ATH_REQUIRE(e != NULL);
+    ATH_EXPECT_EQ_U64(e->shard, 1);
+    ATH_EXPECT(((const unsigned char *)e->t.data)[3] == 11);
+    e = ath_safetensors_find(&st, "embed");
+    ATH_REQUIRE(e != NULL);
+    ATH_EXPECT(e->shard == 0 && ((const unsigned char *)e->t.data)[0] == 4);
+    ath_safetensors_close(&st);
+
+    /* the index and the shards must agree */
+    static const struct {
+        const char *index;
+        ath_status  want;
+    } bad[] = {
+        {"{\"weight_map\":{\"head\":\"model-00002-of-00002.safetensors\","   /* omits layers.1.w */
+         "\"layers.0.w\":\"model-00001-of-00002.safetensors\","
+         "\"embed\":\"model-00001-of-00002.safetensors\"}}", ATH_ERR_FORMAT},
+        {"{\"weight_map\":{\"head\":\"model-00001-of-00002.safetensors\","   /* wrong shard */
+         "\"layers.1.w\":\"model-00002-of-00002.safetensors\","
+         "\"layers.0.w\":\"model-00001-of-00002.safetensors\","
+         "\"embed\":\"model-00001-of-00002.safetensors\"}}", ATH_ERR_FORMAT},
+        {"{\"weight_map\":{\"head\":\"model-00002-of-00002.safetensors\","   /* unknown tensor */
+         "\"layers.1.w\":\"model-00002-of-00002.safetensors\","
+         "\"layers.0.w\":\"model-00001-of-00002.safetensors\","
+         "\"embed\":\"model-00001-of-00002.safetensors\","
+         "\"ghost\":\"model-00001-of-00002.safetensors\"}}", ATH_ERR_FORMAT},
+        {"{\"weight_map\":{\"head\":\"model-00002-of-00002.safetensors\","   /* listed twice */
+         "\"head\":\"model-00002-of-00002.safetensors\","
+         "\"layers.1.w\":\"model-00002-of-00002.safetensors\","
+         "\"layers.0.w\":\"model-00001-of-00002.safetensors\"}}", ATH_ERR_FORMAT},
+        {"{\"weight_map\":{\"head\":\"../model-00002-of-00002.safetensors\"}}", ATH_ERR_FORMAT},
+        {"{\"weight_map\":{\"head\":\"model-00003-of-00003.safetensors\"}}", ATH_ERR_NOT_FOUND},
+        {"{\"weight_map\":[]}", ATH_ERR_FORMAT},
+        {"{\"weight_map\":{\"head\":3}}", ATH_ERR_FORMAT},
+        {"{\"weight_map\":", ATH_ERR_PARSE},
+    };
+    for (size_t k = 0; k < ATH_ARRAY_LEN(bad); k++) {
+        ATH_REQUIRE(tmpdir_write(&d, "model.safetensors.index.json", bad[k].index, strlen(bad[k].index)));
+        ath_status got = ath_safetensors_open(&st, &a, d.path);
+        if (got != bad[k].want) {
+            char msg[512];
+            snprintf(msg, sizeof msg, "index case %zu: got '%s', want '%s'", k,
+                     ath_status_str(got), ath_status_str(bad[k].want));
+            ath_test_fail_(t_, __FILE__, __LINE__, msg);
+        }
+        if (got == ATH_OK)
+            ath_safetensors_close(&st);
+    }
+    ath_arena_free(&a);
+    tmpdir_remove(&d);
+}
+
+ATH_TEST(safetensors_real_model)
+{
+    char p[1024];
+    if (!model_file(p, sizeof p, "config.json"))
+        ATH_SKIP("no checkpoint in $ATH_MODEL_DIR");
+    ath_arena a;
+    ath_arena_init(&a, 0);
+    ath_safetensors st;
+    ATH_REQUIRE_OK(ath_safetensors_open(&st, &a, model_dir()));
+    ATH_EXPECT(st.n_tensors > 0);
+    /* acceptance criterion 1 of step 1: tensor bytes == data sections */
+    ATH_EXPECT_EQ_U64(st.tensor_bytes, st.data_bytes);
+    if (st.index_total_size >= 0)
+        ATH_EXPECT_EQ_U64((uint64_t)st.index_total_size, st.tensor_bytes);
+
+    uint64_t file_bytes = 0;
+    for (uint32_t s = 0; s < st.n_shards; s++)
+        file_bytes += st.shards[s].file.size - st.shards[s].data_offset;
+    ATH_EXPECT_EQ_U64(file_bytes, st.data_bytes);
+
+    for (uint32_t i = 0; i < st.n_tensors; i++) {
+        const ath_safetensors_entry *e = &st.tensors[i];
+        const ath_safetensors_shard *sh = &st.shards[e->shard];
+        const char *lo = (const char *)sh->file.data + sh->data_offset;
+        const char *hi = (const char *)sh->file.data + sh->file.size;
+        const char *at = e->t.data;
+        ATH_EXPECT(at >= lo && at + ath_tensor_nbytes(&e->t) <= hi);
+        ATH_EXPECT((uintptr_t)at % ath_dtype_size(e->t.dtype) == 0);
+        ATH_EXPECT(ath_safetensors_find(&st, e->name) == e);
+        if (i > 0)
+            ATH_EXPECT(ath_safetensors_name_cmp(st.tensors[i - 1].name, e->name) < 0);
+    }
+    ath_safetensors_close(&st);
+    ath_arena_free(&a);
+}
+
 /* ---- runner --------------------------------------------------------------- */
 
 static const ath_test_case tests[] = {
@@ -649,6 +952,11 @@ static const ath_test_case tests[] = {
     ATH_TEST_ENTRY(json_real_model_files),
     ATH_TEST_ENTRY(dtype_table),
     ATH_TEST_ENTRY(tensor_init_and_views),
+    ATH_TEST_ENTRY(safetensors_name_order),
+    ATH_TEST_ENTRY(safetensors_single_file),
+    ATH_TEST_ENTRY(safetensors_rejects_bad_headers),
+    ATH_TEST_ENTRY(safetensors_sharded),
+    ATH_TEST_ENTRY(safetensors_real_model),
 };
 
 int main(int argc, char **argv)

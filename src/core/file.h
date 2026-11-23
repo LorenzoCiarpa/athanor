@@ -13,6 +13,9 @@
 
 #include "core/base.h"
 
+/* Buffer size for paths built by athanor (Linux PATH_MAX). */
+#define ATH_PATH_MAX 4096
+
 typedef struct {
     int         fd;     /* kept open for pread; -1 when closed            */
     size_t      size;   /* file size in bytes                             */
