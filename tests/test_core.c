@@ -9,6 +9,7 @@
 #include "core/arena.h"
 #include "core/file.h"
 #include "core/json.h"
+#include "core/tensor.h"
 
 #include <stdint.h>
 #include <unistd.h>
@@ -542,6 +543,92 @@ ATH_TEST(json_real_model_files)
     ath_arena_free(&a);
 }
 
+/* ---- tensor --------------------------------------------------------------- */
+
+ATH_TEST(dtype_table)
+{
+    ATH_EXPECT_EQ_U64(ath_dtype_size(ATH_DTYPE_F32), 4);
+    ATH_EXPECT_EQ_U64(ath_dtype_size(ATH_DTYPE_F16), 2);
+    ATH_EXPECT_EQ_U64(ath_dtype_size(ATH_DTYPE_BF16), 2);
+    ATH_EXPECT_EQ_U64(ath_dtype_size(ATH_DTYPE_I32), 4);
+    ATH_EXPECT_EQ_U64(ath_dtype_size(ATH_DTYPE_I64), 8);
+    ATH_EXPECT_EQ_U64(ath_dtype_size(ATH_DTYPE_U8), 1);
+    ATH_EXPECT_EQ_U64(ath_dtype_size(ATH_DTYPE_F8_E4M3), 1);
+    ATH_EXPECT_EQ_U64(ath_dtype_size(ATH_DTYPE_F8_E5M2), 1);
+    ATH_EXPECT_EQ_U64(ath_dtype_size(ATH_DTYPE_COUNT), 0);
+    ATH_EXPECT_EQ_U64(ath_dtype_size(ATH_DTYPE_QUANT_FIRST), 0);
+    ATH_EXPECT_STR_EQ(ath_dtype_name(ATH_DTYPE_BF16), "bf16");
+    ATH_EXPECT_STR_EQ(ath_dtype_name(ATH_DTYPE_F8_E4M3), "f8_e4m3");
+    ATH_EXPECT_STR_EQ(ath_dtype_name(ATH_DTYPE_QUANT_LAST), "?");
+    for (int i = 0; i < ATH_DTYPE_COUNT; i++)
+        ATH_EXPECT(ath_dtype_size((ath_dtype)i) > 0 && strcmp(ath_dtype_name((ath_dtype)i), "?") != 0);
+    ATH_EXPECT_STR_EQ(ath_tier_name(ATH_TIER_VRAM), "vram");
+}
+
+ATH_TEST(tensor_init_and_views)
+{
+    float buf[2 * 3 * 4];
+    for (int i = 0; i < 24; i++)
+        buf[i] = (float)i;
+    ath_tensor t;
+    int64_t shape[] = {2, 3, 4};
+    ATH_REQUIRE_OK(ath_tensor_init(&t, ATH_DTYPE_F32, 3, shape, buf, ATH_TIER_RAM));
+    ATH_EXPECT_EQ_INT(t.stride[0], 12);
+    ATH_EXPECT_EQ_INT(t.stride[1], 4);
+    ATH_EXPECT_EQ_INT(t.stride[2], 1);
+    ATH_EXPECT_EQ_INT(ath_tensor_numel(&t), 24);
+    ATH_EXPECT_EQ_U64(ath_tensor_nbytes(&t), 96);
+    ATH_EXPECT(ath_tensor_is_contiguous(&t));
+
+    /* rows 1..2 of the middle dimension: shares memory, not contiguous */
+    ath_tensor v;
+    ATH_REQUIRE_OK(ath_tensor_slice(&t, 1, 1, 2, &v));
+    ATH_EXPECT_EQ_INT(v.shape[1], 2);
+    ATH_EXPECT(v.data == (void *)(buf + 4));
+    ATH_EXPECT(!ath_tensor_is_contiguous(&v));
+    /* element [1][1][3] of the view is element [1][2][3] of t */
+    const float *vd = v.data;
+    ATH_EXPECT(vd[1 * v.stride[0] + 1 * v.stride[1] + 3 * v.stride[2]] == 23.0f);
+
+    /* outer slice stays contiguous */
+    ATH_REQUIRE_OK(ath_tensor_slice(&t, 0, 1, 1, &v));
+    ATH_EXPECT(v.data == (void *)(buf + 12) && ath_tensor_is_contiguous(&v));
+    ATH_EXPECT_STATUS(ath_tensor_slice(&t, 0, 1, 2, &v), ATH_ERR_RANGE);
+    ATH_EXPECT_STATUS(ath_tensor_slice(&t, 3, 0, 1, &v), ATH_ERR_INVALID_ARG);
+    ATH_EXPECT_OK(ath_tensor_slice(&t, 2, 4, 0, &v)); /* empty slice at the end */
+    ATH_EXPECT_EQ_INT(ath_tensor_numel(&v), 0);
+
+    /* reshape a contiguous tensor; refuse a strided one */
+    int64_t flat[] = {6, 4};
+    ath_tensor r;
+    ATH_REQUIRE_OK(ath_tensor_reshape(&t, 2, flat, &r));
+    ATH_EXPECT(r.data == (void *)buf && r.stride[0] == 4);
+    int64_t wrong[] = {5, 4};
+    ATH_EXPECT_STATUS(ath_tensor_reshape(&t, 2, wrong, &r), ATH_ERR_INVALID_ARG);
+    ATH_REQUIRE_OK(ath_tensor_slice(&t, 2, 0, 2, &v));
+    ATH_EXPECT_STATUS(ath_tensor_reshape(&v, 2, flat, &r), ATH_ERR_INVALID_ARG);
+
+    /* scalar, empty and invalid shapes */
+    ATH_REQUIRE_OK(ath_tensor_init(&t, ATH_DTYPE_BF16, 0, NULL, NULL, ATH_TIER_RAM));
+    ATH_EXPECT_EQ_INT(ath_tensor_numel(&t), 1);
+    ATH_EXPECT_EQ_U64(ath_tensor_nbytes(&t), 2);
+    int64_t empty[] = {0, 5};
+    ATH_REQUIRE_OK(ath_tensor_init(&t, ATH_DTYPE_F32, 2, empty, NULL, ATH_TIER_RAM));
+    ATH_EXPECT_EQ_U64(ath_tensor_nbytes(&t), 0);
+    int64_t neg[] = {2, -1};
+    ATH_EXPECT_STATUS(ath_tensor_init(&t, ATH_DTYPE_F32, 2, neg, NULL, ATH_TIER_RAM), ATH_ERR_RANGE);
+    int64_t huge[] = {INT64_MAX / 2, 3};
+    ATH_EXPECT_STATUS(ath_tensor_init(&t, ATH_DTYPE_U8, 2, huge, NULL, ATH_TIER_RAM), ATH_ERR_RANGE);
+    int64_t huge0[] = {0, INT64_MAX / 2, 3};
+    ATH_EXPECT_STATUS(ath_tensor_init(&t, ATH_DTYPE_U8, 3, huge0, NULL, ATH_TIER_RAM), ATH_ERR_RANGE);
+    int64_t big[] = {INT64_MAX / 4};
+    ATH_EXPECT_STATUS(ath_tensor_init(&t, ATH_DTYPE_I64, 1, big, NULL, ATH_TIER_RAM), ATH_ERR_RANGE);
+    int64_t nine[9] = {1, 1, 1, 1, 1, 1, 1, 1, 1};
+    ATH_EXPECT_STATUS(ath_tensor_init(&t, ATH_DTYPE_F32, 9, nine, NULL, ATH_TIER_RAM), ATH_ERR_RANGE);
+    ATH_EXPECT_STATUS(ath_tensor_init(&t, ATH_DTYPE_QUANT_FIRST, 1, nine, NULL, ATH_TIER_RAM),
+                      ATH_ERR_UNSUPPORTED);
+}
+
 /* ---- runner --------------------------------------------------------------- */
 
 static const ath_test_case tests[] = {
@@ -560,6 +647,8 @@ static const ath_test_case tests[] = {
     ATH_TEST_ENTRY(json_rejects_invalid),
     ATH_TEST_ENTRY(json_error_position_and_length),
     ATH_TEST_ENTRY(json_real_model_files),
+    ATH_TEST_ENTRY(dtype_table),
+    ATH_TEST_ENTRY(tensor_init_and_views),
 };
 
 int main(int argc, char **argv)
