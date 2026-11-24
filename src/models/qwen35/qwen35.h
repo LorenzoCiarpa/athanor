@@ -54,6 +54,30 @@ typedef struct {
     ath_qwen35_mixer *mixer;      /* [n_layers], the layer schedule   */
 } ath_qwen35_config;
 
+/* The params of one decoder layer, by what the forward pass does with them,
+ * and the indices of its state in m->states. weights.c fills the params while
+ * binding, family.c the state indices. Entries a layer does not have are NULL
+ * (params) or -1 (state); MoE layers leave the dense MLP entries NULL. */
+typedef struct {
+    const ath_param *input_norm, *post_norm;
+    /* full attention */
+    const ath_param *q_proj, *k_proj, *v_proj, *q_norm, *k_norm, *o_proj;
+    /* Gated DeltaNet */
+    const ath_param *qkv_proj, *z_proj, *a_proj, *b_proj, *conv, *a_log, *dt_bias, *norm, *out_proj;
+    /* dense MLP */
+    const ath_param *gate_proj, *up_proj, *down_proj;
+    int32_t          kv, conv_state, recurrent;
+} ath_qwen35_layer;
+
+/* family_data of a qwen35 model. */
+typedef struct {
+    ath_qwen35_config c;
+    ath_qwen35_layer *layer;    /* [n_layers]                                        */
+    const ath_param  *embed;
+    const ath_param  *norm;     /* final norm                                        */
+    const ath_param  *head;     /* output projection: lm_head, or embed when tied    */
+} ath_qwen35_model;
+
 /* config.c */
 bool       ath_qwen35_match(const ath_json *config);
 /* ATH_ERR_NOT_FOUND for a missing key, ATH_ERR_TYPE for a key of the wrong
@@ -62,8 +86,13 @@ bool       ath_qwen35_match(const ath_json *config);
  * in a. */
 ath_status ath_qwen35_config_parse(ath_qwen35_config *c, ath_arena *a, const ath_json *config);
 
-/* weights.c: fill m->params and m->ignored from m->ckpt. */
-ath_status ath_qwen35_bind(ath_model *m, ath_arena *a, const ath_qwen35_config *c);
+/* weights.c: fill m->params and m->ignored from m->ckpt, and the params of
+ * q (q->c is parsed, q->layer allocated). */
+ath_status ath_qwen35_bind(ath_model *m, ath_arena *a, ath_qwen35_model *q);
+
+/* forward.c: the family's forward (model.h, ath_family.forward). */
+ath_status ath_qwen35_forward(const ath_model *m, const ath_batch *b, ath_state *s, const ath_hooks *h,
+                              ath_arena *scratch);
 
 extern const ath_family ath_family_qwen35;
 

@@ -1,16 +1,53 @@
 /* family.c: the qwen35 entry of the family registry. load() parses the
- * config, fills the model's dimensions and layer schedule, and binds the
- * tensors (weights.c). The Makefile lists this family in FAMILIES. */
+ * config, fills the model's dimensions and layer schedule, binds the tensors
+ * (weights.c) and declares the per-sequence state; forward() is in
+ * forward.c. The Makefile lists this family in FAMILIES.
+ */
 #include "qwen35.h"
+
+/* The state one sequence needs (contract, State per layer): per attention
+ * layer the keys and values of every token; per Gated DeltaNet layer the last
+ * K − 1 inputs of the convolution and the fp32 recurrent state. */
+static ath_status declare_states(ath_model *m, ath_arena *a, ath_qwen35_model *q)
+{
+    const ath_qwen35_config *c = &q->c;
+    uint32_t n = 0;
+    for (int32_t l = 0; l < c->n_layers; l++)
+        n += c->mixer[l] == ATH_QWEN35_ATTENTION ? 1 : 2;
+    m->states = ath_arena_alloc(a, (n ? n : 1) * sizeof *m->states, _Alignof(ath_state_spec));
+    if (!m->states)
+        return ATH_ERR_NOMEM;
+
+    const int64_t kv = (int64_t)c->n_kv_heads * c->head_dim;
+    const int64_t conv_dim = 2 * (int64_t)c->lin_k_heads * c->lin_k_dim + (int64_t)c->lin_v_heads * c->lin_v_dim;
+    m->n_states = 0;
+    for (int32_t l = 0; l < c->n_layers; l++) {
+        ath_qwen35_layer *L = &q->layer[l];
+        if (c->mixer[l] == ATH_QWEN35_ATTENTION) {
+            L->kv = (int32_t)m->n_states;
+            m->states[m->n_states++] = (ath_state_spec){.kind = ATH_STATE_KV, .layer = l, .per_token = 2 * kv};
+        } else {
+            L->conv_state = (int32_t)m->n_states;
+            m->states[m->n_states++] = (ath_state_spec){
+                .kind = ATH_STATE_CONV, .layer = l, .fixed = (int64_t)(c->conv_kernel - 1) * conv_dim};
+            L->recurrent = (int32_t)m->n_states;
+            m->states[m->n_states++] = (ath_state_spec){
+                .kind = ATH_STATE_RECURRENT, .layer = l,
+                .fixed = (int64_t)c->lin_v_heads * c->lin_k_dim * c->lin_v_dim};
+        }
+    }
+    return ATH_OK;
+}
 
 static ath_status load(ath_model *m, ath_arena *a)
 {
-    ath_qwen35_config *c = ath_arena_alloc(a, sizeof *c, _Alignof(ath_qwen35_config));
-    if (!c)
+    ath_qwen35_model *q = ath_arena_zalloc(a, sizeof *q, _Alignof(ath_qwen35_model));
+    if (!q)
         return ATH_ERR_NOMEM;
+    ath_qwen35_config *c = &q->c;
     ATH_CHECK(ath_qwen35_config_parse(c, a, m->config));
 
-    m->family_data = c;
+    m->family_data = q;
     m->hidden_size = c->hidden;
     m->vocab_size = c->vocab;
     m->tie_embeddings = c->tie_embeddings;
@@ -19,18 +56,22 @@ static ath_status load(ath_model *m, ath_arena *a)
 
     m->n_layers = c->n_layers;
     m->layers = ath_arena_alloc(a, (size_t)c->n_layers * sizeof *m->layers, _Alignof(ath_layer));
-    if (!m->layers)
+    q->layer = ath_arena_zalloc(a, (size_t)c->n_layers * sizeof *q->layer, _Alignof(ath_qwen35_layer));
+    if (!m->layers || !q->layer)
         return ATH_ERR_NOMEM;
     for (int32_t i = 0; i < c->n_layers; i++) {
         m->layers[i].mixer = c->mixer[i] == ATH_QWEN35_ATTENTION ? "attention" : "gated_deltanet";
         m->layers[i].ffn = c->moe ? "moe" : "mlp";
         m->layers[i].n_experts = c->n_experts;
+        q->layer[i].kv = q->layer[i].conv_state = q->layer[i].recurrent = -1;
     }
-    return ath_qwen35_bind(m, a, c);
+    ATH_CHECK(ath_qwen35_bind(m, a, q));
+    return declare_states(m, a, q);
 }
 
 const ath_family ath_family_qwen35 = {
     .name = "qwen35",
     .match = ath_qwen35_match,
     .load = load,
+    .forward = ath_qwen35_forward,
 };

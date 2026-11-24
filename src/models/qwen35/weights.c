@@ -39,6 +39,9 @@ typedef struct {
     uint32_t                 cap;   /* capacity of m->params */
 } binder;
 
+/* Where a bound param is recorded for the forward pass; NULL to skip. */
+typedef const ath_param **slot;
+
 static void fmt_shape(char *out, size_t cap, int32_t ndim, const int64_t *d)
 {
     size_t n = (size_t)snprintf(out, cap, "[");
@@ -85,23 +88,30 @@ static ath_status find(const binder *b, const char *name, shape want, const ath_
     return ATH_OK;
 }
 
-static void add(binder *b, const ath_tensor *t, const char *name, ath_role role, int32_t layer,
-                int32_t expert, uint32_t flags)
+/* m->params never moves (allocated once with its capacity), so the returned
+ * pointer stays valid for the life of the model. */
+static const ath_param *add(binder *b, const ath_tensor *t, const char *name, ath_role role, int32_t layer,
+                            int32_t expert, uint32_t flags)
 {
     ATH_ASSERT(b->m->n_params < b->cap);
-    b->m->params[b->m->n_params++] = (ath_param){
+    ath_param *p = &b->m->params[b->m->n_params++];
+    *p = (ath_param){
         .t = *t, .role = role, .layer = layer, .expert = expert, .flags = flags, .name = name,
     };
+    return p;
 }
 
-/* Bind a whole tensor as one param. */
-static ath_status bind(binder *b, int32_t layer, const char *suffix, shape want, ath_role role, uint32_t flags)
+/* Bind a whole tensor as one param and record it in *out. */
+static ath_status bind(binder *b, int32_t layer, const char *suffix, shape want, ath_role role, uint32_t flags,
+                       slot out)
 {
     char name[256];
     ATH_CHECK(tensor_name(name, sizeof name, b, layer, suffix));
     const ath_safetensors_entry *e;
     ATH_CHECK(find(b, name, want, &e));
-    add(b, &e->t, e->name, role, layer, -1, flags);
+    const ath_param *p = add(b, &e->t, e->name, role, layer, -1, flags);
+    if (out)
+        *out = p;
     return ATH_OK;
 }
 
@@ -126,7 +136,7 @@ static ath_status bind_experts(binder *b, int32_t layer, const char *suffix, int
 
 /* ---- blocks (contract: Gated DeltaNet layer, Full-attention layer, MLP, MoE) -- */
 
-static ath_status bind_gated_deltanet(binder *b, int32_t l)
+static ath_status bind_gated_deltanet(binder *b, int32_t l, ath_qwen35_layer *L)
 {
     const ath_qwen35_config *c = b->c;
     const int64_t h = c->hidden, nv = c->lin_v_heads;
@@ -134,38 +144,39 @@ static ath_status bind_gated_deltanet(binder *b, int32_t l)
     const int64_t value_dim = nv * c->lin_v_dim;
     const int64_t conv_dim = 2 * key_dim + value_dim;   /* q, k, v channels */
 
-    ATH_CHECK(bind(b, l, "linear_attn.in_proj_qkv.weight", S2(conv_dim, h), ATH_ROLE_MIX_IN, 0));
-    ATH_CHECK(bind(b, l, "linear_attn.in_proj_z.weight", S2(value_dim, h), ATH_ROLE_MIX_IN, 0));
-    ATH_CHECK(bind(b, l, "linear_attn.in_proj_b.weight", S2(nv, h), ATH_ROLE_GATE, SENS));
-    ATH_CHECK(bind(b, l, "linear_attn.in_proj_a.weight", S2(nv, h), ATH_ROLE_GATE, SENS));
-    ATH_CHECK(bind(b, l, "linear_attn.conv1d.weight", S3(conv_dim, 1, c->conv_kernel), ATH_ROLE_CONV, 0));
-    ATH_CHECK(bind(b, l, "linear_attn.A_log", S1(nv), ATH_ROLE_OTHER, 0));
-    ATH_CHECK(bind(b, l, "linear_attn.dt_bias", S1(nv), ATH_ROLE_OTHER, 0));
-    ATH_CHECK(bind(b, l, "linear_attn.norm.weight", S1(c->lin_v_dim), ATH_ROLE_NORM, 0));
-    return bind(b, l, "linear_attn.out_proj.weight", S2(h, value_dim), ATH_ROLE_MIX_OUT, RESID);
+    ATH_CHECK(bind(b, l, "linear_attn.in_proj_qkv.weight", S2(conv_dim, h), ATH_ROLE_MIX_IN, 0, &L->qkv_proj));
+    ATH_CHECK(bind(b, l, "linear_attn.in_proj_z.weight", S2(value_dim, h), ATH_ROLE_MIX_IN, 0, &L->z_proj));
+    ATH_CHECK(bind(b, l, "linear_attn.in_proj_b.weight", S2(nv, h), ATH_ROLE_GATE, SENS, &L->b_proj));
+    ATH_CHECK(bind(b, l, "linear_attn.in_proj_a.weight", S2(nv, h), ATH_ROLE_GATE, SENS, &L->a_proj));
+    ATH_CHECK(bind(b, l, "linear_attn.conv1d.weight", S3(conv_dim, 1, c->conv_kernel), ATH_ROLE_CONV, 0,
+                   &L->conv));
+    ATH_CHECK(bind(b, l, "linear_attn.A_log", S1(nv), ATH_ROLE_OTHER, 0, &L->a_log));
+    ATH_CHECK(bind(b, l, "linear_attn.dt_bias", S1(nv), ATH_ROLE_OTHER, 0, &L->dt_bias));
+    ATH_CHECK(bind(b, l, "linear_attn.norm.weight", S1(c->lin_v_dim), ATH_ROLE_NORM, 0, &L->norm));
+    return bind(b, l, "linear_attn.out_proj.weight", S2(h, value_dim), ATH_ROLE_MIX_OUT, RESID, &L->out_proj);
 }
 
-static ath_status bind_attention(binder *b, int32_t l)
+static ath_status bind_attention(binder *b, int32_t l, ath_qwen35_layer *L)
 {
     const ath_qwen35_config *c = b->c;
     const int64_t h = c->hidden, hd = c->head_dim;
     const int64_t q = (int64_t)c->n_heads * hd, kv = (int64_t)c->n_kv_heads * hd;
 
     /* q_proj holds query and output gate, interleaved per head: 2 x q rows */
-    ATH_CHECK(bind(b, l, "self_attn.q_proj.weight", S2(2 * q, h), ATH_ROLE_MIX_IN, 0));
-    ATH_CHECK(bind(b, l, "self_attn.k_proj.weight", S2(kv, h), ATH_ROLE_MIX_IN, 0));
-    ATH_CHECK(bind(b, l, "self_attn.v_proj.weight", S2(kv, h), ATH_ROLE_MIX_IN, 0));
-    ATH_CHECK(bind(b, l, "self_attn.q_norm.weight", S1(hd), ATH_ROLE_NORM, 0));
-    ATH_CHECK(bind(b, l, "self_attn.k_norm.weight", S1(hd), ATH_ROLE_NORM, 0));
-    return bind(b, l, "self_attn.o_proj.weight", S2(h, q), ATH_ROLE_MIX_OUT, RESID);
+    ATH_CHECK(bind(b, l, "self_attn.q_proj.weight", S2(2 * q, h), ATH_ROLE_MIX_IN, 0, &L->q_proj));
+    ATH_CHECK(bind(b, l, "self_attn.k_proj.weight", S2(kv, h), ATH_ROLE_MIX_IN, 0, &L->k_proj));
+    ATH_CHECK(bind(b, l, "self_attn.v_proj.weight", S2(kv, h), ATH_ROLE_MIX_IN, 0, &L->v_proj));
+    ATH_CHECK(bind(b, l, "self_attn.q_norm.weight", S1(hd), ATH_ROLE_NORM, 0, &L->q_norm));
+    ATH_CHECK(bind(b, l, "self_attn.k_norm.weight", S1(hd), ATH_ROLE_NORM, 0, &L->k_norm));
+    return bind(b, l, "self_attn.o_proj.weight", S2(h, q), ATH_ROLE_MIX_OUT, RESID, &L->o_proj);
 }
 
-static ath_status bind_mlp(binder *b, int32_t l)
+static ath_status bind_mlp(binder *b, int32_t l, ath_qwen35_layer *L)
 {
     const int64_t h = b->c->hidden, in = b->c->intermediate;
-    ATH_CHECK(bind(b, l, "mlp.gate_proj.weight", S2(in, h), ATH_ROLE_MLP_IN, 0));
-    ATH_CHECK(bind(b, l, "mlp.up_proj.weight", S2(in, h), ATH_ROLE_MLP_IN, 0));
-    return bind(b, l, "mlp.down_proj.weight", S2(h, in), ATH_ROLE_MLP_OUT, RESID);
+    ATH_CHECK(bind(b, l, "mlp.gate_proj.weight", S2(in, h), ATH_ROLE_MLP_IN, 0, &L->gate_proj));
+    ATH_CHECK(bind(b, l, "mlp.up_proj.weight", S2(in, h), ATH_ROLE_MLP_IN, 0, &L->up_proj));
+    return bind(b, l, "mlp.down_proj.weight", S2(h, in), ATH_ROLE_MLP_OUT, RESID, &L->down_proj);
 }
 
 static ath_status bind_moe(binder *b, int32_t l)
@@ -173,14 +184,14 @@ static ath_status bind_moe(binder *b, int32_t l)
     const ath_qwen35_config *c = b->c;
     const int64_t h = c->hidden, ie = c->expert_inter, is = c->shared_inter;
 
-    ATH_CHECK(bind(b, l, "mlp.gate.weight", S2(c->n_experts, h), ATH_ROLE_ROUTER, SENS));
+    ATH_CHECK(bind(b, l, "mlp.gate.weight", S2(c->n_experts, h), ATH_ROLE_ROUTER, SENS, NULL));
     /* gate_up_proj[e] rows: gate projection [0, ie), up projection [ie, 2 ie) */
     ATH_CHECK(bind_experts(b, l, "mlp.experts.gate_up_proj", 2 * ie, h, ATH_ROLE_EXPERT_IN, 0));
     ATH_CHECK(bind_experts(b, l, "mlp.experts.down_proj", h, ie, ATH_ROLE_EXPERT_OUT, RESID));
-    ATH_CHECK(bind(b, l, "mlp.shared_expert.gate_proj.weight", S2(is, h), ATH_ROLE_MLP_IN, SHARED));
-    ATH_CHECK(bind(b, l, "mlp.shared_expert.up_proj.weight", S2(is, h), ATH_ROLE_MLP_IN, SHARED));
-    ATH_CHECK(bind(b, l, "mlp.shared_expert.down_proj.weight", S2(h, is), ATH_ROLE_MLP_OUT, SHARED | RESID));
-    return bind(b, l, "mlp.shared_expert_gate.weight", S2(1, h), ATH_ROLE_GATE, SHARED | SENS);
+    ATH_CHECK(bind(b, l, "mlp.shared_expert.gate_proj.weight", S2(is, h), ATH_ROLE_MLP_IN, SHARED, NULL));
+    ATH_CHECK(bind(b, l, "mlp.shared_expert.up_proj.weight", S2(is, h), ATH_ROLE_MLP_IN, SHARED, NULL));
+    ATH_CHECK(bind(b, l, "mlp.shared_expert.down_proj.weight", S2(h, is), ATH_ROLE_MLP_OUT, SHARED | RESID, NULL));
+    return bind(b, l, "mlp.shared_expert_gate.weight", S2(1, h), ATH_ROLE_GATE, SHARED | SENS, NULL);
 }
 
 /* ---- entry point -------------------------------------------------------------- */
@@ -190,8 +201,9 @@ static const ath_ignored ignored_groups[] = {
     {.prefix = "mtp.", .reason = "multi-token prediction head: speculative decoding, step 13"},
 };
 
-ath_status ath_qwen35_bind(ath_model *m, ath_arena *a, const ath_qwen35_config *c)
+ath_status ath_qwen35_bind(ath_model *m, ath_arena *a, ath_qwen35_model *q)
 {
+    const ath_qwen35_config *c = &q->c;
     /* Upper bound on the param count: 3 global params and, per layer, two
      * norms, at most 9 mixer tensors and the MLP or MoE params. */
     uint64_t per_layer = 2 + 9 + (c->moe ? 5 + 2 * (uint64_t)c->n_experts : 3);
@@ -212,17 +224,18 @@ ath_status ath_qwen35_bind(ath_model *m, ath_arena *a, const ath_qwen35_config *
     /* With tied embeddings the table is also the output projection, which
      * quantization must treat with care (contract, Parameter binding). */
     ATH_CHECK(bind(&b, -1, "embed_tokens.weight", S2(v, h), ATH_ROLE_EMBED,
-                   RESID | (c->tie_embeddings ? SENS : 0)));
+                   RESID | (c->tie_embeddings ? SENS : 0), &q->embed));
     for (int32_t l = 0; l < c->n_layers; l++) {
-        ATH_CHECK(bind(&b, l, "input_layernorm.weight", S1(h), ATH_ROLE_NORM, 0));
+        ath_qwen35_layer *L = &q->layer[l];
+        ATH_CHECK(bind(&b, l, "input_layernorm.weight", S1(h), ATH_ROLE_NORM, 0, &L->input_norm));
         if (c->mixer[l] == ATH_QWEN35_ATTENTION)
-            ATH_CHECK(bind_attention(&b, l));
+            ATH_CHECK(bind_attention(&b, l, L));
         else
-            ATH_CHECK(bind_gated_deltanet(&b, l));
-        ATH_CHECK(bind(&b, l, "post_attention_layernorm.weight", S1(h), ATH_ROLE_NORM, 0));
-        ATH_CHECK(c->moe ? bind_moe(&b, l) : bind_mlp(&b, l));
+            ATH_CHECK(bind_gated_deltanet(&b, l, L));
+        ATH_CHECK(bind(&b, l, "post_attention_layernorm.weight", S1(h), ATH_ROLE_NORM, 0, &L->post_norm));
+        ATH_CHECK(c->moe ? bind_moe(&b, l) : bind_mlp(&b, l, L));
     }
-    ATH_CHECK(bind(&b, -1, "norm.weight", S1(h), ATH_ROLE_NORM, 0));
+    ATH_CHECK(bind(&b, -1, "norm.weight", S1(h), ATH_ROLE_NORM, 0, &q->norm));
 
     /* The output head is a top-level tensor in both checkpoint layouts. */
     const ath_safetensors_entry *head = ath_safetensors_find(&m->ckpt, "lm_head.weight");
@@ -231,10 +244,11 @@ ath_status ath_qwen35_bind(ath_model *m, ath_arena *a, const ath_qwen35_config *
             ath_log(ATH_LOG_ERROR, "qwen35: tie_word_embeddings is true but the checkpoint has lm_head.weight");
             return ATH_ERR_FORMAT;
         }
+        q->head = q->embed;
         return ATH_OK;
     }
     const ath_safetensors_entry *e;
     ATH_CHECK(find(&b, "lm_head.weight", S2(v, h), &e));
-    add(&b, &e->t, e->name, ATH_ROLE_LM_HEAD, -1, -1, SENS);
+    q->head = add(&b, &e->t, e->name, ATH_ROLE_LM_HEAD, -1, -1, SENS);
     return ATH_OK;
 }
