@@ -8,8 +8,8 @@
  * they need no normalization, because only ratios matter.
  *
  * Top-k keeps a sorted list of the k best while scanning the vocabulary,
- * which costs about one comparison per token when k is small (Qwen's
- * recommended k is 20). Without top-k every token is a candidate and the
+ * which costs about one comparison per token when k is small (model cards
+ * recommend about 20). Without top-k every token is a candidate and the
  * whole vocabulary is sorted (heapsort: glibc's qsort may allocate).
  */
 #include "ops/check.h"

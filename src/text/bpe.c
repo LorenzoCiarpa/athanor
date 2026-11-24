@@ -1,6 +1,6 @@
 /* bpe.c: byte-level BPE, read from a Hugging Face tokenizer.json. See bpe.h.
  *
- * The file (12 MB for Qwen3.5, with 248,044 tokens and 247,587 merges) is
+ * The file (12 MB for the first model, with 248,044 tokens and 247,587 merges) is
  * parsed into a temporary arena; only the token bytes, the added tokens and
  * the merge table are kept. Merges are found by a hash table keyed on the
  * pair of ids, which gives the merge's rank and the id of the result.

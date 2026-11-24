@@ -10,7 +10,7 @@
  * The state is reused across turns where the prompt allows it. When the new
  * prompt starts with every token the state has seen, only the new tokens
  * run. When it does not (the template rewrites the assistant's turn once
- * it is history: Qwen3.5 drops its thinking block), a copy of the state
+ * it is history: a past turn may lose its thinking block), a copy of the state
  * taken at the end of the previous prompt's last message is restored
  * instead, and when even that does not match, the conversation runs again
  * from the start. A recurrent state cannot be rolled back, hence the copy.
@@ -416,7 +416,8 @@ static int parse_options(options *o, int argc, char **argv)
     }
     if (!o->dir)
         return usage_error("missing <model_dir>", NULL);
-    /* Qwen3.5's recommended settings: thinking 0.6 / 0.95 / 20, otherwise 0.7 / 0.8 / 20. */
+    /* The settings model cards of thinking models recommend: thinking 0.6 / 0.95 / 20,
+     * otherwise 0.7 / 0.8 / 20 (docs/contract/ for the model at hand). */
     if (o->think && !o->temp_set)
         o->sampler.temperature = 0.6f;
     if (o->think && !o->top_p_set)
