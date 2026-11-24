@@ -42,8 +42,9 @@ CFLAGS     += -I$(BUILD)/gen
 
 CORE_SRC  := $(wildcard src/core/*.c)
 OPS_SRC   := $(wildcard src/ops/*.c)
+TEXT_SRC  := $(wildcard src/text/*.c)
 MODEL_SRC := $(wildcard src/model/*.c)
-LIB_SRC   := $(CORE_SRC) $(OPS_SRC) $(MODEL_SRC) $(FAMILY_SRC)
+LIB_SRC   := $(CORE_SRC) $(OPS_SRC) $(TEXT_SRC) $(MODEL_SRC) $(FAMILY_SRC)
 LIB_OBJ   := $(LIB_SRC:%.c=$(BUILD)/obj/%.o)
 
 TOOL_SRC := $(wildcard tools/*.c)
