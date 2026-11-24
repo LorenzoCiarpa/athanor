@@ -9,7 +9,7 @@ The Qwen hybrid family (Qwen3.5, Qwen3.6, Qwen3.8 dense and MoE). The only direc
 | `config.c` | `config.json` → dimensions, layer schedule (Gated DeltaNet / full attention), MLP or MoE parameters; `match` on `model_type`; rejects keys the reference does not support | 2 |
 | `weights.c` | checkpoint tensor names → `ath_param` with role, layer, expert, flags; dtype and shape checked against the config; fused experts become one view per expert; vision encoder and MTP head are ignored groups, their tensors bound last as params flagged `ATH_P_UNUSED`; every param recorded in the layer table for the forward pass | 2, 4 |
 | `forward.c` | the forward pass from the CPU reference ops, with `ath_matmul_fast` (the same bits as `ath_matmul_ref`, on the caller's pool) for the matmuls: embedding, per layer the Gated DeltaNet or attention mixer and the MLP with their norms and residual additions, final norm, fp32 logits; one path for prefill, pieces and decode; KV, conv and recurrent state in the buffers of the state specs; activations in the state's dtype; calls `on_residual` at every layer boundary. MoE layers fail with `ATH_ERR_UNSUPPORTED` until step 12 | 4 |
-| `text.c` | pre-tokenization, chat template with tool definitions and thinking switch, incremental output parser (thinking blocks, tool calls) | 5 |
+| `text.c` | pre-tokenization (the `tokenizer.json` regex by hand, `ath_qwen35_pretokenize_regex`), chat template with tool definitions and thinking switch (`chat_template.jinja` by hand), incremental output parser (thinking blocks, tool calls with arguments typed by the tool's schema) | 5 |
 | `backward.c` | per-block backward | T1 |
 | `fused.cu` | optional fused kernels, admitted only with a benchmark | 9+ |
 

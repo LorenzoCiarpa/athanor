@@ -25,6 +25,7 @@ tests/test_ops.c  ref vs golden data; GPU vs ref; fast vs ref
 | `attn.c` | `ath_attn_ref`: causal softmax attention with grouped-query heads, the queries being the last T of S positions |
 | `conv.c` | `ath_conv_ref`: causal depthwise conv1d over time with a `[K − 1, C]` running state, optional SiLU |
 | `gdn.c` | `ath_gdn_gates_ref` (decay and write strength), `ath_gdn_ref` (gated delta rule, recurrent form, state `[nv, dk, dv]` in f32) |
+| `sample.c` (step 5) | `ath_sample_ref`: the next token from the logits, below |
 
 Conventions, stated once in `ops.h`:
 
@@ -64,10 +65,14 @@ Every function is tested on hand-computed cases in `tests/test_ops.c` and agains
 | `conv` | short depthwise causal conv1d with state | 3 |
 | `gdn` | Gated DeltaNet: gates; recurrent reference (CPU and GPU decode), chunkwise-parallel GPU prefill | 3, 7, 10 |
 | `moe` | router top-k, expert dispatch, grouped GEMM, shared expert | 12 |
-| `sample` | temperature, top-k, top-p, min-p, repetition penalty | 5, 9 |
+| `sample` | greedy, temperature, top-k, top-p, min-p (step 5); presence and repetition penalties later; GPU sampling | 5, 9 |
 | `quant` | (de)quantization per format | Q1 |
 
 Backward functions for each op are added in phase 4 (T1) in the same files, with gradient checks.
+
+## Sampling (step 5)
+
+`ath_sample_ref` chooses the next token from one row of logits. Greedy (temperature 0, or top-k 1) takes the largest logit, the lowest id among equals. Otherwise the candidates are ordered from the most likely and filtered in the order of transformers' logits warpers: temperature, top-k (a sorted list of the k best kept while scanning, about one comparison per token for small k), top-p (the shortest prefix whose probability reaches p, at least one token), min-p (drop tokens below min-p times the best). The token is where `u` falls in the cumulative distribution of the kept candidates. `u` is a uniform number in [0, 1) that the caller draws from its own generator (`ath_rng`, `src/core/rng.h`), so the op is deterministic and its tests are hand-computed: `tests/test_text.c` (`sample_rules`, and `sample_distribution`, 40,000 draws with a fixed seed against the softmax). The reference implementation records no sampling, so there is no golden data; the GPU kernel comes with GPU sampling in step 9.
 
 ## Rules
 

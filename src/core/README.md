@@ -8,10 +8,11 @@ The bottom layer: memory, tensors, files, parsing, threads. No GPU code and no k
 | `arena.h`, `arena.c` | lifetime-scoped linear arenas (weights, per-request, per-step scratch): chained blocks, alignment, mark/reset | 1 |
 | `tensor.h`, `tensor.c` | `ath_dtype`, `ath_tier`, `ath_tensor` descriptor, slice and reshape views; bf16 conversion (round to nearest even, as torch) and element access for f32 and bf16 (step 3) | 1, 3 |
 | `file.h`, `file.c` | read-only `mmap`, `pread`, path join; async reads later (io_uring via raw syscalls) | 1 |
-| `json.h`, `json.c` | read-only JSON parser into an arena; lookup by key, index and dotted path | 1 |
+| `json.h`, `json.c` | read-only JSON parser into an arena; lookup by key, index and dotted path; a writer with the formatting of Python's `json.dumps(ensure_ascii=False)` (step 5), because chat templates serialize tool definitions and arguments with it: `", "` and `": "`, Python's escapes and its shortest float repr (`1e-05`, `1e+16`) | 1, 5 |
+| `buf.h`, `buf.c` | `ath_buf`: a growable byte buffer in an arena, always NUL-terminated (rendered prompts, decoded text, JSON) | 5 |
 | `safetensors.h`, `safetensors.c` | single and multi-shard readers, zero-copy views; writer added in phase 4 for checkpoint export | 1 |
 | `threads.c/.h` | fixed pthread pool for CPU work: `ath_pool_init`, `ath_pool_run` (fork and join, tasks assigned statically, runs from several threads take turns), `ath_pool_free`; first user `ath_matmul_fast`; later experts, dequantization, I/O completion | 4 |
-| `rng.c/.h` | small deterministic PRNG for sampling, tests and training | later |
+| `rng.h`, `rng.c` | `ath_rng`: xoshiro256** seeded by splitmix64, the same sequence for the same seed on every machine; the state belongs to the caller. First user: sampling in `athanor chat` | 5 |
 
 ## Conventions
 

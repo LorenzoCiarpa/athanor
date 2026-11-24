@@ -256,6 +256,70 @@ The chat prompt's first position (`<|im_start|>`) is ill-conditioned. In layer 1
 
 transformers 5.24.0 has no implementation of the MTP head: both `Qwen3_5ForConditionalGeneration` and `Qwen3_5ForCausalLM` drop `mtp.*` on load (`_keys_to_ignore_on_load_unexpected`). The MTP **verify** item stays open until step 13, which must pin another reference (an inference engine that implements MTP speculative decoding).
 
+## Tokenizer (step 5)
+
+Source: the checkpoint's `tokenizer.json` (sha256 `5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42`), as Hugging Face tokenizers 0.23.3 runs it.
+
+| Item | Value |
+| --- | --- |
+| Model | byte-level BPE, 248,044 tokens, 247,587 merges ("a b" strings); no unknown token, no byte fallback, `ignore_merges` false |
+| Added tokens | 26, ids 248,044 to 248,069, matched in the raw text before anything else (leftmost, then longest); none strips spaces or is normalized. Special: `<\|endoftext\|>` (248044, padding), `<\|im_start\|>` (248045), `<\|im_end\|>` (248046, end of a turn), the vision markers. Not special but still single tokens: `<tool_call>`, `</tool_call>`, `<tool_response>`, `</tool_response>`, `<think>` (248068), `</think>` (248069), the FIM and repository markers |
+| Normalizer | NFC. The reference applies Unicode 9.0 normalization data (tokenizers' `unicode-normalization-alignments`), so characters added later neither compose nor reorder: 21 compositions (Todhri, Tulu-Tigalari, Gurung Khema, Kirat Rai, Dives Akuru) and 29 combining classes are left out of athanor's tables to match (`tools/dev/gen_unicode.py`) |
+| Pre-tokenizer | Split, behavior Isolated, regex `(?i:'s\|'t\|'re\|'ve\|'m\|'ll\|'d)\|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+\|\p{N}\| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*\|\s*[\r\n]+\|\s+(?!\S)\|\s+`, then ByteLevel without prefix space or regex. The regex engine is Oniguruma with Unicode 16.0 classes; `\s` is U+0009 to U+000D, U+0085, Zs, Zl, Zp; `(?i:)` folds U+017F (ſ) to s |
+| Decoder | ByteLevel: the bytes of the tokens, added tokens as their text |
+| No BOS | `add_bos_token` false; a prompt starts with `<\|im_start\|>` |
+
+Verified on 28.2 million tokens of text, including every code point (`tests/test_text.c`, `golden_tokenizer_corpus`).
+
+## Chat template (step 5)
+
+Source: the checkpoint's `chat_template.jinja` (sha256 `273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80`), rendered by transformers 5.24.0 (Jinja with `trim_blocks` and `lstrip_blocks`; `tojson` is Python's `json.dumps(ensure_ascii=False)`, without HTML escaping). Text content only; images and videos are not supported. `src/models/qwen35/text.c` renders it by hand; `golden_chat_template` compares 17 conversations byte for byte.
+
+```
+[tools present]
+<|im_start|>system
+# Tools
+
+You have access to the following functions:
+
+<tools>
+{"type": "function", "function": {"name": ..., "description": ..., "parameters": ...}}     one line per tool
+</tools>
+
+If you choose to call a function ONLY reply in the following format with NO suffix: ...   fixed instructions
+                                                                    (then "\n\n" + system content, if not empty)
+<|im_end|>
+[no tools, first message system]
+<|im_start|>system
+{system content}<|im_end|>
+[each message]
+user        <|im_start|>user\n{content}<|im_end|>\n
+assistant   <|im_start|>assistant\n[<think>\n{reasoning}\n</think>\n\n]{content}{tool calls}<|im_end|>\n
+tool        (first of a run: <|im_start|>user)\n<tool_response>\n{content}\n</tool_response>(last of a run: <|im_end|>\n)
+[generation prompt]
+<|im_start|>assistant\n<think>\n                    thinking on
+<|im_start|>assistant\n<think>\n\n</think>\n\n    thinking off
+```
+
+- Every content is trimmed with Python's `str.strip()` (Unicode white space, including U+001C to U+001F).
+- The thinking block of an assistant turn is rendered only for turns after the last user message that is not just a `<tool_response>`. Its reasoning is `reasoning_content` when given, otherwise the text between `<think>` and `</think>` in the content (newlines around it stripped), and the content keeps what follows `</think>`.
+- Tool calls of an assistant turn: `\n\n` before the first if the content is not empty, `\n` between calls; each is `<tool_call>\n<function=NAME>\n` + per argument `<parameter=KEY>\nVALUE\n</parameter>\n` + `</function>\n</tool_call>`. VALUE is `str()` of the argument in Python (a string as is, `True`, `None`, numbers as Python prints them), or `tojson` for objects and lists.
+- Errors: no messages; a system message after the first; no user message that is not only a tool response.
+
+## Output markup (step 5)
+
+What the model writes after the generation prompt, as `parse` reads it (`parse_fixtures`):
+
+| Markup | Event |
+| --- | --- |
+| text up to `</think>` when the prompt opened thinking, or between `<think>` and `</think>` | thinking; the newlines next to the tags are formatting and dropped |
+| `<tool_call>\n<function=NAME>\n<parameter=P>\nVALUE\n</parameter>\n...</function>\n</tool_call>` | a tool call: begin (NAME), arguments as one JSON object, end. VALUE becomes JSON by P's type in the tool's schema (string, integer, number, boolean, object, array; `null`), a string when it does not parse as that type; newlines before, between and after calls are formatting |
+| anything else | text; `<tool_call>` without a well-formed `<function=...>` header is text |
+
+The turn ends with `<|im_end|>` (id 248046), which the caller recognizes as a token, before parsing.
+
+Recommended sampling (model card): thinking 0.6 / 0.95 / 20 (temperature, top-p, top-k) for precise tasks, or 1.0 / 0.95 / 20 with presence penalty 1.5; without thinking 0.7 / 0.8 / 20 with presence penalty 1.5, or 1.0 / 1.0 / 20 with 2.0. The presence penalty is not implemented yet (`docs/STATUS.md`, Open questions).
+
 ## Parameter binding
 
 Step 2 binds every language-model tensor to an `ath_param` (`src/model/model.h`) with a role, a layer, an expert index and flags; `athanor inspect --roles` prints the result. Flags: `residual` = `ATH_P_WRITES_RESIDUAL` (abliteration projects the direction out of these), `sensitive` = `ATH_P_SENSITIVE` (quantization keeps these at higher precision by default), `shared` = `ATH_P_SHARED_EXPERT`. The sensitive set is a default to be measured in phase 2: the output projection (here the tied embedding) and the small matmuls that produce per-head gates.

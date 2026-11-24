@@ -35,7 +35,7 @@ Dependency direction: `tools → pipelines → contract → families → ops/tex
 
 ## The contract
 
-`src/model/model.h` is the most important file in the project. Pipelines see a model only through it. This is the header as of step 4 (comments shortened); members marked *later* join it when their first user lands.
+`src/model/model.h` is the most important file in the project. Pipelines see a model only through it. This is the header as of step 5 (comments shortened); members marked *later* join it when their first user lands.
 
 ```c
 typedef enum {
@@ -97,13 +97,42 @@ typedef struct {
     void *u;
 } ath_hooks;
 
+/* text (step 5) */
+typedef struct { const char *name, *description, *json_schema; } ath_tool_def;     /* schema: raw JSON */
+typedef struct { const char *id, *name, *arguments; } ath_tool_call;               /* arguments: raw JSON object */
+typedef enum { ATH_MSG_SYSTEM, ATH_MSG_USER, ATH_MSG_ASSISTANT, ATH_MSG_TOOL } ath_msg_role;
+typedef struct {
+    ath_msg_role role;
+    const char *content, *reasoning;                 /* reasoning: thinking given apart, or NULL */
+    const ath_tool_call *tool_calls; int32_t n_tool_calls;   /* assistant */
+    const char *tool_call_id;                        /* tool */
+} ath_msg;
+#define ATH_CHAT_GENERATE 1u   /* end with the assistant's header */
+#define ATH_CHAT_THINKING 2u
+typedef enum {
+    ATH_OUT_TEXT, ATH_OUT_THINKING,
+    ATH_OUT_TOOL_CALL_BEGIN, ATH_OUT_TOOL_CALL_ARGS, ATH_OUT_TOOL_CALL_END
+} ath_out_kind;
+typedef struct { ath_out_kind kind; const char *data; size_t len; const char *tool_name; } ath_out_event;
+typedef struct {
+    uint32_t opts; const ath_tool_def *tools; int32_t n_tools;   /* set by the caller */
+    ath_arena *a;                                                 /* parser memory, event bytes */
+    void *priv;                                                   /* the family's state */
+} ath_parse_state;
+
 struct ath_family {
     const char  *name;
     bool        (*match)  (const ath_json *config);
     ath_status  (*load)   (ath_model *m, ath_arena *a);      /* reads m->config, m->ckpt */
     ath_status  (*forward)(const ath_model *m, const ath_batch *b, ath_state *s,
                            const ath_hooks *h, ath_arena *scratch, ath_pool *pool);
-    /* later: pretokenize, chat and parse (step 5), backward (phase 4) */
+    const char  *pretokenize_regex;                          /* the tokenizer.json Split regex it implements */
+    ath_status  (*pretokenize)(const char *text, size_t n, ath_spans *out);
+    ath_status  (*chat) (const ath_msg *msgs, int32_t n_msgs, const ath_tool_def *tools, int32_t n_tools,
+                         uint32_t opts, ath_buf *out);
+    ath_status  (*parse)(ath_parse_state *st, const char *piece, size_t n,   /* piece NULL: end of output */
+                         ath_out_event *events, int32_t cap, int32_t *n_events);
+    /* later: backward (phase 4) */
 };
 
 ath_status ath_model_open(ath_model *m, ath_arena *a, const char *dir);
@@ -111,8 +140,14 @@ void       ath_model_close(ath_model *m);
 ath_status ath_state_bytes(const ath_model *m, ath_dtype act, int32_t capacity, size_t *bytes);
 ath_status ath_state_init(ath_state *s, const ath_model *m, ath_dtype act, int32_t capacity, ath_arena *a);
 void       ath_state_reset(ath_state *s, const ath_model *m);
+ath_status ath_state_copy(ath_state *dst, const ath_state *src, const ath_model *m);
 ath_status ath_model_forward(const ath_model *m, const ath_batch *b, ath_state *s,
                              const ath_hooks *h, ath_arena *scratch, ath_pool *pool);
+ath_status ath_model_tokenizer(const ath_model *m, const char *dir, ath_tokenizer *t, ath_arena *a);
+ath_status ath_model_chat(const ath_model *m, const ath_msg *msgs, int32_t n_msgs,
+                          const ath_tool_def *tools, int32_t n_tools, uint32_t opts, ath_buf *out);
+ath_status ath_model_parse(const ath_model *m, ath_parse_state *st, const char *piece, size_t n,
+                           ath_out_event *events, int32_t cap, int32_t *n_events);
 ```
 
 Members still to come, as designed:
@@ -125,48 +160,22 @@ typedef struct {
 } ath_hooks;
 
     ath_status   (*backward)   (ath_model *m, ath_batch *b, ath_grads *g);     /* NULL until phase 4 */
-    ath_status   (*pretokenize)(const char *text, size_t n, ath_spans *out);
 ```
-
-The text members, as CHANGE-001 (2026-11-24) specifies them. They join `model.h` in step 5 with their first user, `src/models/qwen35/text.c`; step 5 settles the members of `ath_msg`, `ath_buf` and `ath_parse_state` and records them here:
-
-```c
-typedef struct {
-    const char *name;
-    const char *description;
-    const char *json_schema;      /* parameters schema, raw JSON */
-} ath_tool_def;
-
-typedef enum { ATH_MSG_SYSTEM, ATH_MSG_USER, ATH_MSG_ASSISTANT, ATH_MSG_TOOL } ath_msg_role;
-/* ath_msg: role, content, optional tool calls (assistant), tool_call_id (tool results) */
-
-typedef enum {
-    ATH_OUT_TEXT, ATH_OUT_THINKING,
-    ATH_OUT_TOOL_CALL_BEGIN, ATH_OUT_TOOL_CALL_ARGS, ATH_OUT_TOOL_CALL_END
-} ath_out_kind;
-
-typedef struct {
-    ath_out_kind kind;
-    const char  *data;  size_t len;   /* text, thinking or argument bytes */
-    const char  *tool_name;           /* set on TOOL_CALL_BEGIN */
-} ath_out_event;
-
-    ath_status (*chat) (const ath_msg *msgs, int32_t n_msgs,
-                        const ath_tool_def *tools, int32_t n_tools,
-                        uint32_t opts,                 /* e.g. ATH_CHAT_THINKING */
-                        ath_buf *out);
-    ath_status (*parse)(ath_parse_state *st,           /* incremental, streaming-safe */
-                        const char *piece, size_t n,
-                        ath_out_event *events, int32_t cap, int32_t *n_events);
-```
-
-`chat` renders a conversation, with the tool definitions and the thinking switch, into the exact prompt text of the model's chat template. `parse` turns the decoded output, piece by piece as it streams, into events: text, thinking, and tool calls (name, then argument bytes, then end). It must handle markup split across pieces, nested or malformed markup (emitted as text, never a crash) and an end-of-stream flush.
 
 `load` takes the open checkpoint (`ath_safetensors`) rather than the `ath_weights` abstraction of the first design: there is one weight source until the `.ath` container lands in phase 2, which will introduce the abstraction with its second user.
 
 Since CHANGE-001 (2026-11-24) every checkpoint tensor is a param. Tensors the text path does not use, the vision encoder of a vision-language checkpoint and, until step 13, the MTP head, are bound as whole-tensor params flagged `ATH_P_UNUSED` (role other, layer −1, after all the other params), and each belongs to an ignored group that the family declares with a prefix and a reason. Pipelines on the text path skip them; an export (quantized container, abliterated checkpoint) copies them unchanged, so the result keeps its vision encoder.
 
 Step 4 departs from the first design of the state in three places. A spec counts elements, not bytes, because the element type depends on the activation dtype the state is created with (bf16, as the reference runs, or f32 for an exact forward pass); the kind fixes the rest (KV and conv state hold activations, the recurrent state is fp32). `forward` takes the model as `const` and a scratch arena for its working tensors, which the contract releases after every call. A batch is one sequence; batches of several sequences arrive with the engine (step 8). Since task 4.7, `forward` also takes the caller's thread pool (`ath_pool`, `src/core/threads.h`; NULL runs on the calling thread). It is passed explicitly because the code has no globals. The CPU matmuls spread over it with the same bits as on one thread.
+
+### Text
+
+The text members joined the contract in step 5, as CHANGE-001 (2026-11-24) specified them, with the details step 5 settled. `ath_spans` and `ath_tokenizer` are the generic byte-level BPE engine of `src/text/bpe.h`; `ath_buf` is a growable buffer in an arena (`src/core/buf.h`).
+
+- `pretokenize` splits text into the pieces BPE merges within: the family's tokenizer regex, written by hand. `pretokenize_regex` is that regex as `tokenizer.json` writes it; `ath_model_tokenizer` loads the tokenizer with the family's split and refuses a file whose regex differs.
+- `chat` renders a conversation, with the tool definitions and the thinking switch, into the exact prompt text of the model's chat template, and fails (`ATH_ERR_INVALID_ARG`) where the template raises an error. Tool definitions and arguments are raw JSON; the family serializes them as the template does.
+- `parse` turns the decoded output, piece by piece as it streams, into events: text, thinking, and tool calls (name, then argument bytes that form one JSON object, then end). Markup split across pieces is held back until it is complete; malformed markup comes out as text; a NULL piece ends the output and decides what was held back. The caller zeroes an `ath_parse_state`, sets the prompt's options, its tools (their schemas type the arguments) and an arena; the family keeps its state behind `priv`. Event bytes are valid until the next call.
+- `ath_state_copy` copies a sequence's state. A pipeline keeps a copy where a conversation will come back to, because a recurrent state cannot be rolled back: `athanor chat` keeps one at the end of each prompt's last message, since the template renders a past assistant turn differently from the prompt that produced it.
 
 ### State and the forward pass
 
@@ -187,6 +196,7 @@ The family list is compiled in from the Makefile: `FAMILIES=qwen35` generates `b
 | ablit | `on_residual` to capture activations; every param with `ATH_P_WRITES_RESIDUAL` is orthogonalized; `ATH_P_UNUSED` params exported unchanged |
 | train | `backward`; LoRA targets by `role`; hot/cold blocks by `layer`; `ATH_P_UNUSED` params frozen and never loaded |
 | net | `chat` with the request's tool definitions to render the prompt; `parse` to turn the output into text, thinking and tool-call events, which `api.c` converts to OpenAI and Anthropic formats |
+| `athanor chat` (step 5) | `ath_model_tokenizer`, `ath_model_chat`, `ath_model_forward`, `ath_sample_ref`, `ath_model_parse`; `ath_state_copy` to resume a conversation |
 
 ## Common versus family-specific
 
@@ -220,12 +230,12 @@ athanor/
 ├── Makefile                     targets: cpu (default), cuda, hip, test, clean; FAMILIES=qwen35
 ├── include/athanor.h            public C API
 ├── src/
-│   ├── core/      base.c arena.c tensor.c file.c json.c safetensors.c threads.c rng.c (each with its .h)
+│   ├── core/      base.c arena.c buf.c tensor.c file.c json.c safetensors.c threads.c rng.c (each with its .h)
 │   ├── backend/   backend.h compat.h cpu.c gpu.cu
 │   ├── ops/       ops.h, check.h (private); per op a .c reference and a .cu kernel:
-│   │              embed matmul norm rope act attn conv gdn (step 3), moe sample quant
-│   ├── text/      bpe.c unicode.h (generated, committed)
-│   ├── model/     model.h registry.c state.c
+│   │              embed matmul norm rope act attn conv gdn (step 3), sample (step 5), moe quant
+│   ├── text/      bpe.c unicode.c, unicode_tables.h (generated, committed)
+│   ├── model/     model.h registry.c state.c text.c
 │   ├── models/
 │   │   └── qwen35/  qwen35.h family.c config.c weights.c forward.c text.c [backward.c] [fused.cu]
 │   ├── infer/     engine.c state.c sched.c tier.c spec.c
@@ -233,9 +243,9 @@ athanor/
 │   ├── ablit/     capture.c direction.c edit.c search.c eval.c
 │   ├── train/     loop.c optim.c lora.c hotcold.c data.c planner.c ckpt.c
 │   └── net/       http.c api.c
-├── tools/         athanor.c (dispatch), one file per subcommand (inspect.c, ...), dev/ (development helpers)
-├── tests/         test.h (runner) util.h tiny.h test_core.c test_model.c test_ops.c test_golden.c test_forward.c ...
-│                  golden/ (dump.py, requirements.txt; data/ generated, not committed)
+├── tools/         athanor.c (dispatch), one file per subcommand (inspect.c, chat.c, ...), dev/ (development helpers)
+├── tests/         test.h (runner) util.h tiny.h test_core.c test_model.c test_ops.c test_golden.c test_forward.c
+│                  test_text.c ...; golden/ (dump.py, text.py, requirements.txt; data/ generated, not committed)
 └── docs/          ARCHITECTURE.md PLAN.md STATUS.md status_extended.md MODELS.md BENCHMARKS.md
                    CHANGE-*.md (specification changes, applied as recorded in STATUS.md)
                    contract/ program/ proposals/ results/
@@ -247,7 +257,8 @@ athanor/
 | --- | --- |
 | JSON | read-only parser into an arena |
 | safetensors, GGUF | direct readers; both are a header plus offsets |
-| tokenizer regex | a hand-written split function per family; Unicode category tables generated once into `src/text/unicode.h` |
+| tokenizer regex | a hand-written split function per family; Unicode category and normalization tables generated once into `src/text/unicode_tables.h` |
+| chat template engine (Jinja) | the family's template rendered by hand in C, compared byte for byte with the reference's rendering |
 | HTTP server with streaming | minimal HTTP/1.1 with server-sent events over POSIX sockets, localhost only |
 | thread pool, async I/O | pthreads and `pread`; io_uring through raw syscalls later |
 | test framework | a minimal C runner |

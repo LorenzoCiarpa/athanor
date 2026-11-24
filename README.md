@@ -9,7 +9,7 @@ It follows the thesis of [DwarfStar](https://github.com/antirez/ds4), [Strata](h
 
 ## Status
 
-Pre-alpha. Steps 1 to 4 done: the core library and `athanor inspect` read a checkpoint without copying it, the model contract binds every tensor, and the whole Qwen3.5-0.8B forward pass runs on the CPU, checked against the reference implementation. Live status: [docs/STATUS.md](docs/STATUS.md).
+Pre-alpha. Steps 1 to 5 done: the core library and `athanor inspect` read a checkpoint without copying it, the model contract binds every tensor, the whole Qwen3.5-0.8B forward pass runs on the CPU, checked against the reference implementation, and `athanor chat` talks to it on the CPU, with the reference's tokenizer and chat template reproduced exactly, thinking and tool calls included. Live status: [docs/STATUS.md](docs/STATUS.md).
 
 ## What it does
 

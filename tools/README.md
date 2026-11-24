@@ -7,6 +7,7 @@ One binary, `athanor`, with subcommands. `athanor.c` holds only the dispatch tab
 | `athanor.c` | dispatch table, global `--help`, arena-backed stdout buffer, exit codes |
 | `commands.h` | subcommand entry points (`ath_cmd_<name>`) and exit codes: 0 success, 1 failure, 2 usage |
 | `inspect.c` | `athanor inspect` |
+| `chat.c` | `athanor chat` (step 5) |
 | `dev/` | development-only helpers, never built into `athanor` |
 
 | Subcommand | Purpose | Step |
@@ -53,10 +54,32 @@ ignored  model.visual.      153 tensors  191.87 MiB  vision encoder: text path o
 check    488 checkpoint tensors (1.63 GiB): 488 bound to 488 params (168 in ignored groups, unused), 0 unbound
 ```
 
+## `athanor chat` (step 5)
+
+```
+athanor chat <model_dir> [-p <text>] [--system <text>] [--think] [--tools <file.json>]
+             [--temp t] [--top-k k] [--top-p p] [--min-p p] [--seed n] [--max-tokens n]
+             [--ctx n] [--threads n] [--f32] [--stats]
+```
+
+A conversation on the CPU, through the contract only: the family's chat template renders the whole conversation, the tokenizer encodes it, the forward pass runs on a thread pool, `ath_sample_ref` picks each token, and the family's parser splits the output into text, thinking and tool calls as it streams. With `-p` it answers one message and exits; otherwise it reads one message per line from stdin (a line ending in `\` continues), with `/reset`, `/tool <text>` and `/exit`.
+
+- `--think` lets the model think first; the thinking is shown dimmed on a terminal and goes to stderr otherwise, so stdout holds the answer.
+- `--tools` takes a JSON array of tool definitions in OpenAI format. A call is printed as `[tool call] name {arguments}`; athanor never runs it (AGENTS.md, invariant 10). `/tool <result>` sends a result back as the harness would.
+- Sampling defaults are the model card's for Qwen3.5 without the presence penalty: temperature 0.7, top-p 0.8, top-k 20, and 0.6, 0.95, 20 with `--think`. `--temp 0` is greedy. The seed defaults to the clock.
+- The state is reused across turns: only new tokens run when the prompt extends what the state has seen; otherwise a copy of the state taken at the end of the previous prompt's last message is restored (the template rewrites a past assistant turn), and only when that does not match either does the conversation run again.
+- `--ctx` bounds the conversation (default 8192 tokens); the KV cache and the copy are allocated for it. `--f32` runs with f32 activations. `--stats` prints, after each answer, how many prompt tokens ran and the speeds.
+
+```
+$ athanor chat models/Qwen3.5-0.8B -p "What is the capital of Italy? Answer in one sentence." --temp 0
+The capital of Italy is Rome.
+```
+
 ## `tools/dev/`
 
 Development-only helpers (Python allowed): Unicode table generation, golden data utilities.
 
 | File | Content |
 | --- | --- |
+| `gen_unicode.py` | generates `src/text/unicode_tables.h` (character classes and NFC data) from Python's `unicodedata`, with the normalization limited to what the reference tokenizer applies; run with the golden environment (`src/text/README.md`) |
 | `check_alloc.sh`, `alloc_trace.c` | run a command under an `LD_PRELOAD` shim that reports every `malloc`/`calloc`/`realloc`, and fail if any caller is not `ath_arena_alloc` or if the command itself fails. `make check-alloc` runs it on `athanor inspect` with and without `--roles`. Needs a C compiler and `addr2line` |

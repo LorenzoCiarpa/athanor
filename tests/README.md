@@ -78,6 +78,14 @@ ATH_FORWARD_DETAIL=1 ./build/test_forward golden     # KL, margin and greedy cho
 
 A `DEBUG=1` build runs the first 4 positions of each prompt (three in one call, one alone) and checks the f32 tolerances; the gate needs every position.
 
+## Text
+
+`tests/golden/text.py` records, with the pinned reference (transformers 5.24.0, tokenizers 0.23.3), what `test_text` compares exactly:
+
+- **Tokenizer.** For 188 texts, 28 million tokens in all: the ids the reference gives and the text it decodes them to. Hand-written cases (languages, scripts, emoji sequences, code, every kind of white space, contractions in every case, added tokens inside text, normalization), files of this repository and the model card, every Unicode code point but the surrogates in five contexts (`a·`, ` ·`, `·1`, `·!`, `·'`), and every canonical decomposition, decomposed, with up to three extra marks in shuffled order. athanor must give the same ids and decode them to the same bytes: no tolerance.
+- **Chat template.** 20 conversations rendered by `apply_chat_template`: with and without system, thinking on and off, history with thinking in the content or apart, tools with and without system, tool calls with typed arguments and their results, tool responses written as user messages, trimming, Unicode; 3 of them the template rejects. athanor must render the same bytes (and give the same ids), or fail where the template raises.
+- **Generation.** A chat prompt, 32 greedy steps of the fp32 reference with the top-2 margin of each step, and the bf16 noise of that margin (its largest change from fp32 to the bf16 reference on the same tokens). athanor, with bf16 activations and its own template and tokenizer, must choose the reference's token at every step until the first one whose margin is within the noise (step 27 of 32 for this prompt); after it the two may part legitimately, and the test reports how many tokens are equal in all (32). A `DEBUG=1` build runs 4 steps.
+
 ## Runner
 
 A minimal C runner: `ATH_TEST(name) { ... }`, `ATH_EXPECT_*` assertions, a summary line, non-zero exit on failure. No external test framework.
@@ -85,9 +93,10 @@ A minimal C runner: `ATH_TEST(name) { ... }`, `ATH_EXPECT_*` assertions, a summa
 `tests/test.h` holds the runner (header-only); `tests/util.h` the helpers the suites share (scratch directory, location of the real checkpoint); `tests/tiny.h` the tiny synthetic Qwen3.5 checkpoints (`config.json` and safetensors, zero-filled or pseudo-random, with mutations for the failure tests) that `test_model` and `test_forward` share. Each suite is one `tests/test_<area>.c` built into `build/test_<area>` with a table of `ATH_TEST_ENTRY(name)` at the bottom. Assertions: `ATH_EXPECT` (record and continue), `ATH_REQUIRE` (record and end the test), `ATH_EXPECT_OK`, `ATH_EXPECT_STATUS`, `ATH_EXPECT_EQ_INT`, `ATH_EXPECT_EQ_U64`, `ATH_EXPECT_STR_EQ`, `ATH_EXPECT_NEAR`, and `ATH_SKIP(why)`.
 
 ```
-make test                          # all suites, smoke runs of athanor inspect (with and without --roles), and make check-alloc; about 13 s
-make DEBUG=1 test                  # same suites with ASan and UBSan, in build/debug; about 3 minutes
-                                   # (test_golden 2.6 minutes there, 5 s in release; test_forward 34 s on 4 positions, 11 s on all)
+make test                          # all suites, smoke runs of athanor inspect (with and without --roles), and make check-alloc; about 17 s
+make DEBUG=1 test                  # same suites with ASan and UBSan, in build/debug; about 4 minutes
+                                   # (test_golden 2.6 minutes there, 5 s in release; test_forward 34 s on 4 positions, 11 s on all;
+                                   # test_text 3 s in release, its generation 4 steps instead of 32 there)
 ./build/test_core json             # only tests whose name contains "json"
 ATH_LOG=error ./build/test_core    # show the library's error messages (silenced by default)
 ```
@@ -101,3 +110,4 @@ Synthetic files (safetensors shards, indexes, broken headers) are written by the
 | `test_ops.c` | every `_ref` function of `src/ops/` on hand-computed cases (bf16 rounding, norms, RoPE pairing and relative positions, attention averaging and head grouping, conv taps, the delta rule step by step, gates around the softplus threshold) and on exact properties: streaming equals all at once for conv and Gated DeltaNet, decode equals the last prefill row for attention, causality, argument checks; `ath_matmul_fast` bit for bit against `ath_matmul_ref` (7 shapes × 8 dtype combinations, without and with threads) |
 | `test_golden.c` | every op the reference computes on Qwen3.5-0.8B (24 layers, prefill and decode, 906 records), replayed through the `_ref` functions on the real weights, native and exact (above); every matmul record also through `ath_matmul_fast` on 8 threads, required bit-identical to `ath_matmul_ref` |
 | `test_forward.c` | the forward pass through the contract: state specs and sizes, argument checks, hooks, all at once = in pieces = token by token on tiny random checkpoints; the real checkpoint against the forward records (above) |
+| `test_text.c` | text, through the contract only: UTF-8, character classes, NFC, the Python-style JSON writer, pre-tokenization pieces, the output parser (17 fixtures, each also split at every byte and fed byte by byte), template errors, sampling (hand-computed cases and a distribution with a fixed seed); against the text golden data (below): the corpus, the templates, the greedy chat generation |

@@ -16,6 +16,7 @@ How to read it:
   - [Step 2: contract and family loading](#step-2-contract-and-family-loading)
   - [Step 3: CPU reference ops and golden harness](#step-3-cpu-reference-ops-and-golden-harness)
   - [Step 4: CPU forward](#step-4-cpu-forward)
+  - [Step 5: tokenizer, sampling, CPU chat](#step-5-tokenizer-sampling-cpu-chat)
 - [Files by step](#files-by-step)
 
 ---
@@ -666,49 +667,200 @@ What was implemented:
 
 ---
 
+### Step 5: tokenizer, sampling, CPU chat
+
+Branch `step5-tokenizer-chat`, from `main` after step 4 and CHANGE-001 were merged. The gate of `docs/PLAN.md`, as CHANGE-001 amended it: exact token round trip against the reference tokenizer, prompts byte-identical to the reference chat template with and without tools, parser fixtures, a first chat.
+
+#### 5.1 Text golden data
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `tests/golden/text.py` | New | The reference's tokenizer, template and generation, recorded for `test_text` |
+| `Makefile` | Changed | `make golden` runs `text.py` after `dump.py` |
+
+What was implemented:
+
+- **Corpus.**
+  - 43 hand-written cases: languages and scripts, emoji sequences, numbers, contractions in every case (U+017F included), white space of every kind, code, JSON, HTML, URLs, punctuation runs, marks, text that needs NFC, added tokens inside text and their prefixes, tool markup, long runs, control and private-use characters, unassigned code points.
+  - Five repository files and the model card.
+  - Every code point but the surrogates, in five contexts, in chunks of 8192.
+  - Every canonical decomposition, decomposed, with up to three extra marks shuffled by a seeded generator, and Hangul syllables as jamo.
+  - For each text: the text, the ids from `tokenizer.encode`, and the text from `tokenizer.decode`.
+- **Templates.** 20 conversations, each rendered with `apply_chat_template` (and tokenized) or recorded as an error. The C view of each conversation stores schemas and arguments as compact JSON text, so the test also checks that athanor re-serializes them as `json.dumps` does.
+- **Generation.** The prompt of a one-message chat, 32 greedy steps of the fp32 reference with the top-2 margin of each, and the bf16 noise of the margin: the bf16 reference run on the same tokens, the largest change of the margin.
+
+#### 5.2 Unicode
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `tools/dev/gen_unicode.py` | New | Generates the tables from Python's `unicodedata`, the normalization limited to what the reference tokenizer applies |
+| `src/text/unicode_tables.h` | New (generated) | Class ranges (1,152), combining-class ranges (333), full canonical decompositions (2,060), primary composites (940) |
+| `src/text/unicode.h`, `unicode.c` | New | UTF-8 decoding (invalid bytes kept as themselves) and encoding, `ath_unicode_class`, `ath_unicode_ccc`, `ath_nfc` |
+
+What was implemented:
+
+- **Classes** for the regex: letter, mark, number, and white space as Oniguruma's `\s`, from Unicode 16.0.
+- **NFC** after UAX #15: full decomposition (Hangul computed), a stable sort of each run of non-starters, composition with the last starter when not blocked. Text below U+0300 is returned as it is (a quick check that holds for every such code point).
+- **Two Unicode versions.** The first corpus run failed on the decompositions case: the reference did not compose a Todhri letter added in Unicode 16. Its NFC uses Unicode 9.0 data. The generator now runs the reference's NFC and NFD on every entry and keeps only what it applies; 21 compositions and 29 combining classes are left out.
+
+#### 5.3 `src/text/bpe.c`
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `src/text/bpe.h`, `bpe.c` | New | `ath_tokenizer`: load, encode, decode; `ath_spans`, `ath_tokens` |
+| `Makefile` | Changed | `src/text/*.c` in the library |
+
+What was implemented:
+
+- **Loading.** `tokenizer.json` is parsed into a temporary arena. Token bytes (mapped back from the GPT-2 alphabet), the added tokens and a merge table (open addressing, pair of ids → rank and result) stay. A temporary byte-string → id map resolves the merges. Unsupported features fail with `ATH_ERR_UNSUPPORTED`, and the split regex must equal the family's.
+- **Encoding.** Added tokens are found first (a first-byte filter, then the longest match). The text between them goes through NFC and the family's split; each piece is merged from bytes, always taking the lowest-rank pair, leftmost among equals. This is the order Hugging Face's priority queue gives.
+- **Speed**, for the record: load 0.06 s, 28 million tokens encoded in 0.6 s.
+
+#### 5.4 Contract and core helpers
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `src/model/model.h` | Changed | Text types, the family's text members, `ath_model_tokenizer`, `ath_model_chat`, `ath_model_parse`, `ath_state_copy` |
+| `src/model/text.c` | New | The three text functions: argument checks, then the family |
+| `src/model/state.c` | Changed | `ath_state_copy` |
+| `src/core/buf.h`, `buf.c` | New | `ath_buf` |
+| `src/core/json.h`, `json.c` | Changed | `ath_json_write`, `ath_json_write_str`, `ath_json_write_double` with Python's formatting |
+| `src/core/rng.h`, `rng.c` | New | `ath_rng` |
+
+What was implemented:
+
+- **The text contract** of CHANGE-001, with the details the step settled (STATUS log): what a message carries, the chat options, the parser state with the family's state behind a pointer, the end of output, the event lifetime, and a bound on the number of events.
+- **`pretokenize_regex`**, a member the CHANGE did not have, so that the tokenizer can refuse a file with another regex.
+- **`ath_state_copy`** copies every buffer and `n_past` between two states of equal capacity and dtype.
+- **The JSON writer** reproduces `json.dumps(ensure_ascii=False)`: separators, escapes (`\u00xx` in lower case for control characters), floats in Python's shortest repr, found by trying increasing precision until the value reads back the same.
+
+#### 5.5 `src/models/qwen35/text.c`
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `src/models/qwen35/text.c` | New | `ath_qwen35_pretokenize` (and its regex), `ath_qwen35_chat`, `ath_qwen35_parse` |
+| `src/models/qwen35/qwen35.h`, `family.c` | Changed | Declarations; the text members of `ath_family_qwen35` |
+
+What was implemented:
+
+- **Pre-tokenization**: at each position the first alternative of the regex that matches, each with its own backtracking written out. The optional character of the letter alternative is taken first and given back if no letter follows. The three white-space alternatives share one scan of the run: up to its last CR or LF, all of it at the end of the text, all but its last character, or all of it.
+- **The template**, line by line from `chat_template.jinja`:
+  - the tools block with the fixed instructions;
+  - the system message, trimmed with Python's `str.strip`;
+  - the last real user query, which decides which assistant turns show their thinking;
+  - reasoning taken from the content around `<think>` and `</think>` when not given apart;
+  - tool calls with arguments printed as Python's `str()` or `tojson`;
+  - runs of tool results in one user turn;
+  - the generation prompt with or without thinking;
+  - the three errors the template raises.
+- **The parser**, a state machine over a buffer of unconsumed bytes, in six modes: text, thinking, after `<tool_call>`, inside a function, inside a parameter value, after `</function>`.
+  - A tag split across pieces is held back until it is complete, and so are newlines that may turn out to be formatting.
+  - A call begins only once `<function=NAME>` is complete, so a malformed header can still be given back as text.
+  - Each value becomes JSON by its schema type. Events of one kind merge, and their bytes are copied into one buffer per call.
+
+#### 5.6 `src/ops/sample.c`
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `src/ops/sample.c` | New | `ath_sample_ref` |
+| `src/ops/ops.h` | Changed | `ath_sampler`, `ath_sample_ref` |
+
+What was implemented: greedy, then temperature, top-k (an insertion-sorted list of the k best), or a heapsort of the whole vocabulary without top-k; top-p and min-p cuts; inverse-transform draw with the caller's uniform number. Probabilities are relative weights in double, and scratch memory is released.
+
+#### 5.7 `athanor chat`
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `tools/chat.c` | New | The subcommand |
+| `tools/athanor.c`, `commands.h` | Changed | Its entry in the dispatch table |
+
+What was implemented:
+
+- **Options and modes.** Option parsing with the model card's defaults; one-shot `-p` or messages from stdin with `/reset`, `/tool` and `/exit`; tool definitions from a JSON file.
+- **Each turn**:
+  - render the whole conversation;
+  - tokenize it, and tokenize it again without the generation header to find the stable prefix;
+  - continue from the state, or restore its copy, or reset;
+  - run the prompt with a copy taken at the stable prefix (none in one-shot mode);
+  - sample until `<|im_end|>` or `<|endoftext|>`, parse each token's bytes and show the events;
+  - store the answer (text, thinking, calls) in the history.
+- **Memory.** One arena for the model, the tokenizer and the states; one for the history; one per turn; one for the forward pass's scratch memory.
+
+#### 5.8 `tests/test_text.c`
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `tests/test_text.c` | New | 12 tests (README of `tests/`) |
+| `Makefile` | Changed | `test_text` in the suites |
+
+What was implemented: unit tests that need no data (UTF-8, classes, NFC, the JSON writer, pre-tokenization pieces, 17 parser fixtures under every split, template errors, sampling rules and distribution), and the three golden comparisons. The parser fixtures caught one difference on the first run: newlines after a tool call were kept as text. The first DEBUG run caught one `memcmp` with a NULL pointer in the test itself.
+
+#### 5.9 Documentation and closing step 5
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `docs/STATUS.md` | Changed | Step 5 current and done, step 4 completed and merged, step 6 preview, open question (presence penalty), log |
+| `docs/ARCHITECTURE.md` | Changed | Contract excerpt as of step 5, section Text, `athanor chat` in the pipeline table, the tree, the template engine in "What athanor writes itself" |
+| `docs/contract/qwen35-0.8b.md` | Changed | Sections Tokenizer, Chat template, Output markup |
+| `src/core/README.md`, `src/text/README.md`, `src/ops/README.md`, `src/model/README.md`, `src/models/qwen35/README.md`, `tools/README.md`, `tests/README.md`, `tests/golden/README.md` | Changed | New files and interfaces, `athanor chat`, the text tests and data, times |
+| `docs/program/PROGRAM.md` | Changed | Rows 5, 6 and 6b |
+| `README.md` | Changed | Status line |
+
+---
+
 ## Files by step
 
 Every file of the repository and the steps that created or changed it (documentation-only edits included).
 
-| File | Step 1 | Step 2 | Step 3 | Step 4 |
-| --- | --- | --- | --- | --- |
-| `Makefile` | 1.1, 1.8 | 2.3, 2.6 | 3.3, 3.4, 3.5, 3.6 | 4.5 |
-| `src/core/base.{h,c}` | 1.2 | | | |
-| `src/core/arena.{h,c}` | 1.3 | | | |
-| `src/core/file.{h,c}` | 1.4, 1.7 | | | |
-| `src/core/json.{h,c}` | 1.5 | | | |
-| `src/core/tensor.{h,c}` | 1.6 | | 3.2 | |
-| `src/core/safetensors.{h,c}` | 1.7 | | | |
-| `src/core/threads.{h,c}` | | | | 4.7 |
-| `src/model/model.h` | | 2.2 | | 4.2, 4.7, 4.8 |
-| `src/model/registry.c` | | 2.3 | | 4.8 |
-| `src/model/state.c` | | | | 4.2, 4.7 |
-| `src/models/qwen35/qwen35.h`, `config.c` | | 2.4 | | 4.3, 4.7, 4.8 (`qwen35.h`) |
-| `src/models/qwen35/weights.c`, `family.c` | | 2.5 | | 4.3, 4.8 (`weights.c`) |
-| `src/models/qwen35/forward.c` | | | | 4.3, 4.7 |
-| `src/ops/ops.h`, `check.h`, `embed.c`, `matmul.c`, `norm.c`, `rope.c`, `act.c`, `attn.c`, `conv.c`, `gdn.c` | | | 3.3 | 4.7 (`ops.h`, `matmul.c`) |
-| `tools/athanor.c`, `commands.h` | 1.8 | | | |
-| `tools/inspect.c` | 1.8 | 2.6 | | 4.8 |
-| `tools/dev/alloc_trace.c` | 1.8 | | | |
-| `tools/dev/check_alloc.sh` | 1.8 | 2.6 | | |
-| `tests/test.h` | 1.9 | | | |
-| `tests/test_core.c` | 1.9 | 2.7 | | 4.7 |
-| `tests/util.h`, `tests/test_model.c` | | 2.7 | | 4.5, 4.8 (`test_model.c`) |
-| `tests/test_ops.c` | | | 3.5 | 4.7 |
-| `tests/test_golden.c` | | | 3.6 | 4.7 |
-| `tests/tiny.h`, `tests/test_forward.c` | | | | 4.5, 4.7 (`test_forward.c`) |
-| `tests/golden/dump.py`, `README.md` | | | 3.4 | 4.4, 4.8 |
-| `tests/golden/requirements.in`, `requirements.txt` | | | 3.1 | |
-| `docs/contract/qwen35-0.8b.md` | closing | 2.1 | 3.1, 3.7 | 4.6, 4.8 |
-| `docs/contract/qwen35-35b-a3b.md` | | 2.1 | | 4.8 |
-| `docs/MODELS.md` | | 2.1 | 3.7 | 4.6, 4.8 |
-| `docs/ARCHITECTURE.md` | closing | 2.2 | 3.7 | 4.6, 4.7, 4.8 |
-| `docs/PLAN.md` | | | | 4.8 |
-| `docs/STATUS.md` | closing | 2.1 to 2.7, closing | 3.1, closing | 4.1, closing, 4.7, 4.8 |
-| `docs/program/PROGRAM.md` | closing | closing | 3.7 | 4.6, 4.7, 4.8 |
-| `docs/proposals/cpu-matmul-avx512.md` | | | | 4.7 |
-| `docs/CHANGE-001-scope-tools-cache.md` | | | | 4.8 |
-| `docs/status_extended.md` | | | closing | 4.6, 4.7, 4.8 |
-| `AGENTS.md` | | 2.3 | 3.7 | 4.8 |
-| `README.md` | closing | | | 4.8 |
-| module READMEs | closing (`src/core`, `tests`, `tools`) | 2.2, 2.5, 2.6, 2.7 (`src/model`, `src/models/qwen35`, `tools`, `tests`) | 3.2, 3.3, 3.6, 3.7 (`src/core`, `src/ops`, `tests`, `tests/golden`, `src/backend`) | 4.6 (`src/model`, `src/models/qwen35`, `tests`, `tests/golden`); 4.7 (`src/core`, `src/ops`, `src/backend`, `src/model`, `src/models/qwen35`, `tests`); 4.8 (`src/model`, `src/models/qwen35`, `src/net`, `src/infer`, `src/text`, `tools`) |
+| File | Step 1 | Step 2 | Step 3 | Step 4 | Step 5 |
+| --- | --- | --- | --- | --- | --- |
+| `Makefile` | 1.1, 1.8 | 2.3, 2.6 | 3.3, 3.4, 3.5, 3.6 | 4.5 | 5.1, 5.3, 5.8 |
+| `src/core/base.{h,c}` | 1.2 | | | | |
+| `src/core/arena.{h,c}` | 1.3 | | | | |
+| `src/core/file.{h,c}` | 1.4, 1.7 | | | | |
+| `src/core/json.{h,c}` | 1.5 | | | | 5.4 |
+| `src/core/tensor.{h,c}` | 1.6 | | 3.2 | | |
+| `src/core/safetensors.{h,c}` | 1.7 | | | | |
+| `src/core/threads.{h,c}` | | | | 4.7 | |
+| `src/model/model.h` | | 2.2 | | 4.2, 4.7, 4.8 | 5.4 |
+| `src/model/registry.c` | | 2.3 | | 4.8 | |
+| `src/model/state.c` | | | | 4.2, 4.7 | 5.4 |
+| `src/models/qwen35/qwen35.h`, `config.c` | | 2.4 | | 4.3, 4.7, 4.8 (`qwen35.h`) | 5.5 (`qwen35.h`) |
+| `src/models/qwen35/weights.c`, `family.c` | | 2.5 | | 4.3, 4.8 (`weights.c`) | 5.5 (`family.c`) |
+| `src/models/qwen35/forward.c` | | | | 4.3, 4.7 | |
+| `src/ops/ops.h`, `check.h`, `embed.c`, `matmul.c`, `norm.c`, `rope.c`, `act.c`, `attn.c`, `conv.c`, `gdn.c` | | | 3.3 | 4.7 (`ops.h`, `matmul.c`) | 5.6 (`ops.h`) |
+| `tools/athanor.c`, `commands.h` | 1.8 | | | | 5.7 |
+| `tools/inspect.c` | 1.8 | 2.6 | | 4.8 | |
+| `tools/dev/alloc_trace.c` | 1.8 | | | | |
+| `tools/dev/check_alloc.sh` | 1.8 | 2.6 | | | |
+| `tests/test.h` | 1.9 | | | | |
+| `tests/test_core.c` | 1.9 | 2.7 | | 4.7 | |
+| `tests/util.h`, `tests/test_model.c` | | 2.7 | | 4.5, 4.8 (`test_model.c`) | |
+| `tests/test_ops.c` | | | 3.5 | 4.7 | |
+| `tests/test_golden.c` | | | 3.6 | 4.7 | |
+| `tests/tiny.h`, `tests/test_forward.c` | | | | 4.5, 4.7 (`test_forward.c`) | |
+| `tests/golden/dump.py`, `README.md` | | | 3.4 | 4.4, 4.8 | 5.9 (`README.md`) |
+| `tests/golden/requirements.in`, `requirements.txt` | | | 3.1 | | |
+| `src/core/buf.{h,c}`, `src/core/rng.{h,c}` | | | | | 5.4 |
+| `src/text/unicode.{h,c}`, `unicode_tables.h` | | | | | 5.2 |
+| `src/text/bpe.{h,c}` | | | | | 5.3 |
+| `src/model/text.c` | | | | | 5.4 |
+| `src/models/qwen35/text.c` | | | | | 5.5 |
+| `src/ops/sample.c` | | | | | 5.6 |
+| `tools/chat.c` | | | | | 5.7 |
+| `tools/dev/gen_unicode.py` | | | | | 5.2 |
+| `tests/test_text.c` | | | | | 5.8 |
+| `tests/golden/text.py` | | | | | 5.1 |
+| `docs/contract/qwen35-0.8b.md` | closing | 2.1 | 3.1, 3.7 | 4.6, 4.8 | 5.9 |
+| `docs/contract/qwen35-35b-a3b.md` | | 2.1 | | 4.8 | |
+| `docs/MODELS.md` | | 2.1 | 3.7 | 4.6, 4.8 | |
+| `docs/ARCHITECTURE.md` | closing | 2.2 | 3.7 | 4.6, 4.7, 4.8 | 5.9 |
+| `docs/PLAN.md` | | | | 4.8 | |
+| `docs/STATUS.md` | closing | 2.1 to 2.7, closing | 3.1, closing | 4.1, closing, 4.7, 4.8 | 5.1 to 5.9, closing |
+| `docs/program/PROGRAM.md` | closing | closing | 3.7 | 4.6, 4.7, 4.8 | 5.9 |
+| `docs/proposals/cpu-matmul-avx512.md` | | | | 4.7 | |
+| `docs/CHANGE-001-scope-tools-cache.md` | | | | 4.8 | |
+| `docs/status_extended.md` | | | closing | 4.6, 4.7, 4.8 | 5.9 |
+| `AGENTS.md` | | 2.3 | 3.7 | 4.8 | |
+| `README.md` | closing | | | 4.8 | 5.9 |
+| module READMEs | closing (`src/core`, `tests`, `tools`) | 2.2, 2.5, 2.6, 2.7 (`src/model`, `src/models/qwen35`, `tools`, `tests`) | 3.2, 3.3, 3.6, 3.7 (`src/core`, `src/ops`, `tests`, `tests/golden`, `src/backend`) | 4.6 (`src/model`, `src/models/qwen35`, `tests`, `tests/golden`); 4.7 (`src/core`, `src/ops`, `src/backend`, `src/model`, `src/models/qwen35`, `tests`); 4.8 (`src/model`, `src/models/qwen35`, `src/net`, `src/infer`, `src/text`, `tools`) | 5.9 (`src/core`, `src/text`, `src/ops`, `src/model`, `src/models/qwen35`, `tools`, `tests`) |

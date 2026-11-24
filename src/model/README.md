@@ -1,12 +1,13 @@
 # src/model
 
-The contract between pipelines and model families, and the static registry. Introduced in step 2; the forward pass and the per-sequence state joined in step 4.
+The contract between pipelines and model families, and the static registry. Introduced in step 2; the forward pass and the per-sequence state joined in step 4, text (tokenizer, chat template, output parser) in step 5.
 
 | File | Content |
 | --- | --- |
-| `model.h` | `ath_role` and `ath_role_name`, param flags, `ath_param`, the layer schedule `ath_layer`, ignored groups `ath_ignored` (their tensors are params flagged `ATH_P_UNUSED`), state kinds and specs (`ath_state_spec`), `ath_model`, `ath_state`, `ath_batch`, `ath_hooks`, `ath_family` (`match`, `load`, `forward`); the functions of `registry.c` and `state.c` |
+| `model.h` | `ath_role` and `ath_role_name`, param flags, `ath_param`, the layer schedule `ath_layer`, ignored groups `ath_ignored` (their tensors are params flagged `ATH_P_UNUSED`), state kinds and specs (`ath_state_spec`), `ath_model`, `ath_state`, `ath_batch`, `ath_hooks`, the text types (`ath_tool_def`, `ath_tool_call`, `ath_msg`, `ATH_CHAT_*`, `ath_out_event`, `ath_parse_state`), `ath_family` (`match`, `load`, `forward`, `pretokenize_regex`, `pretokenize`, `chat`, `parse`); the functions of `registry.c`, `state.c` and `text.c` |
 | `registry.c` | the compiled-in families (from the Makefile `FAMILIES` list through the generated `families.h`); `ath_model_open(dir)` reads `config.json`, picks the family whose `match` accepts it, maps the checkpoint, calls `load`, then runs the coverage check |
-| `state.c` | `ath_state_bytes`, `ath_state_init`, `ath_state_reset`: the state of one sequence from the model's specs, in host memory; `ath_model_forward`: argument checks, the family's `forward` (with the caller's thread pool), scratch memory released, `n_past` advanced |
+| `state.c` | `ath_state_bytes`, `ath_state_init`, `ath_state_reset`: the state of one sequence from the model's specs, in host memory; `ath_model_forward`: argument checks, the family's `forward` (with the caller's thread pool), scratch memory released, `n_past` advanced; `ath_state_copy` (step 5) |
+| `text.c` | `ath_model_tokenizer` (the checkpoint's `tokenizer.json` with the family's pre-tokenization), `ath_model_chat`, `ath_model_parse`: argument checks, then the family's function (step 5) |
 
 The full definition and the reasoning behind it are in `docs/ARCHITECTURE.md`. Any change to `model.h` must be reflected there and must keep every existing family compiling.
 
@@ -48,6 +49,30 @@ ath_pool_free(&pool);
 ```
 
 The logits tensor has one row per token or one row for the last token. `n_past` counts the tokens the state has seen; a batch that does not fit in `capacity` fails with `ATH_ERR_RANGE` and leaves the state as it was. Any other failure inside the family leaves the state undefined until `ath_state_reset`. Every working tensor of a call comes from the scratch arena and is released before it returns, so the arena's blocks are reused from call to call. The pool lends its threads to the CPU work. A NULL pool runs everything on the calling thread, and the logits and the state are the same bits with any number of threads.
+
+## Text
+
+```c
+ath_tokenizer tok;
+ATH_CHECK(ath_model_tokenizer(&m, dir, &tok, &a));          /* tokenizer.json + the family's split */
+ath_msg msgs[] = {{.role = ATH_MSG_USER, .content = "Why is the sky blue?"}};
+ath_buf prompt;
+ath_buf_init(&prompt, &a);
+ATH_CHECK(ath_model_chat(&m, msgs, 1, NULL, 0, ATH_CHAT_GENERATE, &prompt));   /* the template, byte for byte */
+ath_tokens ids;
+ath_tokens_init(&ids, &a);
+ATH_CHECK(ath_tokenizer_encode(&tok, prompt.data, prompt.len, &ids, &scratch));
+/* ... ath_model_forward on ids, then per token: sample, decode, parse ... */
+ath_parse_state ps = {.opts = ATH_CHAT_GENERATE, .a = &a};
+ath_out_event ev[64];
+int32_t n_ev;
+ATH_CHECK(ath_model_parse(&m, &ps, piece, piece_len, ev, 64, &n_ev));   /* text, thinking, tool calls */
+ATH_CHECK(ath_model_parse(&m, &ps, NULL, 0, ev, 64, &n_ev));            /* end of the output */
+```
+
+Tools are `ath_tool_def`s (name, description, the parameters schema as raw JSON); an assistant message carries the calls it made (`ath_tool_call`, arguments as a raw JSON object), and a tool's result comes back as a message with role `ATH_MSG_TOOL`. athanor renders and parses tool calls; it never runs one (AGENTS.md, invariant 10). `tools/chat.c` is a complete user of this section.
+
+`ath_state_copy` copies the state of one sequence into another of the same capacity and activation dtype. A recurrent state cannot be rolled back, so a pipeline that will come back to a point of a conversation keeps a copy there.
 
 ## State specs
 

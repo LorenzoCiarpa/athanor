@@ -6,11 +6,55 @@ This file is the overview. [`status_extended.md`](status_extended.md) goes one l
 
 ## Current step
 
-**Step 4: CPU forward** (see `docs/PLAN.md` §4). Started 2026-11-24 on branch `step4-cpu-forward`. **Done 2026-11-24** (pushed, to be merged into `main`); step 5 is next. Task 4.7 was added after the step closed, at the maintainer's request, and task 4.8 applies the specification change CHANGE-001 (log, 2026-11-24).
+**Step 5: tokenizer, sampling, CPU chat** (see `docs/PLAN.md` §4, gate amended by CHANGE-001). Started 2026-11-24 on branch `step5-tokenizer-chat`. **Done 2026-11-24** (pushed, to be merged into `main`); step 6 is next.
+
+Goal: text in and out of the model on the CPU. A byte-level BPE tokenizer that gives the reference tokenizer's ids, the family's chat template (with tool definitions and the thinking switch) rendered byte for byte as the reference renders it, a parser that turns the model's output into text, thinking and tool calls, sampling, and a first `athanor chat` on the CPU forward pass of step 4.
+
+### Tasks
+
+- [x] **5.1 Text golden data.** `tests/golden/text.py`: with the pinned reference (transformers 5.24.0, tokenizers 0.23.3), the token ids and decoded text of a corpus (hand-written cases in many languages, emoji, code, white space, contractions, added tokens; repository files; every Unicode code point in five contexts; every canonical decomposition with shuffled marks), conversations rendered by the checkpoint's chat template with and without tools and thinking (and the ones it rejects), and a greedy chat generation of the fp32 reference with its top-2 margins and the bf16 noise. `make golden` runs it.
+- [x] **5.2 Unicode.** `tools/dev/gen_unicode.py` generates `src/text/unicode_tables.h` (committed): character classes (letter, mark, number, white space) and NFC data. `src/text/unicode.c`: UTF-8, classes, NFC.
+- [x] **5.3 `src/text/bpe.c`.** Byte-level BPE from `tokenizer.json`: added tokens, NFC, the family's pre-tokenization, merges by rank; decoding. The loader refuses any tokenizer feature it does not implement and checks that the file's split regex is the one the family implements.
+- [x] **5.4 Contract.** `model.h`: `ath_tool_def`, `ath_tool_call`, `ath_msg`, `ATH_CHAT_*`, `ath_out_event`, `ath_parse_state`; the family members `pretokenize_regex`, `pretokenize`, `chat`, `parse`; `ath_model_tokenizer`, `ath_model_chat`, `ath_model_parse` (`src/model/text.c`) and `ath_state_copy`. Core helpers: `ath_buf` (`src/core/buf.c`), a JSON writer with Python's `json.dumps` formatting (`src/core/json.c`), `ath_rng` (`src/core/rng.c`).
+- [x] **5.5 `src/models/qwen35/text.c`.** The pre-tokenization regex by hand, the chat template by hand (tools, thinking, tool calls and results, history), the incremental output parser (thinking, tool calls with arguments typed by the tool's schema).
+- [x] **5.6 `src/ops/sample.c`.** `ath_sample_ref`: greedy, temperature, top-k, top-p, min-p; the uniform number comes from the caller's generator.
+- [x] **5.7 `athanor chat`.** `tools/chat.c`: one prompt (`-p`) or a conversation on stdin, thinking on request, tool definitions from a file (calls shown, never run; `/tool` answers one), state reused across turns.
+- [x] **5.8 `tests/test_text.c`.** Unicode, NFC, the JSON writer, pre-tokenization, parser fixtures (whole, split at every byte, byte by byte), template errors, sampling; against the golden data: the corpus, the templates, the greedy generation.
+- [x] **5.9 Documentation.** Contract docs, the chat template and tokenizer in `docs/contract/qwen35-0.8b.md`, module READMEs, `tests/README.md`, `tests/golden/README.md`, `docs/program/PROGRAM.md`, this file and `status_extended.md`.
+
+### Acceptance criteria
+
+1. Exact round trip on a corpus against the reference tokenizer: the same token ids for every text, and the same text decoded from them.
+2. Rendered prompts byte-identical to the reference chat template for a fixture set with and without tools, thinking on and off; where the template raises an error, `chat` fails (CHANGE-001).
+3. Parser fixtures pass: thinking, several tool calls in one turn, typed arguments, malformed and truncated markup, every fixture also split at every byte and fed byte by byte (CHANGE-001).
+4. A first chat, slow and correct: `athanor chat` answers on the CPU; athanor's greedy generation (bf16) on a fixed chat prompt equals the fp32 reference's at every step whose top-2 margin is above the bf16 noise.
+5. Pipelines and tools reach tokenizer, template and parser only through the contract; no model names in `src/` outside `src/models/`.
+6. `make test` green with zero warnings, also with `DEBUG=1`; `ldd build/athanor` shows no new library.
+7. Documentation listed in 5.9 updated.
+
+Result (2026-11-24, Qwen3.5-0.8B revision `2fc0636`, transformers 5.24.0, tokenizers 0.23.3, Python 3.14.4, gcc 15.2, glibc 2.43):
+
+| # | Criterion | Result |
+| --- | --- | --- |
+| 1 | tokenizer | 188 texts, 28.9 MB, 28,185,794 tokens: every id identical to the reference's, every decoded text identical (`golden_tokenizer_corpus`). It includes every code point but the surrogates in five contexts and every canonical decomposition with shuffled marks. Load 0.06 s, encode 0.6 s for the whole corpus |
+| 2 | templates | 17 conversations byte-identical (system or not, multi-turn, thinking in content or apart, tools with and without system, a round trip with two calls and two results, typed arguments including nested objects, floats and nulls, tool responses as user messages, trimming, Unicode), and their token ids identical; the 3 conversations the template rejects fail with `ATH_ERR_INVALID_ARG` (`golden_chat_template`) |
+| 3 | parser | 17 fixtures, each whole, split at every byte and byte by byte, give the same events (`parse_fixtures`) |
+| 4 | chat | `athanor chat -p "What is the capital of Italy? Answer in one sentence." --temp 0` answers "The capital of Italy is Rome." in 0.9 s. Greedy: 27 of the 32 tokens of the fixed prompt are above the bf16 noise (0.19) and all equal the fp32 reference's; after step 27 (margin 0.01) the comparison stops, and the 32 tokens are still the reference's (`golden_chat_generate`). Multi-turn and tool calls checked by hand (log) |
+| 5 | contract | `tools/chat.c` and `tests/test_text.c` include no family header; `grep -rni qwen src tools --include=*.[ch]` outside `src/models/` finds nothing |
+| 6 | `make test`, zero warnings, also `DEBUG=1` | 24 + 11 + 17 + 1 + 7 + 12 tests pass in release (about 17 s) and with ASan/UBSan; `ldd build/athanor`: `libm`, `libc` only |
+| 7 | documentation | `docs/ARCHITECTURE.md`; `docs/contract/qwen35-0.8b.md` (Tokenizer, Chat template, Output markup); READMEs of `src/core`, `src/text`, `src/ops`, `src/model`, `src/models/qwen35`, `tools`, `tests`, `tests/golden`; `docs/program/PROGRAM.md` rows 5, 6, 6b; README; this file and `status_extended.md` |
+
+Speed, for the record (no performance claim; Ryzen 7 9800X3D, 8 threads, bf16 activations): the prompt runs at about 40 to 45 tokens per second and the answer decodes at about 22 to 25 tokens per second, sampling and parsing included.
+
+## Completed steps
+
+### Step 4
+
+**Step 4: CPU forward** (see `docs/PLAN.md` §4). Started 2026-11-24 on branch `step4-cpu-forward`. **Done 2026-11-24** (pushed, to be merged into `main`); step 5 is next. Task 4.7 was added after the step closed, at the maintainer's request, and task 4.8 applies the specification change CHANGE-001 (log, 2026-11-24). Merged into `main` (fast-forward) on 2026-11-24, at the maintainer's request.
 
 Goal: the whole Qwen3.5-0.8B forward pass on the CPU, composed from the step 3 ops, with the per-sequence state (KV cache, conv and recurrent state) that prefill and decode need, reached by pipelines only through the contract; and evidence on fixed prompts that its logits are as close to the exact model as the reference implementation's.
 
-### Tasks
+#### Tasks
 
 - [x] **4.1 End-to-end metric.** Settle the open question (below): KL against an fp32 run of the reference, gated on the bf16 reference's own KL; greedy agreement; the residual stream per layer as a diagnostic; an fp32 forward of athanor against the fp32 reference, tight.
 - [x] **4.2 Contract.** `src/model/model.h`: state kinds and specs (`ath_state_spec`, listed by the model), `ath_state` (one sequence: activation dtype, capacity, tokens so far, one buffer per spec), `ath_batch`, `ath_hooks` with `on_residual`, and `forward` in `ath_family`. `src/model/state.c`: `ath_state_init`, `ath_state_reset`, `ath_state_bytes`, `ath_model_forward` (argument checks, positions, scratch memory, `n_past`).
@@ -21,7 +65,7 @@ Goal: the whole Qwen3.5-0.8B forward pass on the CPU, composed from the step 3 o
 - [x] **4.7 Fast CPU matmul** (added after the step closed). `src/core/threads.c`: a fixed pthread pool. `ath_matmul_fast` in `src/ops/matmul.c`: several outputs per thread, each summed exactly as the reference sums it, so the same bits with any number of threads. The pool joins the contract (`forward`, `ath_model_forward`) and the forward pass uses `ath_matmul_fast`. Tests: the pool; fast against reference bit for bit, on random shapes and dtypes and on every golden matmul record. The AVX-512 variant that was not chosen is written down in `docs/proposals/cpu-matmul-avx512.md`.
 - [x] **4.8 CHANGE-001** (`docs/CHANGE-001-scope-tools-cache.md`, from the maintainer). Scope boundary (engine plus server, no agent harness): AGENTS.md invariant 10, `docs/ARCHITECTURE.md` (Scope: engine versus harness), README, PLAN decisions. Vision-encoder tensors (and the MTP head until step 13) bound as params flagged `ATH_P_UNUSED`, in the family's ignored groups; the coverage rule leaves no tensor unbound; `inspect --roles` reports their count and size. `tests/golden/dump.py` checks that it runs the text path only and records the reference class. Tool calling (the text members `chat` with tool definitions and `parse`) and on-disk prefix snapshots written into the plan, the contract target and the module READMEs, for steps 5, 13 and 14.
 
-### Acceptance criteria
+#### Acceptance criteria
 
 1. `forward`, the state specs, `ath_state`, `ath_batch` and `ath_hooks` are in `model.h`, documented, and the tests reach the forward pass only through the contract (no family header).
 2. Over every position of both fixed prompts, prefill and decode, athanor with bf16 activations has a mean KL against the fp32 reference no larger than the bf16 reference's mean KL against the same run (the gate); the maximum and the per-prompt means are reported. (Wording made explicit on 2026-11-24 after the measurement: the resolution of the open question already said "over every position of the fixed prompts"; see the log.)
@@ -51,12 +95,11 @@ Speed, for the record (no performance claim): 0.29 s per token per thread for pr
 
 After 4.7, for the record (no performance claim; Ryzen 7 9800X3D, 8 threads): a decode step with its logits takes 41 ms (0.43 s before), and 32 prefill tokens with the logits of all 32 take 0.84 s (13.7 s before). On one thread: 138 ms and 4.2 s. `ath_matmul_fast` alone, one token: 3.4× the reference on one thread, 12× to 16× on 8. On the lm_head that is about 58 GB/s of weights, close to what the memory delivers.
 
-### Notes (CHANGE-001)
+#### Notes (CHANGE-001)
 
 - Qwen3.5-0.8B is a vision-language checkpoint (architecture `Qwen3_5ForConditionalGeneration`; transformers loads it with `AutoModelForMultimodalLM`, or its text path with `AutoModelForCausalLM`). `weights.c` recognizes the vision-encoder tensors by name prefix (`model.visual.`), binds them with `ATH_P_UNUSED`, and `athanor inspect --roles` reports their count and size. The MTP head (`mtp.`) is handled the same way until step 13 gives it real roles.
 - `tests/golden/dump.py` runs the text path only: it stops unless the loaded class is `Qwen3_5ForCausalLM` without vision parameters, and the manifest records the class (`reference.class`) next to the transformers version.
 
-## Completed steps
 
 ### Step 3
 
@@ -178,7 +221,9 @@ Result (2026-11-23, Qwen3.5-0.8B revision `2fc0636`, gcc 15.2, glibc 2.43):
 
 ## Next step (preview)
 
-**Step 5: tokenizer, sampling, CPU chat.** `src/text/bpe.c` and the generated `unicode.h` (byte-level BPE from `tokenizer.json`), the family's pre-tokenization split and chat template in `src/models/qwen35/text.c` (`pretokenize` and `chat` join the contract), `src/ops/sample.c`, and a first `athanor chat` on the CPU forward of step 4. Gate: exact token round-trip on a corpus against the reference tokenizer; a first chat, slow and correct.
+**Step 6: GPU backend.** `src/backend/gpu.cu` and `compat.h`: device memory, copies, streams, events and timing on CUDA, written once for CUDA and HIP. Gate: allocation, copies, streams, events, timing on CUDA. Blocked until the CUDA toolkit is upgraded (open questions: nvcc 12.4 cannot target `sm_120`).
+
+Superseded preview (written in step 4): **Step 5: tokenizer, sampling, CPU chat.** `src/text/bpe.c` and the generated `unicode.h` (byte-level BPE from `tokenizer.json`), the family's pre-tokenization split and chat template in `src/models/qwen35/text.c` (`pretokenize` and `chat` join the contract), `src/ops/sample.c`, and a first `athanor chat` on the CPU forward of step 4. Gate: exact token round-trip on a corpus against the reference tokenizer; a first chat, slow and correct.
 
 Amended by CHANGE-001 (2026-11-24): `chat` takes tool definitions and a thinking switch, and `parse` (incremental, streaming-safe: thinking blocks, tool calls, markup split across pieces, malformed markup as text, end-of-stream flush) joins the contract with them. A fixture generator in `tests/golden/` renders reference prompts with the upstream chat template (with and without tools, thinking on and off) and stores them byte-exact; `tests/test_text.c` compares the rendering with the fixtures and runs parser fixtures (split pieces, malformed markup, several tool calls in one turn). Gate additions: rendered prompts byte-identical to the reference chat template for the fixture set; parser fixtures pass.
 
@@ -189,6 +234,8 @@ Superseded preview (written in step 2): **Step 3: CPU reference ops and golden h
 Superseded preview (written in step 1): **Step 2: contract and family loading.** Write `src/model/model.h` as in `docs/ARCHITECTURE.md`, `registry.c`, and `src/models/qwen35/{config.c,weights.c}`: parse `config.json` into the layer schedule (which layers are Gated DeltaNet, which are full attention, MLP or MoE), bind every tensor to an `ath_param` with role, layer, expert and flags, and fail loudly on any unbound or missing tensor. `athanor inspect --roles` prints the result.
 
 ## Open questions
+
+- **Presence penalty (step 5).** Qwen3.5's model card recommends a presence penalty (1.5 without thinking, 0 to 1.5 with it) next to temperature, top-k and top-p. `ath_sampler` has temperature, top-k, top-p and min-p only; a penalty needs the counts of the tokens generated so far. Options: add it to the sampler now (CPU), or with GPU sampling (step 9) or the server (step 13), where request parameters ask for it. Recommended: with the server, step 13. Nothing in step 5 depends on it; `athanor chat` uses the card's other settings.
 
 - (none yet) (superseded 2026-11-23 by the entries below)
 - **CUDA toolkit too old for `sm_120` (blocks step 6).** The development machine has nvcc 12.4 (driver 580, CUDA 13.0 runtime). Blackwell consumer GPUs (`sm_120`, RTX 5080) need CUDA 12.8 or newer. Options: install CUDA 12.8+/13.x before step 6 (recommended), or build for `compute_90` PTX and rely on JIT (slower start, no FP4/FP8 `sm_120` paths). Nothing in steps 1–5 depends on it.
@@ -234,3 +281,16 @@ Superseded preview (written in step 1): **Step 2: contract and family loading.**
   - 6: the notes went into the current step (above). The vision encoder was already explicit since step 2: an ignored group with a reason, its tensors counted by `inspect`, and any unknown tensor a load error. It was not bound, though. Now its tensors are params flagged `ATH_P_UNUSED`, and the ignored group remains as the declaration that explains them. The MTP head gets the same treatment, so that the coverage rule has no exception ("any other unbound tensor is an error"). The registry checks that each group and the unused params coincide. Results unchanged: the 320 used params and every forward number.
   - 10: the fixture generator and `tests/test_text.c` test `text.c`, so they are step 5 work, now in its preview and gate.
   - Decision 5 (ds4): the ds4 README (commit `5379c1c`, 2026-10-19) lists Qwen3.8 Flash Next, on Metal and CUDA, with its own Q2 and Q4K weights. `PLAN.md` records it next to the requested "possibly yes (verify)". It will be confirmed by running ds4 when that model enters scope (open decision 3).
+- 2026-11-24: `step4-cpu-forward` merged into `main` (fast-forward), at the maintainer's request after CHANGE-001; step 5 started on `step5-tokenizer-chat`.
+- 2026-11-24: step 5 implemented on branch `step5-tokenizer-chat`: `src/text/{unicode.h,unicode.c,unicode_tables.h,bpe.h,bpe.c}`, `tools/dev/gen_unicode.py`, `src/core/{buf,rng}.{h,c}` and the JSON writer in `src/core/json.c`, the text members of `src/model/model.h` with `src/model/text.c` and `ath_state_copy`, `src/models/qwen35/text.c`, `src/ops/sample.c`, `tools/chat.c`, `tests/golden/text.py`, `tests/test_text.c`. All acceptance criteria met (table above). Checked by hand as well: a three-turn conversation reuses the state (the second and third prompts run 43 of 56 and 60 of 109 tokens), thinking mode, and a tool round trip with `--tools` (the model calls `get_weather {"city": "Paris", "days": 3}`, `/tool` gives the result, the model answers from it).
+- 2026-11-24: decisions taken within step 5 (`PLAN.md` unchanged):
+  - Unicode data comes from two versions, as the reference does. Character classes follow Unicode 16.0 (Python 3.14's unicodedata), which the reference's regex engine (Oniguruma) also uses. NFC follows what Hugging Face tokenizers 0.23.3 applies, which is Unicode 9.0 data: `gen_unicode.py` probes the reference and leaves out 21 compositions and 29 combining classes added since. The corpus test found the difference (Todhri letters added in 16.0) and covers every code point.
+  - The generated tables are `src/text/unicode_tables.h`, included by `src/text/unicode.c`; the plan named a single `unicode.h`. `unicode.h` is now the interface.
+  - The tokenizer loader accepts only what it implements (BPE without unknown token, byte fallback, dropout or affixes; NFC or no normalizer; Split + ByteLevel pre-tokenizer; ByteLevel decoder; added tokens without strip or normalization) and compares the file's split regex with `pretokenize_regex`, a contract member the CHANGE-001 signature did not have, so that a checkpoint with another regex is refused rather than split wrongly.
+  - The text contract as implemented: `ath_msg` has role, content, reasoning (thinking given apart from content), tool calls (name, arguments as raw JSON, an optional id) and `tool_call_id`; `chat` takes `ATH_CHAT_GENERATE` and `ATH_CHAT_THINKING` and appends to an `ath_buf`; `parse` keeps the family's state behind a pointer in `ath_parse_state`, which carries the prompt's options and tools and an arena; `piece == NULL` ends the output; event bytes live until the next call; `cap >= n + 8` events always suffice.
+  - The parser drops the newlines that are only template formatting (around `</think>`, before and after a tool call, around a parameter value). Arguments become one JSON object per call, typed by the tool's schema: a string parameter stays a string; integer, number, boolean, object and array values are written as such when they parse as one, and as strings otherwise; `null` is null for non-string types. Argument bytes come out per parameter, when the parameter closes. A call whose `<function=...>` header is malformed is text; a call cut off by the end of the output is closed with what it has.
+  - `ath_state_copy` (contract, host memory) lets `athanor chat` keep a copy of the state at the end of the conversation's last message: the template renders a past assistant turn differently from the prompt that generated it (Qwen3.5 drops the empty thinking block), and a recurrent state cannot be rolled back. It is the minimal form of the prefix snapshots of step 14.
+  - Sampling: the filters apply in the order of transformers' logits warpers (temperature, top-k, top-p, min-p); the op takes a uniform number from the caller's generator (`ath_rng`, xoshiro256**), so it is deterministic and testable. `athanor chat` defaults to the model card's settings without the presence penalty (open questions): 0.7 / 0.8 / 20, and 0.6 / 0.95 / 20 with thinking.
+  - `ath_buf`, `ath_rng` and the JSON writer are in `src/core/`; the JSON writer reproduces Python's `json.dumps(ensure_ascii=False)`, because chat templates serialize tool definitions and arguments with it.
+  - `athanor chat` never runs a tool (AGENTS.md, invariant 10): it prints the call, and `/tool <text>` lets the user answer as a harness would.
+  - The sampling op has a CPU reference and tests; its GPU kernel comes with GPU sampling (step 9). The reference implementation has no sampling records to compare against, so the tests are hand-computed cases and a distribution check with a fixed seed.
