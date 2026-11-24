@@ -60,7 +60,7 @@ Never rewrite history in `STATUS.md`, `PLAN.md` or `PROGRAM.md`: mark items done
 ### Add a model family
 
 - [ ] `src/models/<family>/` with `config.c`, `weights.c`, `forward.c`, `text.c` (and later `backward.c`)
-- [ ] Register it in `src/model/registry.c` and in the Makefile `FAMILIES` list
+- [ ] Define `const ath_family ath_family_<family>` and add the family to the Makefile `FAMILIES` list (the registry is generated from it; `src/model/registry.c` needs no edit)
 - [ ] `docs/contract/<model>.md` with the op contract, sourced from the reference implementation
 - [ ] Missing ops added to `src/ops/` following "Add an op"
 - [ ] Zero changes under `src/infer`, `src/quant`, `src/ablit`, `src/train`. If one is needed, extend the contract instead.

@@ -19,15 +19,16 @@ Dependency direction: `tools → pipelines → contract → families → ops/tex
 
 ## The contract
 
-`src/model/model.h` is the most important file in the project. Pipelines see a model only through it.
+`src/model/model.h` is the most important file in the project. Pipelines see a model only through it. This is the header as of step 2 (comments shortened); members marked *later* join it when their first user lands.
 
 ```c
 typedef enum {
     ATH_ROLE_EMBED, ATH_ROLE_LM_HEAD, ATH_ROLE_NORM,
     ATH_ROLE_MIX_IN, ATH_ROLE_MIX_OUT,        /* token-mixing block: attention or linear attention */
-    ATH_ROLE_MLP_IN, ATH_ROLE_MLP_OUT,
+    ATH_ROLE_MLP_IN, ATH_ROLE_MLP_OUT,        /* dense MLP and shared expert                       */
     ATH_ROLE_ROUTER, ATH_ROLE_EXPERT_IN, ATH_ROLE_EXPERT_OUT,
-    ATH_ROLE_CONV, ATH_ROLE_GATE, ATH_ROLE_OTHER
+    ATH_ROLE_CONV, ATH_ROLE_GATE, ATH_ROLE_OTHER,
+    ATH_ROLE_COUNT
 } ath_role;
 
 #define ATH_P_WRITES_RESIDUAL 1u   /* abliteration projects the direction out of these */
@@ -35,7 +36,7 @@ typedef enum {
 #define ATH_P_SHARED_EXPERT   4u
 
 typedef struct {
-    ath_tensor t;
+    ath_tensor t;          /* contiguous view of checkpoint memory (one expert of a fused tensor is a slice) */
     ath_role   role;
     int32_t    layer;      /* -1 for global tensors */
     int32_t    expert;     /* -1 if not an expert   */
@@ -43,6 +44,38 @@ typedef struct {
     const char *name;      /* original checkpoint name */
 } ath_param;
 
+typedef struct { const char *mixer, *ffn; int32_t n_experts; } ath_layer;   /* schedule, labels for people */
+typedef struct { const char *prefix, *reason; uint32_t n_tensors; uint64_t bytes; } ath_ignored;
+
+typedef struct {
+    const ath_family *family;
+    const ath_json   *config;
+    ath_safetensors   ckpt;                    /* params view its memory               */
+    ath_param        *params;   uint32_t n_params;   /* forward order                  */
+    ath_layer        *layers;   int32_t  n_layers;
+    ath_ignored      *ignored;  uint32_t n_ignored;  /* tensors left unbound on purpose */
+    uint32_t          n_bound;
+    int32_t           hidden_size, vocab_size;
+    bool              tie_embeddings;          /* EMBED is also the output projection   */
+    int32_t           n_experts, n_experts_active;
+    void             *family_data;             /* family-private, opaque to pipelines   */
+    /* later (step 4): ath_state_spec *state_specs; uint32_t n_states; */
+} ath_model;
+
+struct ath_family {
+    const char  *name;
+    bool        (*match)      (const ath_json *config);
+    ath_status  (*load)       (ath_model *m, ath_arena *a);      /* reads m->config, m->ckpt */
+    /* later: forward (step 4), pretokenize and chat (step 5), backward (phase 4) */
+};
+
+ath_status ath_model_open(ath_model *m, ath_arena *a, const char *dir);
+void       ath_model_close(ath_model *m);
+```
+
+Members still to come, as designed:
+
+```c
 typedef enum { ATH_STATE_KV, ATH_STATE_RECURRENT, ATH_STATE_CONV } ath_state_kind;
 
 typedef struct {
@@ -58,19 +91,19 @@ typedef struct {
     void *u;
 } ath_hooks;
 
-typedef struct ath_family {
-    const char  *name;
-    int          (*match)      (const ath_json *config);
-    ath_status   (*load)       (ath_model *m, const ath_json *config, ath_weights *w);
     ath_status   (*forward)    (ath_model *m, ath_batch *b, ath_state *s, const ath_hooks *h);
     ath_status   (*backward)   (ath_model *m, ath_batch *b, ath_grads *g);     /* NULL until phase 4 */
     ath_status   (*pretokenize)(const char *text, size_t n, ath_spans *out);
     ath_status   (*chat)       (const ath_msg *msgs, int32_t n, ath_buf *out);
-} ath_family;
-
-/* ath_model exposes: params[] and n_params, state_specs[] and n_states,
-   n_layers, hidden size, vocab size, MoE info (experts per layer, top-k). */
 ```
+
+`load` takes the open checkpoint (`ath_safetensors`) rather than the `ath_weights` abstraction of the first design: there is one weight source until the `.ath` container lands in phase 2, which will introduce the abstraction with its second user.
+
+### Loading and the coverage rule
+
+`ath_model_open(dir)` parses `config.json`, asks each compiled-in family whether it `match`es, maps the checkpoint, and calls the family's `load`. Then it checks, independently of the family, that every checkpoint tensor is viewed by at least one param or falls in exactly one ignored group, never both, and that every param is a contiguous view inside the tensor it names. A tensor nobody accounts for fails the load (`ATH_ERR_FORMAT`): a checkpoint that is not what the family thinks it is must not run. Families report missing tensors (`ATH_ERR_NOT_FOUND`) and shapes or dtypes that do not follow from the config (`ATH_ERR_FORMAT`). `athanor inspect <dir> --roles` prints the result.
+
+The family list is compiled in from the Makefile: `FAMILIES=qwen35` generates `build/gen/families.h` with one `ATH_FAMILY(qwen35)` line, and each family defines `const ath_family ath_family_<name>`. `registry.c` names no family.
 
 ### How each pipeline uses it
 
@@ -120,14 +153,14 @@ athanor/
 │   ├── text/      bpe.c unicode.h (generated, committed)
 │   ├── model/     model.h registry.c
 │   ├── models/
-│   │   └── qwen35/  config.c weights.c forward.c text.c [backward.c] [fused.cu]
+│   │   └── qwen35/  qwen35.h family.c config.c weights.c forward.c text.c [backward.c] [fused.cu]
 │   ├── infer/     engine.c state.c sched.c tier.c spec.c
 │   ├── quant/     formats.c rtn.c gptq.c awq.c recipe.c container.c gguf.c eval.c
 │   ├── ablit/     capture.c direction.c edit.c search.c eval.c
 │   ├── train/     loop.c optim.c lora.c hotcold.c data.c planner.c ckpt.c
 │   └── net/       http.c api.c
 ├── tools/         athanor.c (dispatch), one file per subcommand (inspect.c, ...), dev/ (development helpers)
-├── tests/         test.h (runner) test_core.c test_ops.c test_model.c ... golden/dump.py
+├── tests/         test.h (runner) util.h test_core.c test_model.c test_ops.c ... golden/dump.py
 └── docs/          ARCHITECTURE.md PLAN.md STATUS.md MODELS.md BENCHMARKS.md contract/ program/ results/
 ```
 

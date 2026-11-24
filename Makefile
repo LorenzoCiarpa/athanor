@@ -28,20 +28,24 @@ endif
 CFLAGS += -Isrc
 LDLIBS := -lm -lpthread
 
-# Families are selected at compile time (docs/ARCHITECTURE.md, rule 1).
-# Their sources appear in step 2; until then the list only has to name existing folders.
+# Families are selected at compile time (docs/ARCHITECTURE.md, rule 1): each
+# one is a folder src/models/<name>/ that defines `ath_family_<name>`, and the
+# registry learns the list from the generated header $(BUILD)/gen/families.h.
 $(foreach f,$(FAMILIES),$(if $(wildcard src/models/$(f)/),,$(error unknown family '$(f)': no src/models/$(f)/)))
 FAMILY_SRC := $(foreach f,$(FAMILIES),$(wildcard src/models/$(f)/*.c))
+FAMILIES_H := $(BUILD)/gen/families.h
+CFLAGS     += -I$(BUILD)/gen
 
-CORE_SRC := $(wildcard src/core/*.c)
-LIB_SRC  := $(CORE_SRC) $(FAMILY_SRC)
-LIB_OBJ  := $(LIB_SRC:%.c=$(BUILD)/obj/%.o)
+CORE_SRC  := $(wildcard src/core/*.c)
+MODEL_SRC := $(wildcard src/model/*.c)
+LIB_SRC   := $(CORE_SRC) $(MODEL_SRC) $(FAMILY_SRC)
+LIB_OBJ   := $(LIB_SRC:%.c=$(BUILD)/obj/%.o)
 
 TOOL_SRC := $(wildcard tools/*.c)
 TOOL_OBJ := $(TOOL_SRC:%.c=$(BUILD)/obj/%.o)
-TESTS    := $(BUILD)/test_core
+TESTS    := $(BUILD)/test_core $(BUILD)/test_model
 
-.PHONY: all cpu cuda hip test check-alloc clean
+.PHONY: all cpu cuda hip test check-alloc clean FORCE
 .SECONDARY:
 .DEFAULT_GOAL := cpu
 
@@ -58,11 +62,22 @@ $(BUILD)/obj/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+# One ATH_FAMILY(name) line per family. Rewritten only when the list changes,
+# so that a rebuild with the same FAMILIES does not recompile the registry.
+$(FAMILIES_H): FORCE
+	@mkdir -p $(dir $@)
+	@printf '%s\n' $(foreach f,$(FAMILIES),'ATH_FAMILY($(f))') > $@.tmp
+	@if cmp -s $@.tmp $@; then rm -f $@.tmp; else mv $@.tmp $@; fi
+
+$(BUILD)/obj/src/model/registry.o: $(FAMILIES_H)
+
+FORCE:
+
 test: $(TESTS) $(BUILD)/athanor
 	@set -e; for t in $(TESTS); do echo "== $$t"; ./$$t; done
-	@if [ -d "$(ATH_MODEL_DIR)" ]; then \
+	@set -e; if [ -d "$(ATH_MODEL_DIR)" ]; then \
 		echo "== athanor inspect $(ATH_MODEL_DIR)"; \
-		./$(BUILD)/athanor inspect "$(ATH_MODEL_DIR)" > /dev/null && echo "ok"; \
+		./$(BUILD)/athanor inspect "$(ATH_MODEL_DIR)" > /dev/null; echo "ok"; \
 	else echo "== athanor inspect: skipped, no $(ATH_MODEL_DIR)"; fi
 ifneq ($(DEBUG),1)
 	@if [ -d "$(ATH_MODEL_DIR)" ]; then $(MAKE) --no-print-directory check-alloc; fi
