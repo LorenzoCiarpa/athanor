@@ -13,6 +13,7 @@
 /* ---- helpers --------------------------------------------------------------- */
 
 static ath_arena arena;
+static ath_pool  pool;     /* three threads, for the fast paths */
 
 /* A host tensor of the given dtype and shape, filled from vals (or zeros). */
 static ath_tensor mk(ath_dtype dt, int32_t ndim, const int64_t *shape, const float *vals)
@@ -180,6 +181,44 @@ ATH_TEST(matmul_small)
     ATH_EXPECT(at(&o3, 1) == 2.0f);
     ath_tensor o2 = B(SHAPE(2, 1), NULL);
     ATH_EXPECT_STATUS(ath_matmul_ref(&x3, &w2, &o2), ATH_ERR_INVALID_ARG);
+}
+
+/* The fast path sums in the reference's order: the same bits for every dtype
+ * combination, on one thread or several, with and without a last partial
+ * block of outputs. f32 inputs would expose a fused multiply-add, whose
+ * single rounding differs from the reference's two. */
+ATH_TEST(matmul_fast_same_bits)
+{
+    static const int64_t shapes[][3] = {   /* N, M, K */
+        {1, 1, 1}, {1, 7, 5}, {1, 8, 33}, {2, 9, 16}, {5, 64, 64}, {1, 1029, 512}, {3, 300, 1000},
+    };
+    static const ath_dtype dt[] = {ATH_DTYPE_BF16, ATH_DTYPE_F32};
+    for (size_t i = 0; i < ATH_ARRAY_LEN(shapes); i++)
+        for (int c = 0; c < 8; c++) {   /* dtypes of x, w and out */
+            const int64_t N = shapes[i][0], M = shapes[i][1], K = shapes[i][2];
+            ath_tensor x = random_tensor(dt[c & 1], 2, (const int64_t[]){N, K});
+            ath_tensor w = random_tensor(dt[(c >> 1) & 1], 2, (const int64_t[]){M, K});
+            ath_tensor ref = mk(dt[c >> 2], 2, (const int64_t[]){N, M}, NULL);
+            ath_tensor one = mk(dt[c >> 2], 2, (const int64_t[]){N, M}, NULL);
+            ath_tensor many = mk(dt[c >> 2], 2, (const int64_t[]){N, M}, NULL);
+            ATH_EXPECT_OK(ath_matmul_ref(&x, &w, &ref));
+            ATH_EXPECT_OK(ath_matmul_fast(&x, &w, &one, NULL));
+            ATH_EXPECT_OK(ath_matmul_fast(&x, &w, &many, &pool));
+            ATH_EXPECT(same_bits(&ref, &one));
+            ATH_EXPECT(same_bits(&ref, &many));
+        }
+
+    /* the arguments are checked as in the reference */
+    ath_tensor x = F(SHAPE(2, 3), NULL), w = F(SHAPE(4, 3), NULL), out = F(SHAPE(2, 4), NULL);
+    ATH_EXPECT_OK(ath_matmul_fast(&x, &w, &out, &pool));
+    ATH_EXPECT_STATUS(ath_matmul_fast(NULL, &w, &out, &pool), ATH_ERR_INVALID_ARG);
+    ath_tensor bad = F(SHAPE(4, 2), NULL);
+    ATH_EXPECT_STATUS(ath_matmul_fast(&x, &bad, &out, &pool), ATH_ERR_INVALID_ARG);
+    ath_tensor xi = Z(ATH_DTYPE_I32, SHAPE(2, 3));
+    ATH_EXPECT_STATUS(ath_matmul_fast(&xi, &w, &out, &pool), ATH_ERR_TYPE);
+    ath_tensor xv = x;
+    xv.tier = ATH_TIER_VRAM;
+    ATH_EXPECT_STATUS(ath_matmul_fast(&xv, &w, &out, &pool), ATH_ERR_UNSUPPORTED);
 }
 
 /* ---- norms ------------------------------------------------------------------- */
@@ -518,6 +557,7 @@ static const ath_test_case tests[] = {
     ATH_TEST_ENTRY(op_argument_checks),
     ATH_TEST_ENTRY(embed_rows),
     ATH_TEST_ENTRY(matmul_small),
+    ATH_TEST_ENTRY(matmul_fast_same_bits),
     ATH_TEST_ENTRY(rmsnorm_hand),
     ATH_TEST_ENTRY(rmsnorm_gated_hand),
     ATH_TEST_ENTRY(l2norm_hand),
@@ -535,7 +575,10 @@ static const ath_test_case tests[] = {
 int main(int argc, char **argv)
 {
     ath_arena_init(&arena, 0);
+    if (ath_pool_init(&pool, 3, &arena) != ATH_OK)
+        return 1;
     int rc = ath_test_main(tests, ATH_ARRAY_LEN(tests), argc, argv);
+    ath_pool_free(&pool);
     ath_arena_free(&arena);
     return rc;
 }

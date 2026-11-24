@@ -9,7 +9,7 @@ src/ops/<op>.cu   GPU kernel(s), CUDA C compiled for CUDA and HIP
 tests/test_ops.c  ref vs golden data; GPU vs ref; fast vs ref
 ```
 
-`ops.h` declares the functions with their shapes, dtypes and math. Step 3 landed the CPU references; the entry point per op that dispatches on the device of its arguments joins `ops.h` with the second implementation of an op (the GPU kernels, step 7). Until then callers use the `_ref` functions.
+`ops.h` declares the functions with their shapes, dtypes and math. Step 3 landed the CPU references; step 4 the first fast CPU path, `ath_matmul_fast`. The entry point per op that dispatches on the device of its arguments joins `ops.h` with the GPU kernels (step 7). Until then callers use the `_ref` functions, and the forward pass uses `ath_matmul_fast` for its matmuls.
 
 ## The references (step 3)
 
@@ -18,7 +18,7 @@ tests/test_ops.c  ref vs golden data; GPU vs ref; fast vs ref
 | `ops.h` | every signature, with shapes, dtypes and math; the conventions below |
 | `check.h` | private: argument checks shared by the `_ref` functions, element access (`ld`, `st`) |
 | `embed.c` | `ath_embed_ref` |
-| `matmul.c` | `ath_matmul_ref`: `x · wᵀ` against a weight in checkpoint layout `[M, K]` |
+| `matmul.c` | `ath_matmul_ref`: `x · wᵀ` against a weight in checkpoint layout `[M, K]`; `ath_matmul_fast` (step 4, below) |
 | `norm.c` | `ath_rmsnorm_ref` (plain or zero-centered: `w_offset` 0 or 1), `ath_rmsnorm_gated_ref` (SiLU gate), `ath_l2norm_ref` |
 | `rope.c` | `ath_rope_ref`: rotate-half on the first `rope_dim` dimensions of each head |
 | `act.c` | `ath_swiglu_ref`, `ath_sigmoid_mul_ref`, `ath_add_ref` |
@@ -35,6 +35,22 @@ Conventions, stated once in `ops.h`:
 
 Every function is tested on hand-computed cases in `tests/test_ops.c` and against the reference implementation on real weights in `tests/test_golden.c` (`tests/README.md`).
 
+## Fast CPU paths (step 4)
+
+`ath_matmul_fast` (`matmul.c`, task 4.7) computes the same sums as `ath_matmul_ref`, in the same order, so its results are the same bits, with any number of threads. The reference is slow because each output is one chain of fp32 additions, and every addition waits for the previous one. The fast path computes 8 outputs at once on each thread. Each one is still its own chain in order of k, with a rounded product and a rounded sum per step, and no fused multiply-add. The chains overlap in the core's pipelines, and blocks of 8 outputs are spread over the threads of an `ath_pool` (`src/core/threads.h`).
+
+- Every row of x passes over a block before the next block starts, so the block's weights stay in cache across the tokens of a prompt.
+- The weights keep the checkpoint layout: no copy, no repacking.
+- Weights in f32 (only in tests) and the last partial block run one output at a time, as the reference.
+- A matmul under 2^18 multiply-adds stays on the calling thread.
+- The inner loop reads bf16 weights directly instead of through `ld`. A branch on the dtype inside it stops the compiler from keeping the 8 accumulators in registers and costs half the speed.
+
+| Variant (one token, Ryzen 7 9800X3D, measured once; not a performance claim) | One thread | 8 threads |
+| --- | --- | --- |
+| `ath_matmul_fast` against `ath_matmul_ref`, 3584 × 1024 and 248320 × 1024 | 3.4× to 3.5× | 12× to 16× |
+
+`tests/test_ops.c` (`matmul_fast_same_bits`) and every matmul record of `tests/test_golden.c` check the bits against the reference. The f32 inputs there would show a fused multiply-add, whose single rounding differs from the reference's two. The faster variant that was measured and not chosen, AVX-512 across outputs on repacked weights, is in `docs/proposals/cpu-matmul-avx512.md`.
+
 ## Op list
 
 | Op | Content | Step |
@@ -43,7 +59,7 @@ Every function is tested on hand-computed cases in `tests/test_ops.c` and agains
 | `norm` | RMSNorm (parameterization per contract), gated RMSNorm, L2 norm | 3 |
 | `rope` | rotary embedding, full or partial | 3 |
 | `act` | SwiGLU, sigmoid gates, residual add | 3 |
-| `matmul` | dense GEMM/GEMV for bf16 and f32; per-format GEMV/GEMM from phase 2 | 3 (ref), 7 (GPU), 9–10 (fast) |
+| `matmul` | dense GEMM/GEMV for bf16 and f32; per-format GEMV/GEMM from phase 2 | 3 (ref), 4 (fast CPU), 7 (GPU), 9–10 (fast GPU) |
 | `attn` | causal attention with GQA: naive reference; tiled prefill and split-K decode on GPU | 3, 7, 9, 10 |
 | `conv` | short depthwise causal conv1d with state | 3 |
 | `gdn` | Gated DeltaNet: gates; recurrent reference (CPU and GPU decode), chunkwise-parallel GPU prefill | 3, 7, 10 |

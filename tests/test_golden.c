@@ -128,6 +128,7 @@ typedef struct {
     ath_arena            *a;          /* scratch, reset after each record */
     const ath_safetensors *g;
     const ath_model      *m;
+    ath_pool             *pool;       /* for ath_matmul_fast */
     const ath_json       *rec;
     const char           *id, *op;
     bool                  exact;
@@ -329,6 +330,11 @@ static void run_matmul(ctx *c)
     NEED(x, w, y);
     RUN(ath_matmul_ref(x, w, y));
     compare(c, "out", y);
+    /* the fast path, which the forward pass uses: the same bits */
+    ath_tensor *yf = new_tensor(c, y->dtype, y);
+    RUN(ath_matmul_fast(x, w, yf, c->pool));
+    if (memcmp(y->data, yf->data, ath_tensor_nbytes(y)) != 0)
+        fail(c, "ath_matmul_fast differs from ath_matmul_ref");
 }
 
 static void run_rmsnorm(ctx *c)
@@ -530,9 +536,14 @@ ATH_TEST(golden_ops)
     const size_t n = ath_json_count(records);
     ATH_EXPECT(s != ATH_OK || n > 0);
 
+    ath_pool pool = {.n_threads = 0};
+    if (s == ATH_OK) {
+        s = ath_pool_init(&pool, ath_pool_default_threads(), &a);
+        ATH_EXPECT_OK(s);
+    }
     int replayed = 0;
     for (size_t i = 0; s == ATH_OK && i < n; i++) {
-        ctx c = {.t = t_, .a = &scratch, .g = &g, .m = &m, .rec = ath_json_at(records, i)};
+        ctx c = {.t = t_, .a = &scratch, .g = &g, .m = &m, .pool = &pool, .rec = ath_json_at(records, i)};
         if (ath_json_to_str(ath_json_get(c.rec, "id"), &c.id, NULL) != ATH_OK ||
             ath_json_to_str(ath_json_get(c.rec, "op"), &c.op, NULL) != ATH_OK) {
             ath_test_fail_(t_, __FILE__, __LINE__, "record without id or op");
@@ -553,6 +564,7 @@ ATH_TEST(golden_ops)
         }
         replayed += !c.bad;
     }
+    ath_pool_free(&pool);
     printf("  %d of %zu records replayed (%s)\n", replayed, n, golden_dir());
     print_stats();
 

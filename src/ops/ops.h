@@ -33,6 +33,7 @@
 #define ATH_OPS_H
 
 #include "core/tensor.h"
+#include "core/threads.h"
 
 /* Activation fused into an op. */
 typedef enum {
@@ -52,6 +53,12 @@ ath_status ath_embed_ref(const ath_tensor *table, const ath_tensor *ids, ath_ten
  * x [..., K]; w [M, K] (the layout of the checkpoint); out [..., M] with the
  * leading dimensions of x. */
 ath_status ath_matmul_ref(const ath_tensor *x, const ath_tensor *w, ath_tensor *out);
+
+/* The same contract and the same bits as ath_matmul_ref, faster: several
+ * outputs at a time per thread, spread over the threads of pool (NULL: the
+ * calling thread only). The CPU forward pass uses it; src/ops/README.md,
+ * Fast CPU paths. */
+ath_status ath_matmul_fast(const ath_tensor *x, const ath_tensor *w, ath_tensor *out, ath_pool *pool);
 
 /* ---- norm.c ---------------------------------------------------------------- */
 
