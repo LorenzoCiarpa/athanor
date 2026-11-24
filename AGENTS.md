@@ -33,6 +33,7 @@ athanor is a single C engine that runs, quantizes, abliterates and trains one fa
 3. Add or update tests; run `make test` (and `make cuda test` when GPU code changed).
 4. Update documentation in the same change:
    - `docs/STATUS.md`: tick the task, add a dated line to the log, note open questions.
+   - `docs/status_extended.md`: under the task, the files created or changed, what each is for and what was implemented in it.
    - The module `README.md` if a file or public interface changed.
    - `docs/ARCHITECTURE.md` if the contract or the tree changed.
    - `docs/contract/<model>.md` if you confirmed a **verify** item.

@@ -162,7 +162,8 @@ athanor/
 ├── tools/         athanor.c (dispatch), one file per subcommand (inspect.c, ...), dev/ (development helpers)
 ├── tests/         test.h (runner) util.h test_core.c test_model.c test_ops.c test_golden.c ...
 │                  golden/ (dump.py, requirements.txt; data/ generated, not committed)
-└── docs/          ARCHITECTURE.md PLAN.md STATUS.md MODELS.md BENCHMARKS.md contract/ program/ results/
+└── docs/          ARCHITECTURE.md PLAN.md STATUS.md status_extended.md MODELS.md BENCHMARKS.md
+                   contract/ program/ results/
 ```
 
 ## What athanor writes itself instead of using libraries
