@@ -92,7 +92,7 @@ ath_status ath_qwen35_bind(ath_model *m, ath_arena *a, ath_qwen35_model *q);
 
 /* forward.c: the family's forward (model.h, ath_family.forward). */
 ath_status ath_qwen35_forward(const ath_model *m, const ath_batch *b, ath_state *s, const ath_hooks *h,
-                              ath_arena *scratch);
+                              ath_arena *scratch, ath_pool *pool);
 
 extern const ath_family ath_family_qwen35;
 

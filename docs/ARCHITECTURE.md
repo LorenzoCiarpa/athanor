@@ -85,7 +85,7 @@ struct ath_family {
     bool        (*match)  (const ath_json *config);
     ath_status  (*load)   (ath_model *m, ath_arena *a);      /* reads m->config, m->ckpt */
     ath_status  (*forward)(const ath_model *m, const ath_batch *b, ath_state *s,
-                           const ath_hooks *h, ath_arena *scratch);
+                           const ath_hooks *h, ath_arena *scratch, ath_pool *pool);
     /* later: pretokenize and chat (step 5), backward (phase 4) */
 };
 
@@ -95,7 +95,7 @@ ath_status ath_state_bytes(const ath_model *m, ath_dtype act, int32_t capacity, 
 ath_status ath_state_init(ath_state *s, const ath_model *m, ath_dtype act, int32_t capacity, ath_arena *a);
 void       ath_state_reset(ath_state *s, const ath_model *m);
 ath_status ath_model_forward(const ath_model *m, const ath_batch *b, ath_state *s,
-                             const ath_hooks *h, ath_arena *scratch);
+                             const ath_hooks *h, ath_arena *scratch, ath_pool *pool);
 ```
 
 Members still to come, as designed:
@@ -114,7 +114,7 @@ typedef struct {
 
 `load` takes the open checkpoint (`ath_safetensors`) rather than the `ath_weights` abstraction of the first design: there is one weight source until the `.ath` container lands in phase 2, which will introduce the abstraction with its second user.
 
-Step 4 departs from the first design of the state in three places. A spec counts elements, not bytes, because the element type depends on the activation dtype the state is created with (bf16, as the reference runs, or f32 for an exact forward pass); the kind fixes the rest (KV and conv state hold activations, the recurrent state is fp32). `forward` takes the model as `const` and a scratch arena for its working tensors, which the contract releases after every call. A batch is one sequence; batches of several sequences arrive with the engine (step 8).
+Step 4 departs from the first design of the state in three places. A spec counts elements, not bytes, because the element type depends on the activation dtype the state is created with (bf16, as the reference runs, or f32 for an exact forward pass); the kind fixes the rest (KV and conv state hold activations, the recurrent state is fp32). `forward` takes the model as `const` and a scratch arena for its working tensors, which the contract releases after every call. A batch is one sequence; batches of several sequences arrive with the engine (step 8). Since task 4.7, `forward` also takes the caller's thread pool (`ath_pool`, `src/core/threads.h`; NULL runs on the calling thread). It is passed explicitly because the code has no globals. The CPU matmuls spread over it with the same bits as on one thread.
 
 ### State and the forward pass
 

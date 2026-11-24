@@ -1,4 +1,6 @@
-/* forward.c: the Qwen3.5 forward pass, composed from the reference ops.
+/* forward.c: the Qwen3.5 forward pass, composed from the reference ops and
+ * ath_matmul_fast, which gives the matmuls the same bits as ath_matmul_ref
+ * on the threads of the caller's pool.
  *
  * One call runs T tokens of one sequence at positions P … P + T − 1, where P
  * is the number of tokens the state has already seen: a whole prompt
@@ -42,6 +44,7 @@ typedef struct {
     const ath_qwen35_config *c;
     ath_state               *s;
     ath_arena               *a;
+    ath_pool                *pool;  /* threads for the matmuls, or NULL */
     ath_dtype                act;
     int64_t                  T;     /* tokens in this call            */
     int64_t                  P;     /* tokens before them (n_past)    */
@@ -114,7 +117,7 @@ static ath_status attention(fwd *f, const ath_qwen35_layer *L, const ath_tensor 
     /* projections; the values go straight into the cache */
     ath_tensor qg, qg_rows, q, q_rows, gate, gate_rows, k, k_rows, v_flat;
     ATH_CHECK(tmp(f, &qg, act, 2, T, nh * 2 * hd, 0));
-    ATH_CHECK(ath_matmul_ref(xn, &L->q_proj->t, &qg));
+    ATH_CHECK(ath_matmul_fast(xn, &L->q_proj->t, &qg, f->pool));
     ATH_CHECK(tmp(f, &q, act, 3, T, nh, hd));
     ATH_CHECK(tmp(f, &gate, act, 3, T, nh, hd));
     ATH_CHECK(view(&qg, &qg_rows, 2, T * nh, 2 * hd, 0));
@@ -123,9 +126,9 @@ static ath_status attention(fwd *f, const ath_qwen35_layer *L, const ath_tensor 
     copy_cols(&qg_rows, 0, &q_rows);     /* per head: query [0, hd), gate [hd, 2 hd) */
     copy_cols(&qg_rows, hd, &gate_rows);
     ATH_CHECK(tmp(f, &k, act, 2, T, nkv * hd, 0));
-    ATH_CHECK(ath_matmul_ref(xn, &L->k_proj->t, &k));
+    ATH_CHECK(ath_matmul_fast(xn, &L->k_proj->t, &k, f->pool));
     ATH_CHECK(view(&v_new, &v_flat, 2, T, nkv * hd, 0));
-    ATH_CHECK(ath_matmul_ref(xn, &L->v_proj->t, &v_flat));
+    ATH_CHECK(ath_matmul_fast(xn, &L->v_proj->t, &v_flat, f->pool));
 
     /* QK-norm (zero-centered, per head), then RoPE; rotated keys into the cache */
     ath_tensor qn, kn, qn3, kn3, qr;
@@ -148,7 +151,7 @@ static ath_status attention(fwd *f, const ath_qwen35_layer *L, const ath_tensor 
     ATH_CHECK(view(&gate, &gate_flat, 2, T, nh * hd, 0));
     ATH_CHECK(tmp(f, &og, act, 2, T, nh * hd, 0));
     ATH_CHECK(ath_sigmoid_mul_ref(&o_flat, &gate_flat, &og));
-    return ath_matmul_ref(&og, &L->o_proj->t, out);
+    return ath_matmul_fast(&og, &L->o_proj->t, out, f->pool);
 }
 
 /* Gated DeltaNet (contract, Gated DeltaNet layer): projections; causal conv
@@ -168,10 +171,10 @@ static ath_status gated_deltanet(fwd *f, const ath_qwen35_layer *L, const ath_te
     ATH_CHECK(tmp(f, &z, act, 2, T, value_dim, 0));
     ATH_CHECK(tmp(f, &a, act, 2, T, nv, 0));
     ATH_CHECK(tmp(f, &b, act, 2, T, nv, 0));
-    ATH_CHECK(ath_matmul_ref(xn, &L->qkv_proj->t, &qkv));
-    ATH_CHECK(ath_matmul_ref(xn, &L->z_proj->t, &z));
-    ATH_CHECK(ath_matmul_ref(xn, &L->a_proj->t, &a));
-    ATH_CHECK(ath_matmul_ref(xn, &L->b_proj->t, &b));
+    ATH_CHECK(ath_matmul_fast(xn, &L->qkv_proj->t, &qkv, f->pool));
+    ATH_CHECK(ath_matmul_fast(xn, &L->z_proj->t, &z, f->pool));
+    ATH_CHECK(ath_matmul_fast(xn, &L->a_proj->t, &a, f->pool));
+    ATH_CHECK(ath_matmul_fast(xn, &L->b_proj->t, &b, f->pool));
 
     /* convolution over all conv_dim channels, then the split into q, k, v */
     ath_tensor conv_state, mixed, q, k, v, q2, k2, v2;
@@ -210,7 +213,7 @@ static ath_status gated_deltanet(fwd *f, const ath_qwen35_layer *L, const ath_te
     ATH_CHECK(tmp(f, &on, act, 2, T * nv, dv, 0));
     ATH_CHECK(ath_rmsnorm_gated_ref(&o_rows, &z_rows, &L->norm->t, f->eps, &on));
     ATH_CHECK(view(&on, &on_flat, 2, T, value_dim, 0));
-    return ath_matmul_ref(&on_flat, &L->out_proj->t, out);
+    return ath_matmul_fast(&on_flat, &L->out_proj->t, out, f->pool);
 }
 
 /* SwiGLU MLP (contract, MLP): down(silu(gate(x)) · up(x)). */
@@ -221,10 +224,10 @@ static ath_status mlp(fwd *f, const ath_qwen35_layer *L, const ath_tensor *xn, a
     ATH_CHECK(tmp(f, &gate, f->act, 2, T, I, 0));
     ATH_CHECK(tmp(f, &up, f->act, 2, T, I, 0));
     ATH_CHECK(tmp(f, &h, f->act, 2, T, I, 0));
-    ATH_CHECK(ath_matmul_ref(xn, &L->gate_proj->t, &gate));
-    ATH_CHECK(ath_matmul_ref(xn, &L->up_proj->t, &up));
+    ATH_CHECK(ath_matmul_fast(xn, &L->gate_proj->t, &gate, f->pool));
+    ATH_CHECK(ath_matmul_fast(xn, &L->up_proj->t, &up, f->pool));
     ATH_CHECK(ath_swiglu_ref(&gate, &up, &h));
-    return ath_matmul_ref(&h, &L->down_proj->t, out);
+    return ath_matmul_fast(&h, &L->down_proj->t, out, f->pool);
 }
 
 /* One decoder layer, in place on the residual stream x [T, hidden]. Both
@@ -252,7 +255,7 @@ static ath_status layer(fwd *f, int32_t l, ath_tensor *x)
 /* ---- entry point ------------------------------------------------------------------ */
 
 ath_status ath_qwen35_forward(const ath_model *m, const ath_batch *b, ath_state *s, const ath_hooks *h,
-                              ath_arena *scratch)
+                              ath_arena *scratch, ath_pool *pool)
 {
     const ath_qwen35_model *q = m->family_data;
     const ath_qwen35_config *c = &q->c;
@@ -261,7 +264,7 @@ ath_status ath_qwen35_forward(const ath_model *m, const ath_batch *b, ath_state 
         return ATH_ERR_UNSUPPORTED;
     }
     fwd f = {
-        .m = m, .c = c, .s = s, .a = scratch, .act = s->act,
+        .m = m, .c = c, .s = s, .a = scratch, .pool = pool, .act = s->act,
         .T = b->n_tokens, .P = s->n_past, .eps = (float)c->rms_eps,
     };
     const int64_t T = f.T, H = c->hidden;
@@ -293,5 +296,5 @@ ath_status ath_qwen35_forward(const ath_model *m, const ath_batch *b, ath_state 
         ATH_CHECK(ath_tensor_slice(&x, 0, T - 1, 1, &rows));
     ATH_CHECK(tmp(&f, &xn, f.act, 2, rows.shape[0], H, 0));
     ATH_CHECK(ath_rmsnorm_ref(&rows, &q->norm->t, 1.0f, f.eps, &xn));
-    return ath_matmul_ref(&xn, &q->head->t, b->logits);
+    return ath_matmul_fast(&xn, &q->head->t, b->logits, f.pool);
 }

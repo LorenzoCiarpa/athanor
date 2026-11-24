@@ -140,7 +140,7 @@ static ath_status check_logits(const ath_model *m, const ath_batch *b)
 }
 
 ath_status ath_model_forward(const ath_model *m, const ath_batch *b, ath_state *s, const ath_hooks *h,
-                             ath_arena *scratch)
+                             ath_arena *scratch, ath_pool *pool)
 {
     if (!m || !m->family || !b || !s || !scratch)
         return bad(ATH_ERR_INVALID_ARG, "missing model, batch, state or scratch arena");
@@ -160,7 +160,7 @@ ath_status ath_model_forward(const ath_model *m, const ath_batch *b, ath_state *
     ATH_CHECK(check_logits(m, b));
 
     ath_arena_pos mark = ath_arena_mark(scratch);
-    ath_status st = m->family->forward(m, b, s, h, scratch);
+    ath_status st = m->family->forward(m, b, s, h, scratch, pool);
     ath_arena_reset(scratch, mark);
     if (st == ATH_OK)
         s->n_past += b->n_tokens;

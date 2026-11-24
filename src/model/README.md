@@ -6,7 +6,7 @@ The contract between pipelines and model families, and the static registry. Intr
 | --- | --- |
 | `model.h` | `ath_role` and `ath_role_name`, param flags, `ath_param`, the layer schedule `ath_layer`, ignored groups `ath_ignored`, state kinds and specs (`ath_state_spec`), `ath_model`, `ath_state`, `ath_batch`, `ath_hooks`, `ath_family` (`match`, `load`, `forward`); the functions of `registry.c` and `state.c` |
 | `registry.c` | the compiled-in families (from the Makefile `FAMILIES` list through the generated `families.h`); `ath_model_open(dir)` reads `config.json`, picks the family whose `match` accepts it, maps the checkpoint, calls `load`, then runs the coverage check |
-| `state.c` | `ath_state_bytes`, `ath_state_init`, `ath_state_reset`: the state of one sequence from the model's specs, in host memory; `ath_model_forward`: argument checks, the family's `forward`, scratch memory released, `n_past` advanced |
+| `state.c` | `ath_state_bytes`, `ath_state_init`, `ath_state_reset`: the state of one sequence from the model's specs, in host memory; `ath_model_forward`: argument checks, the family's `forward` (with the caller's thread pool), scratch memory released, `n_past` advanced |
 
 The full definition and the reasoning behind it are in `docs/ARCHITECTURE.md`. Any change to `model.h` must be reflected there and must keep every existing family compiling.
 
@@ -35,16 +35,19 @@ ath_state s;
 ATH_CHECK(ath_state_init(&s, &m, ATH_DTYPE_BF16, 4096, &a));   /* up to 4096 tokens; f32 for an exact run */
 ath_arena scratch;
 ath_arena_init(&scratch, 0);
+ath_pool pool;                                                   /* threads for the matmuls */
+ATH_CHECK(ath_pool_init(&pool, ath_pool_default_threads(), &a));
 
 float *out = ...;                                                /* [1, vocab_size] */
 ath_tensor logits;
 ATH_CHECK(ath_tensor_init(&logits, ATH_DTYPE_F32, 2, (int64_t[]){1, m.vocab_size}, out, ATH_TIER_RAM));
-ATH_CHECK(ath_model_forward(&m, &(ath_batch){prompt, n_prompt, &logits}, &s, NULL, &scratch));   /* prefill */
-ATH_CHECK(ath_model_forward(&m, &(ath_batch){&next, 1, &logits}, &s, NULL, &scratch));          /* decode */
+ATH_CHECK(ath_model_forward(&m, &(ath_batch){prompt, n_prompt, &logits}, &s, NULL, &scratch, &pool));   /* prefill */
+ATH_CHECK(ath_model_forward(&m, &(ath_batch){&next, 1, &logits}, &s, NULL, &scratch, &pool));          /* decode */
 ath_state_reset(&s, &m);                                         /* a new sequence */
+ath_pool_free(&pool);
 ```
 
-The logits tensor has one row per token or one row for the last token. `n_past` counts the tokens the state has seen; a batch that does not fit in `capacity` fails with `ATH_ERR_RANGE` and leaves the state as it was. Any other failure inside the family leaves the state undefined until `ath_state_reset`. Every working tensor of a call comes from the scratch arena and is released before it returns, so the arena's blocks are reused from call to call.
+The logits tensor has one row per token or one row for the last token. `n_past` counts the tokens the state has seen; a batch that does not fit in `capacity` fails with `ATH_ERR_RANGE` and leaves the state as it was. Any other failure inside the family leaves the state undefined until `ath_state_reset`. Every working tensor of a call comes from the scratch arena and is released before it returns, so the arena's blocks are reused from call to call. The pool lends its threads to the CPU work. A NULL pool runs everything on the calling thread, and the logits and the state are the same bits with any number of threads.
 
 ## State specs
 

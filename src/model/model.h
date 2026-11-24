@@ -27,6 +27,7 @@
 #include "core/json.h"
 #include "core/safetensors.h"
 #include "core/tensor.h"
+#include "core/threads.h"
 
 /* What a param is for. Matmul roles name the direction relative to the
  * residual stream: _IN reads from it, _OUT writes back into it. */
@@ -179,10 +180,12 @@ struct ath_family {
     /* Run b->tokens at positions s->n_past, s->n_past + 1, ...: read and update
      * the state buffers, call the hooks, write the logits. Called only through
      * ath_model_forward, which has checked every argument and advances
-     * s->n_past afterwards. Working memory comes from scratch. NULL if the
-     * family cannot run models yet. */
+     * s->n_past afterwards. Working memory comes from scratch; CPU work may
+     * be spread over the threads of pool (NULL: the calling thread only),
+     * which never changes a result. NULL if the family cannot run models
+     * yet. */
     ath_status (*forward)(const ath_model *m, const ath_batch *b, ath_state *s, const ath_hooks *h,
-                          ath_arena *scratch);
+                          ath_arena *scratch, ath_pool *pool);
 };
 
 /* Open the checkpoint in dir: parse config.json, pick the first compiled-in
@@ -218,9 +221,11 @@ void ath_state_reset(ath_state *s, const ath_model *m);
  * has no forward pass), calls the family's forward and, on success, advances
  * s->n_past by b->n_tokens. On failure the state is undefined until
  * ath_state_reset. Working memory is allocated in scratch and released
- * before returning; h may be NULL. */
+ * before returning; h may be NULL. pool (may be NULL) lends threads to the
+ * CPU work; the results are the same, bit for bit, with any number of
+ * threads. */
 ath_status ath_model_forward(const ath_model *m, const ath_batch *b, ath_state *s, const ath_hooks *h,
-                             ath_arena *scratch);
+                             ath_arena *scratch, ath_pool *pool);
 
 /* Families compiled into this binary (Makefile FAMILIES), in order. */
 size_t            ath_family_count(void);

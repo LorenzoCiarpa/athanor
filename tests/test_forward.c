@@ -20,8 +20,9 @@
  *   f32 activations   the residual stream at every layer and the logits within
  *                     a tolerance of the fp32 reference (tests/README.md).
  *
- * The four runs are independent and use the CPU reference ops, about 0.3 s
- * per token; they run in parallel threads. A DEBUG build runs only the first
+ * The four runs are independent; they run in parallel threads and share one
+ * pool for their matmuls (ath_matmul_fast, the same bits as the reference
+ * with any number of threads). A DEBUG build runs only the first
  * ATH_FORWARD_POSITIONS positions (default 4) and checks the f32 tolerances,
  * not the gate, which needs every position. Needs $ATH_GOLDEN_DIR and
  * $ATH_MODEL_DIR; skipped when either is missing.
@@ -197,33 +198,33 @@ ATH_TEST(forward_rejects)
     int32_t toks[5] = {1, 2, 3, 4, 5};
     ath_batch b = {toks, 3, &logits};
 
-    ATH_EXPECT_STATUS(ath_model_forward(m, &b, &s, NULL, NULL), ATH_ERR_INVALID_ARG);
-    ATH_EXPECT_STATUS(ath_model_forward(m, &(ath_batch){toks, 0, NULL}, &s, NULL, &scratch), ATH_ERR_INVALID_ARG);
-    ATH_EXPECT_STATUS(ath_model_forward(m, &(ath_batch){NULL, 3, NULL}, &s, NULL, &scratch), ATH_ERR_INVALID_ARG);
-    ATH_EXPECT_STATUS(ath_model_forward(m, &(ath_batch){toks, 5, NULL}, &s, NULL, &scratch), ATH_ERR_RANGE);
+    ATH_EXPECT_STATUS(ath_model_forward(m, &b, &s, NULL, NULL, NULL), ATH_ERR_INVALID_ARG);
+    ATH_EXPECT_STATUS(ath_model_forward(m, &(ath_batch){toks, 0, NULL}, &s, NULL, &scratch, NULL), ATH_ERR_INVALID_ARG);
+    ATH_EXPECT_STATUS(ath_model_forward(m, &(ath_batch){NULL, 3, NULL}, &s, NULL, &scratch, NULL), ATH_ERR_INVALID_ARG);
+    ATH_EXPECT_STATUS(ath_model_forward(m, &(ath_batch){toks, 5, NULL}, &s, NULL, &scratch, NULL), ATH_ERR_RANGE);
     toks[1] = V;
-    ATH_EXPECT_STATUS(ath_model_forward(m, &b, &s, NULL, &scratch), ATH_ERR_RANGE);
+    ATH_EXPECT_STATUS(ath_model_forward(m, &b, &s, NULL, &scratch, NULL), ATH_ERR_RANGE);
     toks[1] = -1;
-    ATH_EXPECT_STATUS(ath_model_forward(m, &b, &s, NULL, &scratch), ATH_ERR_RANGE);
+    ATH_EXPECT_STATUS(ath_model_forward(m, &b, &s, NULL, &scratch, NULL), ATH_ERR_RANGE);
     toks[1] = 2;
 
     ath_tensor wrong = f32_tensor(out, 2, V);   /* neither 3 rows nor 1 */
-    ATH_EXPECT_STATUS(ath_model_forward(m, &(ath_batch){toks, 3, &wrong}, &s, NULL, &scratch), ATH_ERR_INVALID_ARG);
+    ATH_EXPECT_STATUS(ath_model_forward(m, &(ath_batch){toks, 3, &wrong}, &s, NULL, &scratch, NULL), ATH_ERR_INVALID_ARG);
     wrong = f32_tensor(out, 3, V - 1);
-    ATH_EXPECT_STATUS(ath_model_forward(m, &(ath_batch){toks, 3, &wrong}, &s, NULL, &scratch), ATH_ERR_INVALID_ARG);
+    ATH_EXPECT_STATUS(ath_model_forward(m, &(ath_batch){toks, 3, &wrong}, &s, NULL, &scratch, NULL), ATH_ERR_INVALID_ARG);
     wrong = logits;
     wrong.dtype = ATH_DTYPE_BF16;
-    ATH_EXPECT_STATUS(ath_model_forward(m, &(ath_batch){toks, 3, &wrong}, &s, NULL, &scratch), ATH_ERR_TYPE);
+    ATH_EXPECT_STATUS(ath_model_forward(m, &(ath_batch){toks, 3, &wrong}, &s, NULL, &scratch, NULL), ATH_ERR_TYPE);
     ath_state none = {.buf = NULL};
-    ATH_EXPECT_STATUS(ath_model_forward(m, &b, &none, NULL, &scratch), ATH_ERR_INVALID_ARG);
+    ATH_EXPECT_STATUS(ath_model_forward(m, &b, &none, NULL, &scratch, NULL), ATH_ERR_INVALID_ARG);
     ATH_EXPECT(s.n_past == 0);
 
     /* the state fills up: 3 tokens, then 2 do not fit, then 1 does */
-    ATH_EXPECT_OK(ath_model_forward(m, &b, &s, NULL, &scratch));
+    ATH_EXPECT_OK(ath_model_forward(m, &b, &s, NULL, &scratch, NULL));
     ATH_EXPECT(s.n_past == 3);
-    ATH_EXPECT_STATUS(ath_model_forward(m, &(ath_batch){toks, 2, NULL}, &s, NULL, &scratch), ATH_ERR_RANGE);
+    ATH_EXPECT_STATUS(ath_model_forward(m, &(ath_batch){toks, 2, NULL}, &s, NULL, &scratch, NULL), ATH_ERR_RANGE);
     ATH_EXPECT(s.n_past == 3);
-    ATH_EXPECT_OK(ath_model_forward(m, &(ath_batch){toks, 1, NULL}, &s, NULL, &scratch));
+    ATH_EXPECT_OK(ath_model_forward(m, &(ath_batch){toks, 1, NULL}, &s, NULL, &scratch, NULL));
     ATH_EXPECT(s.n_past == 4);
     /* scratch memory is released by every call */
     ATH_EXPECT(ath_arena_used(&scratch) == 0);
@@ -233,7 +234,7 @@ ATH_TEST(forward_rejects)
     ATH_REQUIRE_OK(tiny_open(&moe, &MOE, 1));
     ath_state sm;
     ATH_REQUIRE_OK(ath_state_init(&sm, &moe.m, ATH_DTYPE_BF16, 4, &moe.a));
-    ATH_EXPECT_STATUS(ath_model_forward(&moe.m, &(ath_batch){toks, 2, NULL}, &sm, NULL, &scratch),
+    ATH_EXPECT_STATUS(ath_model_forward(&moe.m, &(ath_batch){toks, 2, NULL}, &sm, NULL, &scratch, NULL),
                       ATH_ERR_UNSUPPORTED);
     ATH_EXPECT(sm.n_past == 0);
     tiny_close(&moe);
@@ -251,7 +252,7 @@ static ath_status run_pieces(const ath_model *m, ath_dtype act, const int *sizes
     int done = 0;
     for (int i = 0; i < n_sizes; i++) {
         ath_tensor logits = f32_tensor(out + (size_t)done * V, sizes[i], V);
-        ATH_CHECK(ath_model_forward(m, &(ath_batch){TOKENS + done, sizes[i], &logits}, s, NULL, scratch));
+        ATH_CHECK(ath_model_forward(m, &(ath_batch){TOKENS + done, sizes[i], &logits}, s, NULL, scratch, NULL));
         done += sizes[i];
     }
     return done == NTOK ? ATH_OK : ATH_ERR_INVALID_ARG;
@@ -280,14 +281,14 @@ static void check_pieces(ath_test *t_, ath_dtype act)
     ath_state sl;
     ath_tensor one = f32_tensor(last, 1, V);
     ATH_REQUIRE_OK(zeroed_state(&sl, m, act, NTOK, &t.a));
-    ATH_REQUIRE_OK(ath_model_forward(m, &(ath_batch){TOKENS, NTOK, &one}, &sl, NULL, &scratch));
+    ATH_REQUIRE_OK(ath_model_forward(m, &(ath_batch){TOKENS, NTOK, &one}, &sl, NULL, &scratch, NULL));
     ATH_EXPECT(memcmp(last, lw + (NTOK - 1) * V, sizeof last) == 0);
 
     /* after a reset the same state runs the sequence again from scratch */
     float again[NTOK * V];
     ath_tensor all = f32_tensor(again, NTOK, V);
     ath_state_reset(&sw, m);
-    ATH_REQUIRE_OK(ath_model_forward(m, &(ath_batch){TOKENS, NTOK, &all}, &sw, NULL, &scratch));
+    ATH_REQUIRE_OK(ath_model_forward(m, &(ath_batch){TOKENS, NTOK, &all}, &sw, NULL, &scratch, NULL));
     ATH_EXPECT(memcmp(again, lw, sizeof lw) == 0);
     ATH_EXPECT(same_state(&sw, &ss, m));
 
@@ -351,7 +352,7 @@ ATH_TEST(forward_hooks)
 
     hook_log log = {.m = m, .tokens = TOKENS, .dtype_ok = true, .embed_ok = true, .act = ATH_DTYPE_BF16};
     ath_hooks h = {.on_residual = on_residual, .u = &log};
-    ATH_REQUIRE_OK(ath_model_forward(m, &(ath_batch){TOKENS, 5, NULL}, &s, &h, &scratch));
+    ATH_REQUIRE_OK(ath_model_forward(m, &(ath_batch){TOKENS, 5, NULL}, &s, &h, &scratch, NULL));
     ATH_EXPECT(log.calls == m->n_layers + 1);
     for (int i = 0; i < log.calls && i < 16; i++) {
         ATH_EXPECT(log.layer[i] == i);
@@ -359,7 +360,7 @@ ATH_TEST(forward_hooks)
     }
     log.calls = 0;
     log.tokens = TOKENS + 5;
-    ATH_REQUIRE_OK(ath_model_forward(m, &(ath_batch){TOKENS + 5, 1, NULL}, &s, &h, &scratch));
+    ATH_REQUIRE_OK(ath_model_forward(m, &(ath_batch){TOKENS + 5, 1, NULL}, &s, &h, &scratch, NULL));
     ATH_EXPECT(log.calls == m->n_layers + 1);
     ATH_EXPECT(log.rows[0] == 1 && log.rows[m->n_layers] == 1);
     ATH_EXPECT(log.dtype_ok);
@@ -367,7 +368,7 @@ ATH_TEST(forward_hooks)
 
     /* hooks with no callback, and no hooks at all, are fine */
     ath_hooks empty = {.on_residual = NULL};
-    ATH_EXPECT_OK(ath_model_forward(m, &(ath_batch){TOKENS + 6, 1, NULL}, &s, &empty, &scratch));
+    ATH_EXPECT_OK(ath_model_forward(m, &(ath_batch){TOKENS + 6, 1, NULL}, &s, &empty, &scratch, NULL));
     ath_arena_free(&scratch);
     tiny_close(&t);
 }
@@ -414,6 +415,7 @@ typedef struct {
     /* in */
     const ath_model       *m;
     const ath_safetensors *g;
+    ath_pool              *pool;                 /* shared by the runs */
     const char            *name;
     ath_dtype              act;
     const int32_t         *tokens;
@@ -474,7 +476,7 @@ static void *run_job(void *arg)
         int32_t n = p == 0 ? first : 1;
         ath_tensor logits = f32_tensor(j->logits + (size_t)p * (size_t)V, n, V);
         j->pos0 = p;
-        j->st = ath_model_forward(j->m, &(ath_batch){j->tokens + p, n, &logits}, &s, &h, &scratch);
+        j->st = ath_model_forward(j->m, &(ath_batch){j->tokens + p, n, &logits}, &s, &h, &scratch, j->pool);
         p += n;
     }
     j->seconds = now() - t0;
@@ -634,6 +636,7 @@ ATH_TEST(forward_golden)
         ATH_REQUIRE(read_prompt(t_, ath_json_at(recs, i), &g, &a, &P[i]));
 
     /* two runs per prompt: bf16 and f32 activations */
+    ath_pool pool = {.n_threads = 0};   /* started below, once nothing can return early */
     job J[2 * MAX_PROMPTS];
     pthread_t th[2 * MAX_PROMPTS];
     const int n_jobs = 2 * (int)n_prompts;
@@ -642,7 +645,7 @@ ATH_TEST(forward_golden)
         job *j = &J[k];
         int32_t n_run = positions_to_run(p->n_tokens);
         *j = (job){
-            .m = &m, .g = &g, .name = p->name, .act = k % 2 ? ATH_DTYPE_F32 : ATH_DTYPE_BF16,
+            .m = &m, .g = &g, .pool = &pool, .name = p->name, .act = k % 2 ? ATH_DTYPE_F32 : ATH_DTYPE_BF16,
             .tokens = p->tokens, .n_prompt = p->n_prompt, .n_tokens = p->n_tokens, .n_run = n_run,
             .res = p->res, .res32 = p->res32, .rms = p->rms, .rms32 = p->rms32,
         };
@@ -659,10 +662,14 @@ ATH_TEST(forward_golden)
                                      p->res32->dtype, (int64_t)n_run * H);
             }
     }
-    for (int k = 0; k < n_jobs; k++)
-        ATH_REQUIRE(pthread_create(&th[k], NULL, run_job, &J[k]) == 0);
-    for (int k = 0; k < n_jobs; k++)
+    ATH_REQUIRE_OK(ath_pool_init(&pool, ath_pool_default_threads(), &a));
+    int started = 0;
+    while (started < n_jobs && pthread_create(&th[started], NULL, run_job, &J[started]) == 0)
+        started++;
+    for (int k = 0; k < started; k++)
         pthread_join(th[k], NULL);
+    ath_pool_free(&pool);
+    ATH_REQUIRE(started == n_jobs);
 
     bool full = true;
     for (int k = 0; k < n_jobs; k++) {
