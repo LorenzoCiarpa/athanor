@@ -6,8 +6,8 @@ Maps each article and lesson of the course to the athanor code that implements i
 | --- | --- | --- | --- | --- |
 | 1 | Reading a model from disk: safetensors, mmap and zero-copy | 1 | `src/core/file.c`, `safetensors.c`, `json.c`, `arena.c` | code landed (step 1) |
 | 2 | What is inside a Qwen checkpoint | 1–2 | `tools/inspect.c` (`--roles`), `src/model/model.h`, `src/model/registry.c`, `src/models/qwen35/config.c`, `weights.c`; tensor groups, op contract and parameter binding in `docs/contract/qwen35-0.8b.md` and `qwen35-35b-a3b.md` | inspect landed (step 1); roles landed (step 2) |
-| 3 | The forward pass in plain C: embeddings, norms, attention, MLP | 3–4 | `src/ops/*.c`, `src/models/qwen35/forward.c` | planned |
-| 4 | Linear attention and Gated DeltaNet, from the recurrence | 3–4 | `src/ops/gdn.c` | planned |
+| 3 | The forward pass in plain C: embeddings, norms, attention, MLP | 3–4 | `src/ops/*.c` (`embed`, `matmul`, `norm`, `rope`, `act`, `attn`), `src/models/qwen35/forward.c`; checking each op against the reference: `tests/golden/dump.py`, `tests/test_golden.c`, tolerances in `tests/README.md` | CPU reference ops landed (step 3); forward planned (step 4) |
+| 4 | Linear attention and Gated DeltaNet, from the recurrence | 3–4 | `src/ops/gdn.c`, `src/ops/conv.c`, `ath_l2norm_ref` in `src/ops/norm.c` | recurrent reference landed (step 3) |
 | 5 | Byte-level BPE from scratch | 5 | `src/text/bpe.c` | planned |
 | 6 | Sampling: temperature, top-k, top-p | 5 | `src/ops/sample.c` | planned |
 | 7 | How a GPU runs a kernel; one source for CUDA and HIP | 6–7 | `src/backend/`, `src/ops/*.cu` | planned |

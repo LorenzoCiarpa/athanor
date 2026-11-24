@@ -148,8 +148,8 @@ athanor/
 ├── src/
 │   ├── core/      base.c arena.c tensor.c file.c json.c safetensors.c threads.c rng.c (each with its .h)
 │   ├── backend/   backend.h compat.h cpu.c gpu.cu
-│   ├── ops/       ops.h; per op a .c reference and a .cu kernel:
-│   │              norm rope act embed matmul attn gdn conv moe sample quant
+│   ├── ops/       ops.h, check.h (private); per op a .c reference and a .cu kernel:
+│   │              embed matmul norm rope act attn conv gdn (step 3), moe sample quant
 │   ├── text/      bpe.c unicode.h (generated, committed)
 │   ├── model/     model.h registry.c
 │   ├── models/
@@ -160,7 +160,8 @@ athanor/
 │   ├── train/     loop.c optim.c lora.c hotcold.c data.c planner.c ckpt.c
 │   └── net/       http.c api.c
 ├── tools/         athanor.c (dispatch), one file per subcommand (inspect.c, ...), dev/ (development helpers)
-├── tests/         test.h (runner) util.h test_core.c test_model.c test_ops.c ... golden/dump.py
+├── tests/         test.h (runner) util.h test_core.c test_model.c test_ops.c test_golden.c ...
+│                  golden/ (dump.py, requirements.txt; data/ generated, not committed)
 └── docs/          ARCHITECTURE.md PLAN.md STATUS.md MODELS.md BENCHMARKS.md contract/ program/ results/
 ```
 

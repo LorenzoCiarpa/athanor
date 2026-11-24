@@ -1,6 +1,6 @@
 # src/backend
 
-Device runtimes: CPU, and GPU for NVIDIA and AMD from one source. Introduced in step 3 (CPU) and step 6 (GPU).
+Device runtimes: CPU, and GPU for NVIDIA and AMD from one source. Planned for step 3 (CPU) and step 6 (GPU). Nothing is here yet: the CPU reference ops of step 3 need no runtime (they allocate nothing, use one thread, and read host memory that arenas provide), so `cpu.c` arrives with its first user, the GPU runtime of step 6 or the thread pool of the first `_fast` CPU path.
 
 | File | Content |
 | --- | --- |
