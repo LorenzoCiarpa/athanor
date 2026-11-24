@@ -4,7 +4,7 @@ The bottom layer: memory, tensors, files, parsing, threads. No GPU code and no k
 
 | File | Content | Step |
 | --- | --- | --- |
-| `base.h`, `base.c` | fixed-width types, `ath_status` and `ath_status_str`, `ATH_CHECK`, logging (`ath_log`, `ATH_LOG` environment variable), `ATH_ASSERT` | 1 |
+| `base.h`, `base.c` | fixed-width types, `ath_status` and `ath_status_str` (`ATH_ERR_DEVICE` since step 6), `ATH_CHECK`, logging (`ath_log`, `ATH_LOG` environment variable), `ATH_ASSERT` | 1, 6 |
 | `arena.h`, `arena.c` | lifetime-scoped linear arenas (weights, per-request, per-step scratch): chained blocks, alignment, mark/reset | 1 |
 | `tensor.h`, `tensor.c` | `ath_dtype`, `ath_tier`, `ath_tensor` descriptor, slice and reshape views; bf16 conversion (round to nearest even, as torch) and element access for f32 and bf16 (step 3) | 1, 3 |
 | `file.h`, `file.c` | read-only `mmap`, `pread`, path join; async reads later (io_uring via raw syscalls) | 1 |
@@ -15,6 +15,8 @@ The bottom layer: memory, tensors, files, parsing, threads. No GPU code and no k
 | `rng.h`, `rng.c` | `ath_rng`: xoshiro256** seeded by splitmix64, the same sequence for the same seed on every machine; the state belongs to the caller. First user: sampling in `athanor chat` | 5 |
 
 ## Conventions
+
+- Headers that GPU code includes (`base.h`, `arena.h` so far) wrap their declarations in `extern "C"`, because nvcc compiles `.cu` files as C++ (`src/backend/README.md`).
 
 - Every fallible function returns `ath_status`; `ATH_OK` is 0. Propagate with `ATH_CHECK(expr)`; with `ATH_LOG=debug` each hop is logged, which reads like a backtrace.
 - Allocation functions (`ath_arena_alloc`, `ath_arena_zalloc`, `ath_arena_strndup`) return `NULL` on failure; callers map it to `ATH_ERR_NOMEM`.

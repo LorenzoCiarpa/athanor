@@ -6,6 +6,6 @@ Quick reference:
 
 ```
 make && make test          # CPU build and tests
-make cuda && make test     # NVIDIA
+make cuda test             # NVIDIA (CUDA_HOME: a CUDA 12.8+ toolkit)
 ./build/athanor inspect <model_dir>
 ```

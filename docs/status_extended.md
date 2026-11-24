@@ -17,6 +17,7 @@ How to read it:
   - [Step 3: CPU reference ops and golden harness](#step-3-cpu-reference-ops-and-golden-harness)
   - [Step 4: CPU forward](#step-4-cpu-forward)
   - [Step 5: tokenizer, sampling, CPU chat](#step-5-tokenizer-sampling-cpu-chat)
+  - [Step 6: GPU backend](#step-6-gpu-backend)
 - [Files by step](#files-by-step)
 
 ---
@@ -808,59 +809,123 @@ What was implemented: unit tests that need no data (UTF-8, classes, NFC, the JSO
 
 ---
 
+### Step 6: GPU backend
+
+Branch `step6-gpu-backend`, from `main` after step 5 was merged and tagged `v0.1-cpu-chat`. The gate of `docs/PLAN.md`: allocation, copies, streams, events and timing on CUDA. Before the step the toolkit was upgraded (STATUS, open questions): CUDA 13.5 from NVIDIA's redist archives, selected with `CUDA_HOME`, on the existing 580 driver.
+
+#### 6.1 Build
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `Makefile` | Changed | `GPU=cuda` when `cuda` is among the goals; `build/cuda`, `build/cuda-debug`; `CUDA_HOME`, `CUDA_ARCH`, `NVCC`, `NVCCFLAGS`; a pattern rule for `.cu`; static CUDA runtime in `LDLIBS`; the backend sources (`gpu.cu` or `gpu_none.c`); `test_backend` among the suites; `ASAN_OPTIONS` for the CUDA debug tests |
+| `tools/dev/check_nvcc.sh` | New | Fails with a clear message when `CUDA_HOME` has no nvcc, or one too old for `CUDA_ARCH` (12.8 for `sm_120`) |
+
+#### 6.2 to 6.5 The backend
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `src/backend/backend.h` | New | The interface: `ath_device` (properties, three streams), device and pinned memory, `ath_copy`, `ath_memset`, stream and device synchronization, `ath_event` (ordering, timing), `ath_dev_arena` |
+| `src/backend/gpu.cu` | New | The CUDA implementation: errors mapped and the sticky error cleared, the device selected on every call, non-blocking streams, events with or without timing |
+| `src/backend/gpu_none.c` | New | The interface in a build without a GPU backend |
+| `src/backend/compat.h` | New | CUDA names to HIP for every runtime call in use; `ATH_WARP`; `ATH_GPU_BACKEND` |
+| `src/backend/devarena.c` | New | The device arena: blocks from `ath_dev_alloc`, records in a host arena, bumping, mark and reset, blocks kept and reused in order |
+| `src/core/base.h`, `base.c` | Changed | `ATH_ERR_DEVICE`; `extern "C"` guards |
+| `src/core/arena.h` | Changed | `extern "C"` guards |
+
+What was implemented:
+
+- **Opening a device.** It reads the properties: name, compute capability, multiprocessors, warp size (refusing anything but 32), memory, L2, the opt-in shared memory per block, driver and runtime versions. It then creates the three streams, non-blocking so that they never synchronize with the legacy default stream.
+- **Copies** use `cudaMemcpyAsync` with `cudaMemcpyDefault`: unified virtual addressing gives the direction from the pointers, so one function serves every pair of memory kinds.
+- **The device arena** follows the core arena's semantics. The differences are in the bookkeeping: records on the host, and a request that does not fit the next kept block gets a new block inserted before it, so blocks stay in allocation order and marks remain meaningful.
+
+#### 6.6 `athanor devices`
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `tools/devices.c` | New | The subcommand: devices and properties; `--bench` times 256 MiB copies with events, best of 5 |
+| `tools/athanor.c`, `commands.h` | Changed | Its entry in the dispatch table |
+
+#### 6.7 `tests/test_backend.c`
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `tests/test_backend.c` | New | 7 tests: the stub (CPU build only); on the GPU, properties, copies and memset, streams ordered by events, timing, an impossible allocation, the device arena |
+
+What was found while testing:
+- Under AddressSanitizer the CUDA driver did not start: ASan reserves the address range the driver maps into. The CUDA debug tests run with `ASAN_OPTIONS=protect_shadow_gap=0`.
+- compute-sanitizer reports the two API errors of the deliberate impossible allocation, and nothing else.
+
+#### 6.8 Documentation
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `docs/STATUS.md` | Changed | Step 6 current and done, step 5 completed, merged and tagged, the CUDA question resolved, the `output_gate_type` question, step 7 preview, log |
+| `docs/proposals/chat-state-at-last-query.md`, `chat-shadow-sequence.md` | New | Two ways to reuse the state across chat turns, written down at the maintainer's request, not scheduled |
+| `src/backend/README.md` | Changed | Rewritten for what exists: files, building, the interface, streams, tests |
+| `src/core/README.md`, `tools/README.md`, `tests/README.md` | Changed | `ATH_ERR_DEVICE` and the C linkage; `athanor devices` and `check_nvcc.sh`; `test_backend` and the CUDA test commands |
+| `docs/ARCHITECTURE.md`, `CLAUDE.md`, `docs/program/PROGRAM.md` | Changed | Tree and Makefile targets; `make cuda test`; row 7 |
+
+---
+
 ## Files by step
 
 Every file of the repository and the steps that created or changed it (documentation-only edits included).
 
-| File | Step 1 | Step 2 | Step 3 | Step 4 | Step 5 |
-| --- | --- | --- | --- | --- | --- |
-| `Makefile` | 1.1, 1.8 | 2.3, 2.6 | 3.3, 3.4, 3.5, 3.6 | 4.5 | 5.1, 5.3, 5.8 |
-| `src/core/base.{h,c}` | 1.2 | | | | |
-| `src/core/arena.{h,c}` | 1.3 | | | | |
-| `src/core/file.{h,c}` | 1.4, 1.7 | | | | |
-| `src/core/json.{h,c}` | 1.5 | | | | 5.4 |
-| `src/core/tensor.{h,c}` | 1.6 | | 3.2 | | |
-| `src/core/safetensors.{h,c}` | 1.7 | | | | |
-| `src/core/threads.{h,c}` | | | | 4.7 | |
-| `src/model/model.h` | | 2.2 | | 4.2, 4.7, 4.8 | 5.4 |
-| `src/model/registry.c` | | 2.3 | | 4.8 | |
-| `src/model/state.c` | | | | 4.2, 4.7 | 5.4 |
-| `src/models/qwen35/qwen35.h`, `config.c` | | 2.4 | | 4.3, 4.7, 4.8 (`qwen35.h`) | 5.5 (`qwen35.h`) |
-| `src/models/qwen35/weights.c`, `family.c` | | 2.5 | | 4.3, 4.8 (`weights.c`) | 5.5 (`family.c`) |
-| `src/models/qwen35/forward.c` | | | | 4.3, 4.7 | |
-| `src/ops/ops.h`, `check.h`, `embed.c`, `matmul.c`, `norm.c`, `rope.c`, `act.c`, `attn.c`, `conv.c`, `gdn.c` | | | 3.3 | 4.7 (`ops.h`, `matmul.c`) | 5.6 (`ops.h`) |
-| `tools/athanor.c`, `commands.h` | 1.8 | | | | 5.7 |
-| `tools/inspect.c` | 1.8 | 2.6 | | 4.8 | |
-| `tools/dev/alloc_trace.c` | 1.8 | | | | |
-| `tools/dev/check_alloc.sh` | 1.8 | 2.6 | | | |
-| `tests/test.h` | 1.9 | | | | |
-| `tests/test_core.c` | 1.9 | 2.7 | | 4.7 | |
-| `tests/util.h`, `tests/test_model.c` | | 2.7 | | 4.5, 4.8 (`test_model.c`) | |
-| `tests/test_ops.c` | | | 3.5 | 4.7 | |
-| `tests/test_golden.c` | | | 3.6 | 4.7 | |
-| `tests/tiny.h`, `tests/test_forward.c` | | | | 4.5, 4.7 (`test_forward.c`) | |
-| `tests/golden/dump.py`, `README.md` | | | 3.4 | 4.4, 4.8 | 5.9 (`README.md`) |
-| `tests/golden/requirements.in`, `requirements.txt` | | | 3.1 | | |
-| `src/core/buf.{h,c}`, `src/core/rng.{h,c}` | | | | | 5.4 |
-| `src/text/unicode.{h,c}`, `unicode_tables.h` | | | | | 5.2 |
-| `src/text/bpe.{h,c}` | | | | | 5.3 |
-| `src/model/text.c` | | | | | 5.4 |
-| `src/models/qwen35/text.c` | | | | | 5.5 |
-| `src/ops/sample.c` | | | | | 5.6 |
-| `tools/chat.c` | | | | | 5.7 |
-| `tools/dev/gen_unicode.py` | | | | | 5.2 |
-| `tests/test_text.c` | | | | | 5.8 |
-| `tests/golden/text.py` | | | | | 5.1 |
-| `docs/contract/qwen35-0.8b.md` | closing | 2.1 | 3.1, 3.7 | 4.6, 4.8 | 5.9 |
-| `docs/contract/qwen35-35b-a3b.md` | | 2.1 | | 4.8 | |
-| `docs/MODELS.md` | | 2.1 | 3.7 | 4.6, 4.8 | |
-| `docs/ARCHITECTURE.md` | closing | 2.2 | 3.7 | 4.6, 4.7, 4.8 | 5.9 |
-| `docs/PLAN.md` | | | | 4.8 | |
-| `docs/STATUS.md` | closing | 2.1 to 2.7, closing | 3.1, closing | 4.1, closing, 4.7, 4.8 | 5.1 to 5.9, closing |
-| `docs/program/PROGRAM.md` | closing | closing | 3.7 | 4.6, 4.7, 4.8 | 5.9 |
-| `docs/proposals/cpu-matmul-avx512.md` | | | | 4.7 | |
-| `docs/CHANGE-001-scope-tools-cache.md` | | | | 4.8 | |
-| `docs/status_extended.md` | | | closing | 4.6, 4.7, 4.8 | 5.9 |
-| `AGENTS.md` | | 2.3 | 3.7 | 4.8 | |
-| `README.md` | closing | | | 4.8 | 5.9 |
-| module READMEs | closing (`src/core`, `tests`, `tools`) | 2.2, 2.5, 2.6, 2.7 (`src/model`, `src/models/qwen35`, `tools`, `tests`) | 3.2, 3.3, 3.6, 3.7 (`src/core`, `src/ops`, `tests`, `tests/golden`, `src/backend`) | 4.6 (`src/model`, `src/models/qwen35`, `tests`, `tests/golden`); 4.7 (`src/core`, `src/ops`, `src/backend`, `src/model`, `src/models/qwen35`, `tests`); 4.8 (`src/model`, `src/models/qwen35`, `src/net`, `src/infer`, `src/text`, `tools`) | 5.9 (`src/core`, `src/text`, `src/ops`, `src/model`, `src/models/qwen35`, `tools`, `tests`) |
+| File | Step 1 | Step 2 | Step 3 | Step 4 | Step 5 | Step 6 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `Makefile` | 1.1, 1.8 | 2.3, 2.6 | 3.3, 3.4, 3.5, 3.6 | 4.5 | 5.1, 5.3, 5.8 | 6.1 |
+| `src/core/base.{h,c}` | 1.2 | | | | | 6.2 |
+| `src/core/arena.{h,c}` | 1.3 | | | | | 6.2 (`arena.h`) |
+| `src/core/file.{h,c}` | 1.4, 1.7 | | | | | |
+| `src/core/json.{h,c}` | 1.5 | | | | 5.4 | |
+| `src/core/tensor.{h,c}` | 1.6 | | 3.2 | | | |
+| `src/core/safetensors.{h,c}` | 1.7 | | | | | |
+| `src/core/threads.{h,c}` | | | | 4.7 | | |
+| `src/model/model.h` | | 2.2 | | 4.2, 4.7, 4.8 | 5.4 | |
+| `src/model/registry.c` | | 2.3 | | 4.8 | | |
+| `src/model/state.c` | | | | 4.2, 4.7 | 5.4 | |
+| `src/models/qwen35/qwen35.h`, `config.c` | | 2.4 | | 4.3, 4.7, 4.8 (`qwen35.h`) | 5.5 (`qwen35.h`) | |
+| `src/models/qwen35/weights.c`, `family.c` | | 2.5 | | 4.3, 4.8 (`weights.c`) | 5.5 (`family.c`) | |
+| `src/models/qwen35/forward.c` | | | | 4.3, 4.7 | | |
+| `src/ops/ops.h`, `check.h`, `embed.c`, `matmul.c`, `norm.c`, `rope.c`, `act.c`, `attn.c`, `conv.c`, `gdn.c` | | | 3.3 | 4.7 (`ops.h`, `matmul.c`) | 5.6 (`ops.h`) | |
+| `tools/athanor.c`, `commands.h` | 1.8 | | | | 5.7 | 6.6 |
+| `tools/inspect.c` | 1.8 | 2.6 | | 4.8 | | |
+| `tools/dev/alloc_trace.c` | 1.8 | | | | | |
+| `tools/dev/check_alloc.sh` | 1.8 | 2.6 | | | | |
+| `tests/test.h` | 1.9 | | | | | |
+| `tests/test_core.c` | 1.9 | 2.7 | | 4.7 | | |
+| `tests/util.h`, `tests/test_model.c` | | 2.7 | | 4.5, 4.8 (`test_model.c`) | | |
+| `tests/test_ops.c` | | | 3.5 | 4.7 | | |
+| `tests/test_golden.c` | | | 3.6 | 4.7 | | |
+| `tests/tiny.h`, `tests/test_forward.c` | | | | 4.5, 4.7 (`test_forward.c`) | | |
+| `tests/golden/dump.py`, `README.md` | | | 3.4 | 4.4, 4.8 | 5.9 (`README.md`) | |
+| `tests/golden/requirements.in`, `requirements.txt` | | | 3.1 | | | |
+| `src/core/buf.{h,c}`, `src/core/rng.{h,c}` | | | | | 5.4 | |
+| `src/text/unicode.{h,c}`, `unicode_tables.h` | | | | | 5.2 | |
+| `src/text/bpe.{h,c}` | | | | | 5.3 | |
+| `src/model/text.c` | | | | | 5.4 | |
+| `src/models/qwen35/text.c` | | | | | 5.5 | |
+| `src/ops/sample.c` | | | | | 5.6 | |
+| `tools/chat.c` | | | | | 5.7 | |
+| `tools/dev/gen_unicode.py` | | | | | 5.2 | |
+| `tests/test_text.c` | | | | | 5.8 | |
+| `tests/golden/text.py` | | | | | 5.1 | |
+| `src/backend/backend.h`, `gpu.cu`, `gpu_none.c`, `compat.h`, `devarena.c` | | | | | | 6.2 to 6.5 |
+| `tools/devices.c` | | | | | | 6.6 |
+| `tools/dev/check_nvcc.sh` | | | | | | 6.1 |
+| `tests/test_backend.c` | | | | | | 6.7 |
+| `docs/proposals/chat-state-at-last-query.md`, `chat-shadow-sequence.md` | | | | | | 6.8 |
+| `CLAUDE.md` | | | | | | 6.8 |
+| `docs/contract/qwen35-0.8b.md` | closing | 2.1 | 3.1, 3.7 | 4.6, 4.8 | 5.9 | |
+| `docs/contract/qwen35-35b-a3b.md` | | 2.1 | | 4.8 | | |
+| `docs/MODELS.md` | | 2.1 | 3.7 | 4.6, 4.8 | | |
+| `docs/ARCHITECTURE.md` | closing | 2.2 | 3.7 | 4.6, 4.7, 4.8 | 5.9 | 6.8 |
+| `docs/PLAN.md` | | | | 4.8 | | |
+| `docs/STATUS.md` | closing | 2.1 to 2.7, closing | 3.1, closing | 4.1, closing, 4.7, 4.8 | 5.1 to 5.9, closing | 6.1 to 6.8 |
+| `docs/program/PROGRAM.md` | closing | closing | 3.7 | 4.6, 4.7, 4.8 | 5.9 | 6.8 |
+| `docs/proposals/cpu-matmul-avx512.md` | | | | 4.7 | | |
+| `docs/CHANGE-001-scope-tools-cache.md` | | | | 4.8 | | |
+| `docs/status_extended.md` | | | closing | 4.6, 4.7, 4.8 | 5.9 | 6.8 |
+| `AGENTS.md` | | 2.3 | 3.7 | 4.8 | | |
+| `README.md` | closing | | | 4.8 | 5.9 | |
+| module READMEs | closing (`src/core`, `tests`, `tools`) | 2.2, 2.5, 2.6, 2.7 (`src/model`, `src/models/qwen35`, `tools`, `tests`) | 3.2, 3.3, 3.6, 3.7 (`src/core`, `src/ops`, `tests`, `tests/golden`, `src/backend`) | 4.6 (`src/model`, `src/models/qwen35`, `tests`, `tests/golden`); 4.7 (`src/core`, `src/ops`, `src/backend`, `src/model`, `src/models/qwen35`, `tests`); 4.8 (`src/model`, `src/models/qwen35`, `src/net`, `src/infer`, `src/text`, `tools`) | 5.9 (`src/core`, `src/text`, `src/ops`, `src/model`, `src/models/qwen35`, `tools`, `tests`) | 6.8 (`src/backend`, `src/core`, `tools`, `tests`) |

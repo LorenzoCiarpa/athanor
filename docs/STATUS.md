@@ -6,11 +6,52 @@ This file is the overview. [`status_extended.md`](status_extended.md) goes one l
 
 ## Current step
 
-**Step 5: tokenizer, sampling, CPU chat** (see `docs/PLAN.md` §4, gate amended by CHANGE-001). Started 2026-11-24 on branch `step5-tokenizer-chat`. **Done 2026-11-24** (pushed, to be merged into `main`); step 6 is next.
+**Step 6: GPU backend** (see `docs/PLAN.md` §4). Started 2026-11-24 on branch `step6-gpu-backend`. **Done 2026-11-24** (pushed, to be merged into `main`); step 7 is next.
+
+Goal: the GPU runtime athanor's kernels will run on, behind one C interface: devices, device and pinned host memory, copies, streams, events and timing, on CUDA, written once for CUDA and HIP. No kernel yet (step 7).
+
+### Tasks
+
+- [x] **6.1 Build.** `make cuda`: device code compiled by nvcc (CUDA 12.8 or newer for `sm_120`, checked by `tools/dev/check_nvcc.sh`; `CUDA_HOME`, `CUDA_ARCH`), output in `build/cuda` (`build/cuda-debug` with `DEBUG=1`), CUDA runtime linked statically; `make cuda test` runs every suite of that build. `make` stays CPU-only and needs no toolkit.
+- [x] **6.2 `src/backend/backend.h`.** Devices and their properties, device and pinned memory, copies (any direction, asynchronous), memset, three streams per device (compute, host to device, device to host), events for ordering and timing; runtime errors mapped to `ATH_ERR_DEVICE` (new) and `ATH_ERR_NOMEM`.
+- [x] **6.3 `src/backend/gpu.cu`, `gpu_none.c`.** The CUDA implementation, in the C subset of CUDA C++; the stub for builds without a GPU backend (no devices, every call `ATH_ERR_UNSUPPORTED`).
+- [x] **6.4 `src/backend/compat.h`.** The CUDA runtime names used by GPU code mapped to HIP, and `ATH_WARP`; compiled only by nvcc until the HIP build (step 11).
+- [x] **6.5 Device arena.** `src/backend/devarena.c`: linear allocation in device memory with mark and reset, like the core arenas, block records on the host.
+- [x] **6.6 `athanor devices`.** List the devices; `--bench` times copies with events.
+- [x] **6.7 `tests/test_backend.c`.** The stub in the CPU build; on the GPU: properties, copies in every direction at odd sizes and offsets from pinned and ordinary memory, memset, three streams ordered by events, timing, an impossible allocation, the device arena.
+- [x] **6.8 Documentation.**
+
+### Acceptance criteria
+
+1. `make cuda` builds with CUDA 12.8 or newer for `sm_120` with zero warnings (host and device code), and refuses an older nvcc with a clear message; `make` is unchanged and needs no CUDA toolkit.
+2. On the RTX 5080: device and pinned allocation, copies in every direction (synchronous to the host and asynchronous), memset, three streams ordered only by events, and event timing, all checked byte for byte by `test_backend`.
+3. Errors: an impossible allocation gives `ATH_ERR_NOMEM` and the device keeps working; a bad device index or stream gives `ATH_ERR_INVALID_ARG`; no `exit` or `abort`.
+4. `make cuda test` green, also with `DEBUG=1`; `make test` green, where `test_backend` checks the stub and skips the GPU tests; compute-sanitizer finds no memory errors, leaks or races in `test_backend`.
+5. `ldd` shows no new library in either build.
+6. Documentation updated.
+
+Result (2026-11-24, RTX 5080 `sm_120`, driver 580.178.04 (CUDA 13.0), CUDA toolkit 13.5.0 (nvcc 13.5.37), gcc 15.2, glibc 2.43):
+
+| # | Criterion | Result |
+| --- | --- | --- |
+| 1 | build | `make cuda CUDA_HOME=<CUDA 13.5>` builds `build/cuda/athanor` and every test with zero warnings; with the system nvcc 12.4 it stops: "CUDA 12.4; sm_120 needs CUDA 12.8 or newer (set CUDA_HOME)". `make` builds as before, without a toolkit |
+| 2 | runtime on the GPU | `test_backend` on the RTX 5080 (84 SMs, 15.4 GiB, L2 64 MiB, 99 KiB shared memory per block): copies at 7 sizes from 1 byte to 24 MiB and unaligned offsets, pinned and ordinary memory, both directions and device to device; memset; the three streams ordered only by events over 8 rounds; timing (256 MiB device to device 0.6 ms, host to device 5 ms); every byte checked |
+| 3 | errors | an allocation of twice the device memory gives `ATH_ERR_NOMEM` and the device keeps working; device index out of range, bad stream, null pointers give `ATH_ERR_INVALID_ARG` |
+| 4 | tests | `make cuda test`: 24 + 11 + 17 + 1 + 7 + 12 + 6 (1 skipped: the stub test) pass; with `DEBUG=1` too (about 4 minutes); `make test` and `make DEBUG=1 test`: the same suites, `test_backend` 1 pass and 6 skipped; compute-sanitizer on `test_backend`: memcheck with leak check finds no memory error and 0 bytes leaked (its only reports are the two API errors of the deliberate impossible allocation), racecheck 0 hazards |
+| 5 | `ldd` | both builds: `libm`, `libc` only (the CUDA runtime is static and loads the driver itself) |
+| 6 | documentation | `src/backend/README.md` rewritten; READMEs of `src/core`, `tools`, `tests`; `docs/ARCHITECTURE.md` tree; `CLAUDE.md` quick reference; `docs/program/PROGRAM.md` row 7; this file and `status_extended.md` |
+
+For the record (no performance claim), `athanor devices --bench`, 256 MiB copies, best of 5: pinned host to device 55.8 GB/s, device to pinned host 58.1 GB/s, pageable 22 to 24 GB/s both ways, device to device 821 GB/s (read + write).
+
+## Completed steps
+
+### Step 5
+
+**Step 5: tokenizer, sampling, CPU chat** (see `docs/PLAN.md` §4, gate amended by CHANGE-001). Started 2026-11-24 on branch `step5-tokenizer-chat`. **Done 2026-11-24** (pushed, to be merged into `main`); step 6 is next. Merged into `main` (fast-forward) on 2026-11-24, at the maintainer's request, and tagged `v0.1-cpu-chat`: the first working chat, CPU only.
 
 Goal: text in and out of the model on the CPU. A byte-level BPE tokenizer that gives the reference tokenizer's ids, the family's chat template (with tool definitions and the thinking switch) rendered byte for byte as the reference renders it, a parser that turns the model's output into text, thinking and tool calls, sampling, and a first `athanor chat` on the CPU forward pass of step 4.
 
-### Tasks
+#### Tasks
 
 - [x] **5.1 Text golden data.** `tests/golden/text.py`: with the pinned reference (transformers 5.24.0, tokenizers 0.23.3), the token ids and decoded text of a corpus (hand-written cases in many languages, emoji, code, white space, contractions, added tokens; repository files; every Unicode code point in five contexts; every canonical decomposition with shuffled marks), conversations rendered by the checkpoint's chat template with and without tools and thinking (and the ones it rejects), and a greedy chat generation of the fp32 reference with its top-2 margins and the bf16 noise. `make golden` runs it.
 - [x] **5.2 Unicode.** `tools/dev/gen_unicode.py` generates `src/text/unicode_tables.h` (committed): character classes (letter, mark, number, white space) and NFC data. `src/text/unicode.c`: UTF-8, classes, NFC.
@@ -22,7 +63,7 @@ Goal: text in and out of the model on the CPU. A byte-level BPE tokenizer that g
 - [x] **5.8 `tests/test_text.c`.** Unicode, NFC, the JSON writer, pre-tokenization, parser fixtures (whole, split at every byte, byte by byte), template errors, sampling; against the golden data: the corpus, the templates, the greedy generation.
 - [x] **5.9 Documentation.** Contract docs, the chat template and tokenizer in `docs/contract/qwen35-0.8b.md`, module READMEs, `tests/README.md`, `tests/golden/README.md`, `docs/program/PROGRAM.md`, this file and `status_extended.md`.
 
-### Acceptance criteria
+#### Acceptance criteria
 
 1. Exact round trip on a corpus against the reference tokenizer: the same token ids for every text, and the same text decoded from them.
 2. Rendered prompts byte-identical to the reference chat template for a fixture set with and without tools, thinking on and off; where the template raises an error, `chat` fails (CHANGE-001).
@@ -46,7 +87,6 @@ Result (2026-11-24, Qwen3.5-0.8B revision `2fc0636`, transformers 5.24.0, tokeni
 
 Speed, for the record (no performance claim; Ryzen 7 9800X3D, 8 threads, bf16 activations): the prompt runs at about 40 to 45 tokens per second and the answer decodes at about 22 to 25 tokens per second, sampling and parsing included.
 
-## Completed steps
 
 ### Step 4
 
@@ -221,7 +261,9 @@ Result (2026-11-23, Qwen3.5-0.8B revision `2fc0636`, gcc 15.2, glibc 2.43):
 
 ## Next step (preview)
 
-**Step 6: GPU backend.** `src/backend/gpu.cu` and `compat.h`: device memory, copies, streams, events and timing on CUDA, written once for CUDA and HIP. Gate: allocation, copies, streams, events, timing on CUDA. Blocked until the CUDA toolkit is upgraded (open questions: nvcc 12.4 cannot target `sm_120`).
+**Step 7: GPU ops, one by one.** A CUDA kernel in `src/ops/<op>.cu` for every op of the forward pass (embed, matmul through cuBLASLt with its handle in the backend, the norms, RoPE, activations, attention, the short convolution, the Gated DeltaNet gates and recurrence), each compared with its CPU reference on random and real inputs, as AGENTS.md's op checklist asks. Gate: every kernel matches its CPU reference.
+
+Superseded preview (written in step 5): **Step 6: GPU backend.** `src/backend/gpu.cu` and `compat.h`: device memory, copies, streams, events and timing on CUDA, written once for CUDA and HIP. Gate: allocation, copies, streams, events, timing on CUDA. Blocked until the CUDA toolkit is upgraded (open questions: nvcc 12.4 cannot target `sm_120`).
 
 Superseded preview (written in step 4): **Step 5: tokenizer, sampling, CPU chat.** `src/text/bpe.c` and the generated `unicode.h` (byte-level BPE from `tokenizer.json`), the family's pre-tokenization split and chat template in `src/models/qwen35/text.c` (`pretokenize` and `chat` join the contract), `src/ops/sample.c`, and a first `athanor chat` on the CPU forward of step 4. Gate: exact token round-trip on a corpus against the reference tokenizer; a first chat, slow and correct.
 
@@ -235,10 +277,12 @@ Superseded preview (written in step 1): **Step 2: contract and family loading.**
 
 ## Open questions
 
+- **Qwen3.6-27B and Qwen3.8-27B declare `output_gate_type: "swish"`** (their `config.json`, read 2026-11-24). Qwen3.5 has no such key and gates the attention output with a sigmoid (contract, Full-attention layer). `config.c` does not read the key, so athanor would load those checkpoints with the sigmoid gate and no error. Before they are supported: check the reference for what "swish" means there, record it in a contract file, and reject any value the code does not implement. Until then nothing depends on it (only Qwen3.5-0.8B runs).
+
 - **Presence penalty (step 5).** Qwen3.5's model card recommends a presence penalty (1.5 without thinking, 0 to 1.5 with it) next to temperature, top-k and top-p. `ath_sampler` has temperature, top-k, top-p and min-p only; a penalty needs the counts of the tokens generated so far. Options: add it to the sampler now (CPU), or with GPU sampling (step 9) or the server (step 13), where request parameters ask for it. Recommended: with the server, step 13. Nothing in step 5 depends on it; `athanor chat` uses the card's other settings.
 
 - (none yet) (superseded 2026-11-23 by the entries below)
-- **CUDA toolkit too old for `sm_120` (blocks step 6).** The development machine has nvcc 12.4 (driver 580, CUDA 13.0 runtime). Blackwell consumer GPUs (`sm_120`, RTX 5080) need CUDA 12.8 or newer. Options: install CUDA 12.8+/13.x before step 6 (recommended), or build for `compute_90` PTX and rely on JIT (slower start, no FP4/FP8 `sm_120` paths). Nothing in steps 1–5 depends on it.
+- **CUDA toolkit too old for `sm_120` (blocks step 6).** The development machine has nvcc 12.4 (driver 580, CUDA 13.0 runtime). Blackwell consumer GPUs (`sm_120`, RTX 5080) need CUDA 12.8 or newer. Options: install CUDA 12.8+/13.x before step 6 (recommended), or build for `compute_90` PTX and rely on JIT (slower start, no FP4/FP8 `sm_120` paths). Nothing in steps 1–5 depends on it. **Resolved 2026-11-24:** CUDA 13.5 installed at user level from NVIDIA's redist archives (no root needed; the system nvcc 12.4 stays), selected with `CUDA_HOME`. The 13.5 runtime runs on driver 580 (CUDA 13.0) through CUDA's minor-version compatibility: checked with `sm_120` code and a cuBLASLt bf16 matmul, then by `test_backend`. The driver stays 580 for now; a newer one is worth fixing before the benchmarks of step 9, together with GPU performance-counter access for Nsight Compute (needs root).
 - **Hardware assumptions in `docs/PLAN.md` §2 can be confirmed:** CPU is an AMD Ryzen 7 9800X3D (Zen 5; `avx512f`, `avx512bw`, `avx512vl` and `avx512_bf16` present); RAM shows 59 GiB usable, consistent with 64 GB installed.
 - **Step 2, weight parameterizations.** The checkpoint suggests zero-centered RMSNorm weights for the decoder-layer norms and `q_norm`/`k_norm`, and plain weights for the Gated DeltaNet output norm (`docs/contract/qwen35-0.8b.md`, observations). To be confirmed against the pinned reference implementation, as the **verify** rule requires. **Resolved 2026-11-24:** confirmed against transformers 5.24.0 (`Qwen3_5RMSNorm` uses `1 + w`, `Qwen3_5RMSNormGated` a plain `w`); see the contract, sections RMSNorm and Gated RMSNorm.
 - **Golden data and f32 checkpoint tensors (step 3).** `A_log` and `linear_attn.norm.weight` are f32 in the checkpoint, and the reference has no `_keep_in_fp32_modules`. If the golden dump loads the model in bf16, the reference rounds them to bf16 and its outputs differ from athanor's (which uses the stored f32 values). Options: load the reference in fp32 for op-level goldens, or check what transformers 5.24.0 does with mixed-dtype checkpoints and record it. To settle before writing `tests/golden/dump.py`. **Resolved 2026-11-24:** transformers 5.24.0 rounds both tensors to bf16 on load (`dtype="auto"` and `dtype=torch.bfloat16` alike). `dump.py` loads in bf16 and puts the stored f32 values back, which the forward code handles unchanged, so the reference and athanor use the same weights; on the golden prompt this brings the bf16 reference closer to an fp32 run of the model (max KL 1.4e-3 instead of 2.9e-3). Recorded in the contract (Checkpoint dtypes) and `tests/golden/README.md`.
@@ -294,3 +338,16 @@ Superseded preview (written in step 1): **Step 2: contract and family loading.**
   - `ath_buf`, `ath_rng` and the JSON writer are in `src/core/`; the JSON writer reproduces Python's `json.dumps(ensure_ascii=False)`, because chat templates serialize tool definitions and arguments with it.
   - `athanor chat` never runs a tool (AGENTS.md, invariant 10): it prints the call, and `/tool <text>` lets the user answer as a harness would.
   - The sampling op has a CPU reference and tests; its GPU kernel comes with GPU sampling (step 9). The reference implementation has no sampling records to compare against, so the tests are hand-computed cases and a distribution check with a fixed seed.
+- 2026-11-24: `step5-tokenizer-chat` merged into `main` (fast-forward) at the maintainer's request and tagged `v0.1-cpu-chat` (the first working chat, CPU only). Two ideas for reusing the state across chat turns written down, not scheduled, at the maintainer's request: `docs/proposals/chat-state-at-last-query.md` and `docs/proposals/chat-shadow-sequence.md`. Step 6 started on `step6-gpu-backend`.
+- 2026-11-24: step 6 implemented on branch `step6-gpu-backend`: `src/backend/{backend.h,gpu.cu,gpu_none.c,compat.h,devarena.c}`, `ATH_ERR_DEVICE` and C linkage in `src/core/{base,arena}.h`, `make cuda` and `tools/dev/check_nvcc.sh`, `athanor devices` (`tools/devices.c`), `tests/test_backend.c`. All acceptance criteria met (table above).
+- 2026-11-24: decisions taken within step 6 (`PLAN.md` unchanged):
+  - The CUDA build is chosen by naming the goal: `make cuda` (and `make cuda test`) sets `GPU=cuda` for the whole run and builds in `build/cuda`, so the CPU and CUDA builds live side by side. `CUDA_HOME` selects the toolkit (default `/usr/local/cuda`); `tools/dev/check_nvcc.sh` refuses one too old for `CUDA_ARCH`.
+  - The CUDA runtime is linked statically and device code is machine code for one architecture (`sm_120`), with no PTX: the binary needs only the driver, and nothing is compiled at run time.
+  - The interface is C with opaque handles; `gpu.cu` is written in the C subset of CUDA C++ with C linkage, compiled with `-fno-exceptions -fno-rtti` and every warning an error. Core headers that GPU code includes carry `extern "C"` guards.
+  - A build without a GPU links `gpu_none.c` (no devices, `ATH_ERR_UNSUPPORTED`) instead of `#ifdef`s in the callers.
+  - A new status, `ATH_ERR_DEVICE`, for errors of the GPU runtime; the runtime's sticky last error is cleared after each failure.
+  - Every call selects the device its handle names, because the runtime keeps one current device per host thread.
+  - Device memory comes in blocks through `ath_dev_arena` (records in a host arena, since the host cannot write device memory).
+  - ASan and the NVIDIA driver need `ASAN_OPTIONS=protect_shadow_gap=0`; the Makefile sets it for the CUDA debug tests.
+  - Not in the plan's file list: `athanor devices`, the visible part of the step and a check of the timing path. Deferred to their first users: graph capture (step 9), the cuBLASLt handle (step 7), `src/backend/cpu.c` (CPU feature detection).
+  - The HIP half of `compat.h` is written but not compiled until step 11.

@@ -95,6 +95,8 @@ A minimal C runner: `ATH_TEST(name) { ... }`, `ATH_EXPECT_*` assertions, a summa
 ```
 make test                          # all suites, smoke runs of athanor inspect (with and without --roles), and make check-alloc; about 17 s
 make DEBUG=1 test                  # same suites with ASan and UBSan, in build/debug; about 4 minutes
+make cuda test                     # every suite of the CUDA build (build/cuda); test_backend runs on the GPU
+make cuda DEBUG=1 test             # the same with ASan and UBSan (build/cuda-debug)
                                    # (test_golden 2.6 minutes there, 5 s in release; test_forward 34 s on 4 positions, 11 s on all;
                                    # test_text 3 s in release, its generation 4 steps instead of 32 there)
 ./build/test_core json             # only tests whose name contains "json"
@@ -110,4 +112,5 @@ Synthetic files (safetensors shards, indexes, broken headers) are written by the
 | `test_ops.c` | every `_ref` function of `src/ops/` on hand-computed cases (bf16 rounding, norms, RoPE pairing and relative positions, attention averaging and head grouping, conv taps, the delta rule step by step, gates around the softplus threshold) and on exact properties: streaming equals all at once for conv and Gated DeltaNet, decode equals the last prefill row for attention, causality, argument checks; `ath_matmul_fast` bit for bit against `ath_matmul_ref` (7 shapes × 8 dtype combinations, without and with threads) |
 | `test_golden.c` | every op the reference computes on Qwen3.5-0.8B (24 layers, prefill and decode, 906 records), replayed through the `_ref` functions on the real weights, native and exact (above); every matmul record also through `ath_matmul_fast` on 8 threads, required bit-identical to `ath_matmul_ref` |
 | `test_forward.c` | the forward pass through the contract: state specs and sizes, argument checks, hooks, all at once = in pieces = token by token on tiny random checkpoints; the real checkpoint against the forward records (above) |
+| `test_backend.c` | the GPU runtime (`src/backend/backend.h`). In the CPU build: the stub refuses everything cleanly, the GPU tests are skipped. In the CUDA build, on device 0: properties, copies in every direction at odd sizes and offsets from pinned and ordinary memory, memset, three streams ordered only by events (8 rounds overwriting each other's buffers), event timing with a sanity range, an allocation larger than the device, the device arena; every byte checked |
 | `test_text.c` | text, through the contract only: UTF-8, character classes, NFC, the Python-style JSON writer, pre-tokenization pieces, the output parser (17 fixtures, each also split at every byte and fed byte by byte), template errors, sampling (hand-computed cases and a distribution with a fixed seed); against the text golden data (below): the corpus, the templates, the greedy chat generation |

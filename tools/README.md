@@ -8,12 +8,14 @@ One binary, `athanor`, with subcommands. `athanor.c` holds only the dispatch tab
 | `commands.h` | subcommand entry points (`ath_cmd_<name>`) and exit codes: 0 success, 1 failure, 2 usage |
 | `inspect.c` | `athanor inspect` |
 | `chat.c` | `athanor chat` (step 5) |
+| `devices.c` | `athanor devices` (step 6) |
 | `dev/` | development-only helpers, never built into `athanor` |
 
 | Subcommand | Purpose | Step |
 | --- | --- | --- |
 | `inspect` | tensors, dtypes, shapes, roles, placement map, expert statistics | 1, 2 |
 | `chat` | interactive chat and one-shot generation | 5 (CPU), 8 (GPU) |
+| `devices` | the GPUs this build can use; `--bench` times copies | 6 |
 | `bench` | benchmarks per `docs/BENCHMARKS.md`, JSON output | 9 |
 | `serve` | OpenAI- and Anthropic-compatible API | 13 |
 | `quant` | `plan`, `apply`, `eval`, `convert` (GGUF) | phase 2 |
@@ -75,11 +77,20 @@ $ athanor chat models/Qwen3.5-0.8B -p "What is the capital of Italy? Answer in o
 The capital of Italy is Rome.
 ```
 
+## `athanor devices` (step 6)
+
+```
+athanor devices [--bench]
+```
+
+Lists the GPUs the build can use, through the backend only (`src/backend/backend.h`): name, compute capability, multiprocessors, warp size, memory (total and free), L2, the largest shared memory a block can use, driver and runtime versions. A build without a GPU backend (`make`) lists none and says so. With `--bench` it also times 256 MiB copies with GPU events, best of 5: host to device and back from pinned and from ordinary (pageable) memory, and device to device. The numbers describe the machine for the record; they are not a benchmark report (`docs/BENCHMARKS.md`).
+
 ## `tools/dev/`
 
 Development-only helpers (Python allowed): Unicode table generation, golden data utilities.
 
 | File | Content |
 | --- | --- |
+| `check_nvcc.sh` | `make cuda`'s check that the nvcc in `CUDA_HOME` exists and is recent enough for `CUDA_ARCH` (12.8 for `sm_120`) |
 | `gen_unicode.py` | generates `src/text/unicode_tables.h` (character classes and NFC data) from Python's `unicodedata`, with the normalization limited to what the reference tokenizer applies; run with the golden environment (`src/text/README.md`) |
 | `check_alloc.sh`, `alloc_trace.c` | run a command under an `LD_PRELOAD` shim that reports every `malloc`/`calloc`/`realloc`, and fail if any caller is not `ath_arena_alloc` or if the command itself fails. `make check-alloc` runs it on `athanor inspect` with and without `--roles`. Needs a C compiler and `addr2line` |

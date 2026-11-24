@@ -227,11 +227,11 @@ Common code grows only by addition. Pipelines never change to accommodate a fami
 
 ```
 athanor/
-├── Makefile                     targets: cpu (default), cuda, hip, test, clean; FAMILIES=qwen35
+├── Makefile                     targets: cpu (default), cuda (+ test), hip, test, golden, clean; FAMILIES=qwen35
 ├── include/athanor.h            public C API
 ├── src/
 │   ├── core/      base.c arena.c buf.c tensor.c file.c json.c safetensors.c threads.c rng.c (each with its .h)
-│   ├── backend/   backend.h compat.h cpu.c gpu.cu
+│   ├── backend/   backend.h compat.h gpu.cu gpu_none.c devarena.c (step 6), cpu.c (later)
 │   ├── ops/       ops.h, check.h (private); per op a .c reference and a .cu kernel:
 │   │              embed matmul norm rope act attn conv gdn (step 3), sample (step 5), moe quant
 │   ├── text/      bpe.c unicode.c, unicode_tables.h (generated, committed)
@@ -243,9 +243,9 @@ athanor/
 │   ├── ablit/     capture.c direction.c edit.c search.c eval.c
 │   ├── train/     loop.c optim.c lora.c hotcold.c data.c planner.c ckpt.c
 │   └── net/       http.c api.c
-├── tools/         athanor.c (dispatch), one file per subcommand (inspect.c, chat.c, ...), dev/ (development helpers)
+├── tools/         athanor.c (dispatch), one file per subcommand (inspect.c, chat.c, devices.c, ...), dev/ (development helpers)
 ├── tests/         test.h (runner) util.h tiny.h test_core.c test_model.c test_ops.c test_golden.c test_forward.c
-│                  test_text.c ...; golden/ (dump.py, text.py, requirements.txt; data/ generated, not committed)
+│                  test_text.c test_backend.c ...; golden/ (dump.py, text.py, requirements.txt; data/ not committed)
 └── docs/          ARCHITECTURE.md PLAN.md STATUS.md status_extended.md MODELS.md BENCHMARKS.md
                    CHANGE-*.md (specification changes, applied as recorded in STATUS.md)
                    contract/ program/ proposals/ results/
