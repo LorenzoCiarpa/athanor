@@ -15,6 +15,7 @@ static const command commands[] = {
     {"inspect", "describe the config and every tensor of a checkpoint", ath_cmd_inspect,
      ath_cmd_inspect_usage},
     {"chat", "chat with a model on the CPU", ath_cmd_chat, ath_cmd_chat_usage},
+    {"devices", "list the GPUs this build can use", ath_cmd_devices, ath_cmd_devices_usage},
 };
 
 static void usage(FILE *out)
