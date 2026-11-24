@@ -570,7 +570,7 @@ What was implemented:
 - What the measurements showed along the way, recorded in `tests/README.md` and the contract: per prompt, athanor beats the reference on prose (1.7e-4 against 5.3e-4) but not on chat (6.0e-4 against 4.4e-4), because the chat prompt's first position is ill-conditioned (a near-cancellation in layer 15 that turns one bf16 rounding into a 10% error; the reference's own KL there goes from 2.7e-4 to 5.5e-3 when two small tensors are rounded as transformers does by default). The gate pools all positions, as the resolution of the open question wrote it; the per-prompt test that was implemented first failed on chat, and the reference with its default sdpa attention would fail it too.
 - A tiny-model check of bf16 against f32 activations was dropped: with uniform random weights the network is ill-conditioned (bf16 and f32 logits differ by 2% to 30% depending on the seed), so no fixed bound would mean anything; the real checkpoint does that check.
 
-Commit `ed38a7c`.
+Commits `ed38a7c`, `370a452` (the pooled KL line names the positions it covers).
 
 #### 4.6 Documentation and closing step 4
 
@@ -585,7 +585,7 @@ Commit `ed38a7c`.
 | `docs/program/PROGRAM.md` | Changed | Rows 3, 4 and 9: the forward pass, the composed Gated DeltaNet layer, the CPU state of one sequence |
 | `docs/STATUS.md` | Changed | Step 4 tasks, criteria and results; step 5 preview; decisions in the log |
 
-Commit `docs: close step 4`.
+Commit `d1e93fe`.
 
 ---
 
