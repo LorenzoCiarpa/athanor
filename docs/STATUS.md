@@ -4,7 +4,7 @@ Updated by whoever completes a task (human or agent). Never delete lines: mark t
 
 ## Current step
 
-**Step 2: contract and family loading** (see `docs/PLAN.md` §4). Started 2026-11-24 on branch `step2-contract`.
+**Step 2: contract and family loading** (see `docs/PLAN.md` §4). Started 2026-11-24 on branch `step2-contract`. **Done 2026-11-24** (pushed, to be merged into `main`); step 3 is next.
 
 Goal: give every tensor of the checkpoint a meaning that pipelines can use without knowing the family: a role, a layer, an expert index and flags, plus the layer schedule. No model math yet.
 
@@ -26,6 +26,19 @@ Goal: give every tensor of the checkpoint a meaning that pipelines can use witho
 4. `make check-alloc` also covers `inspect --roles`: no heap allocation outside arenas.
 5. No model names outside `src/models/` (the Makefile `FAMILIES` list excepted).
 6. Contract files, module READMEs, `docs/ARCHITECTURE.md` and this file updated.
+
+Result (2026-11-24, Qwen3.5-0.8B revision `2fc0636`, transformers 5.24.0 as reference, gcc 15.2, glibc 2.43):
+
+| # | Criterion | Result |
+| --- | --- | --- |
+| 1 | `inspect --roles` on Qwen3.5-0.8B | 320 tensors bound to 320 params (1,504,791,232 bytes, equal to the language-model total recorded in step 1), 168 ignored (153 `model.visual.`, 15 `mtp.`), 0 unbound; schedule 18 gated_deltanet + 6 attention at layers 3, 7, 11, 15, 19, 23, matching `layer_types`; 49 residual writers (embedding + 24 mixer outputs + 24 MLP downs); exit 0 |
+| 2 | failures name the tensor | `test_model`: missing, unexpected, misshaped, integer dtype, tied with `lm_head`, untied without it, plus 22 rejected configs; each message names the tensor or key |
+| 3 | `make test`, zero warnings, also `DEBUG=1` | 22 + 11 tests pass in release and with ASan/UBSan; no warnings |
+| 4 | `check-alloc` covers `--roles` | one allocation (the arena's first block) for `inspect` and for `inspect --roles`; the script now also fails if the traced command fails |
+| 5 | no model names outside `src/models/` | `grep -rni qwen src tools` outside `src/models/` finds nothing; the registry is generated from the Makefile `FAMILIES` list |
+| 6 | documentation | contracts, `docs/MODELS.md` status line, `docs/ARCHITECTURE.md` (contract as of step 2, coverage rule, tree), READMEs of `src/model`, `src/models/qwen35`, `tests`, `tools`, `AGENTS.md` family checklist, `docs/program/PROGRAM.md` row 2 |
+
+Extra check, MoE: a sparse copy of Qwen3.5-35B-A3B (the 14 real shard headers, zero data; 448 KB on disk) loads with `inspect --roles` in release and ASan builds: 1,811 tensors, 693 bound to 21,093 params (two fused expert tensors per layer give 256 views each), 1,118 ignored (333 vision, 785 MTP), 0 unbound; 30 gated_deltanet + 10 attention, 40 moe.
 
 ## Completed steps
 
@@ -92,3 +105,5 @@ Superseded preview (written in step 1): **Step 2: contract and family loading.**
 - 2026-11-23: decisions taken within step 1 (no `PLAN.md` impact): logging threshold from the `ATH_LOG` environment variable, read on every call (no global state); memory-mapped weights are tier `ATH_TIER_RAM`; the safetensors reader rejects gaps and overlaps in the data section like the reference implementation; sorting uses an in-file heapsort because glibc `qsort` may call `malloc`; `inspect` reads config keys at the top level or under `text_config` (Hugging Face convention for multimodal checkpoints) and leaves model-specific interpretation to step 2.
 - 2026-11-23: fixed `.gitignore`: `models/` also matched `src/models/`; now `/models/`.
 - 2026-11-24: `step1-core-inspect` merged into `main` (fast-forward); step 2 started on `step2-contract`. Reference implementation pinned (transformers 5.24.0); op contract of Qwen3.5-0.8B written; MoE naming, shapes and router contract recorded from the Qwen3.5-35B-A3B headers (no weights downloaded).
+- 2026-11-24: step 2 implemented on branch `step2-contract`: `src/model/{model.h,registry.c}`, `src/models/qwen35/{qwen35.h,family.c,config.c,weights.c}`, `athanor inspect --roles`, `tests/test_model.c` and `tests/util.h`. All acceptance criteria met (table above).
+- 2026-11-24: decisions taken within step 2 (no `PLAN.md` impact): state specs, hooks, `forward`, `pretokenize`, `chat` and `backward` join `model.h` with their first user (step 4 onward), as AGENTS.md rule 9 asks; `load` takes the open `ath_safetensors` instead of an `ath_weights` abstraction until the `.ath` container gives it a second user (phase 2); the family list is generated from the Makefile `FAMILIES` into `build/gen/families.h`, so `registry.c` names no family (AGENTS.md checklist updated); the registry, not the family, enforces coverage (every tensor bound or in a declared ignored group, never both; every param a contiguous view inside its tensor); tied embeddings give no `lm_head` param and make the embedding `sensitive`; fused MoE expert tensors become one view per expert sharing the checkpoint name; the vision encoder and the MTP head are ignored groups, the same prefixes the reference text model drops; `ath_layer` labels are for display only.

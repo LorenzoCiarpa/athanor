@@ -1,8 +1,8 @@
 /* registry.c: compiled-in families, model loading and the coverage check.
  * See model.h.
  *
- * The family list comes from the Makefile: FAMILIES=qwen35 writes the line
- * ATH_FAMILY(qwen35) into the generated header families.h, and each family
+ * The family list comes from the Makefile: FAMILIES=<name> writes the line
+ * ATH_FAMILY(<name>) into the generated header families.h, and each family
  * defines `const ath_family ath_family_<name>`. This file therefore names no
  * family (AGENTS.md, invariant 2) and a build with a different FAMILIES list
  * needs no edit here.
