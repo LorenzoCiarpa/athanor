@@ -32,6 +32,7 @@
 #ifndef ATH_OPS_H
 #define ATH_OPS_H
 
+#include "core/arena.h"
 #include "core/tensor.h"
 #include "core/threads.h"
 
@@ -153,5 +154,29 @@ ath_status ath_gdn_gates_ref(const ath_tensor *a, const ath_tensor *b, const ath
 ath_status ath_gdn_ref(const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
                        const ath_tensor *g, const ath_tensor *beta, float q_scale,
                        ath_tensor *state, ath_tensor *out);
+
+/* ---- sample.c (step 5) ----------------------------------------------------- */
+
+/* How the next token is chosen from the logits. The filters apply in the
+ * order of transformers' logits warpers: temperature, top-k, top-p, min-p. */
+typedef struct {
+    float   temperature;   /* 0: greedy, the largest logit (the lowest id of equals)   */
+    int32_t top_k;         /* keep the k most likely tokens; 0: all                   */
+    float   top_p;         /* keep the most likely tokens until their probability
+                            * reaches top_p (at least one); 1: all                    */
+    float   min_p;         /* drop tokens less likely than min_p times the most
+                            * likely one; 0: none                                     */
+} ath_sampler;
+
+/* One token id from logits [vocab] or [1, vocab] (f32 or bf16). u is a
+ * uniform number in [0, 1) from the caller's generator (core/rng.h): the
+ * token is where u falls in the cumulative distribution of the kept tokens,
+ * ordered from the most likely (the lowest id first among equals), so the
+ * op itself is deterministic. Greedy ignores u. Working memory (two arrays
+ * of vocab entries) comes from scratch and is released before returning.
+ * ATH_ERR_INVALID_ARG for temperature < 0, top_k < 0, top_p outside (0, 1]
+ * or min_p outside [0, 1]. */
+ath_status ath_sample_ref(const ath_tensor *logits, const ath_sampler *p, double u, ath_arena *scratch,
+                          int32_t *out);
 
 #endif /* ATH_OPS_H */
