@@ -50,7 +50,7 @@ LIB_OBJ   := $(LIB_SRC:%.c=$(BUILD)/obj/%.o)
 TOOL_SRC := $(wildcard tools/*.c)
 TOOL_OBJ := $(TOOL_SRC:%.c=$(BUILD)/obj/%.o)
 TESTS    := $(BUILD)/test_core $(BUILD)/test_model $(BUILD)/test_ops $(BUILD)/test_golden \
-            $(BUILD)/test_forward
+            $(BUILD)/test_forward $(BUILD)/test_text
 
 .PHONY: all cpu cuda hip test check-alloc golden clean FORCE
 .SECONDARY:
@@ -104,6 +104,7 @@ check-alloc: $(BUILD)/athanor
 # (development only; needs the environment in tests/golden/requirements.txt).
 golden:
 	$(GOLDEN_PYTHON) tests/golden/dump.py "$(ATH_MODEL_DIR)" --out "$(ATH_GOLDEN_DIR)"
+	$(GOLDEN_PYTHON) tests/golden/text.py "$(ATH_MODEL_DIR)" --out "$(ATH_GOLDEN_DIR)"
 
 cuda:
 	@echo "make cuda: the CUDA backend arrives in step 6 (docs/PLAN.md section 4)" >&2; exit 1
