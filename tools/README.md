@@ -31,13 +31,23 @@ athanor ablit   search models/Qwen3.5-2B --trials 200
 athanor train   run models/Qwen3.5-9B --regime hotcold --data data/sft.jsonl
 ```
 
-## `athanor inspect` (step 1)
+## `athanor inspect` (steps 1 and 2)
 
 ```
-athanor inspect <model_dir> [--json] [--filter <substring>]
+athanor inspect <model_dir> [--roles] [--json] [--filter <substring>]
 ```
 
-Reads `config.json` and the safetensors headers (never the tensor data) and prints: a config summary (architectures, model type, layers, hidden size, vocabulary; keys are read at the top level or under `text_config`), the shard files, one row per tensor (name, dtype, shape, bytes) in natural name order, totals per dtype, and the check that the tensors cover the shards' data sections exactly. `--filter` restricts the table and the totals to names containing the substring; `--json` prints the same information as one JSON object (tensors also carry `shard` and absolute file `offset`). The exit code is 1 if the checkpoint cannot be opened or fails validation. `--roles` arrives in step 2.
+Reads `config.json` and the safetensors headers (never the tensor data) and prints: a config summary (architectures, model type, layers, hidden size, vocabulary; keys are read at the top level or under `text_config`), the shard files, one row per tensor (name, dtype, shape, bytes) in natural name order, totals per dtype, and the check that the tensors cover the shards' data sections exactly. `--filter` restricts the table and the totals to names containing the substring; `--json` prints the same information as one JSON object (tensors also carry `shard` and absolute file `offset`). The exit code is 1 if the checkpoint cannot be opened or fails validation.
+
+With `--roles` the checkpoint is loaded through the model contract (`src/model/model.h`) by the family that recognizes its `config.json`, and the output is what pipelines see: family and dimensions, the layer schedule with per-layer totals, one row per param (name, role, layer, expert, flags, dtype, shape, bytes; a fused MoE tensor gives one row per expert), totals per role, the ignored groups with their reason, and the coverage check (`N checkpoint tensors: B bound to P params, I ignored, 0 unbound`). Loading fails, with the offending tensor named on stderr, if any tensor is missing, unexpected, or has a dtype or shape that does not follow from the config. `--filter` restricts the param rows and totals; `--json` prints one JSON object (`layers`, `params` with `flags` as a list, `roles`, `ignored`, counts).
+
+```
+$ athanor inspect models/Qwen3.5-0.8B --roles
+family   qwen35: 24 layers, hidden size 1024, vocab 248320, tied embeddings
+schedule 18 gated_deltanet + 6 attention; 24 mlp
+...
+check    488 checkpoint tensors (1.63 GiB): 320 bound to 320 params, 168 ignored, 0 unbound
+```
 
 ## `tools/dev/`
 
@@ -45,4 +55,4 @@ Development-only helpers (Python allowed): Unicode table generation, golden data
 
 | File | Content |
 | --- | --- |
-| `check_alloc.sh`, `alloc_trace.c` | run a command under an `LD_PRELOAD` shim that reports every `malloc`/`calloc`/`realloc`, and fail if any caller is not `ath_arena_alloc`. `make check-alloc` runs it on `athanor inspect`. Needs a C compiler and `addr2line` |
+| `check_alloc.sh`, `alloc_trace.c` | run a command under an `LD_PRELOAD` shim that reports every `malloc`/`calloc`/`realloc`, and fail if any caller is not `ath_arena_alloc` or if the command itself fails. `make check-alloc` runs it on `athanor inspect` with and without `--roles`. Needs a C compiler and `addr2line` |

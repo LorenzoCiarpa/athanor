@@ -78,15 +78,20 @@ test: $(TESTS) $(BUILD)/athanor
 	@set -e; if [ -d "$(ATH_MODEL_DIR)" ]; then \
 		echo "== athanor inspect $(ATH_MODEL_DIR)"; \
 		./$(BUILD)/athanor inspect "$(ATH_MODEL_DIR)" > /dev/null; echo "ok"; \
+		echo "== athanor inspect $(ATH_MODEL_DIR) --roles"; \
+		./$(BUILD)/athanor inspect "$(ATH_MODEL_DIR)" --roles > /dev/null; echo "ok"; \
 	else echo "== athanor inspect: skipped, no $(ATH_MODEL_DIR)"; fi
 ifneq ($(DEBUG),1)
 	@if [ -d "$(ATH_MODEL_DIR)" ]; then $(MAKE) --no-print-directory check-alloc; fi
 endif
 
-# Fails if `athanor inspect` allocates heap memory outside the arenas.
+# Fails if `athanor inspect` (with and without --roles) allocates heap memory
+# outside the arenas.
 check-alloc: $(BUILD)/athanor
 	@echo "== heap allocations of athanor inspect"
 	@sh tools/dev/check_alloc.sh $(BUILD)/athanor inspect "$(ATH_MODEL_DIR)"
+	@echo "== heap allocations of athanor inspect --roles"
+	@sh tools/dev/check_alloc.sh $(BUILD)/athanor inspect "$(ATH_MODEL_DIR)" --roles
 
 cuda:
 	@echo "make cuda: the CUDA backend arrives in step 6 (docs/PLAN.md section 4)" >&2; exit 1

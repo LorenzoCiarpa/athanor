@@ -14,7 +14,17 @@ here=$(dirname "$0")
 shim=$(dirname "$bin")/alloc_trace.so
 cc -O1 -shared -fPIC -o "$shim" "$here/alloc_trace.c" -ldl
 
-trace=$(LD_PRELOAD="$shim" "$@" 2>&1 >/dev/null | grep '^\[alloc\]' || true)
+# The command must also succeed: a run that stops early (bad option, unreadable
+# checkpoint) would allocate little and pass for the wrong reason.
+log=$(dirname "$bin")/alloc_trace.log
+rc=0
+LD_PRELOAD="$shim" "$@" >/dev/null 2>"$log" || rc=$?
+if [ "$rc" -ne 0 ]; then
+    grep -v '^\[alloc\]' "$log" >&2 || true
+    echo "check_alloc: FAIL, the command exited with status $rc" >&2
+    exit 1
+fi
+trace=$(grep '^\[alloc\]' "$log" || true)
 total=0
 bad=0
 # shellcheck disable=SC2034

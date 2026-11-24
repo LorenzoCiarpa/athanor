@@ -1,37 +1,48 @@
-/* inspect.c: `athanor inspect <model_dir> [--json] [--filter <substring>]`.
+/* inspect.c: `athanor inspect <model_dir> [--roles] [--json] [--filter <substring>]`.
  *
- * Prints a summary of config.json, the shard files, one row per tensor
- * (name, dtype, shape, bytes) and totals per dtype, then checks that the
- * tensors account for every byte of the shards' data sections. Only headers
- * are read: tensor data stays untouched in the mapping.
+ * Without --roles: a summary of config.json, the shard files, one row per
+ * tensor (name, dtype, shape, bytes) and totals per dtype, then the check
+ * that the tensors account for every byte of the shards' data sections. This
+ * works on any safetensors checkpoint and uses generic Hugging Face keys:
+ * multimodal checkpoints keep the language model's keys under "text_config",
+ * so each key is looked up at the top level first and then there.
  *
- * The config summary uses generic Hugging Face keys. Multimodal checkpoints
- * keep the language model's keys under "text_config", so each key is looked
- * up at the top level first and then there. Model-specific interpretation of
- * the config belongs to the family code (step 2, --roles).
+ * With --roles: the checkpoint is loaded through the model contract
+ * (src/model/model.h) by the family that recognizes it, and the output is
+ * what pipelines see: dimensions, the layer schedule, one row per param with
+ * role, layer, expert and flags, totals per role, the ignored groups and the
+ * coverage check. Nothing here knows a family: it prints the contract.
+ *
+ * Only headers are read: tensor data stays untouched in the mapping.
  */
 #include "commands.h"
 
 #include "core/file.h"
 #include "core/json.h"
 #include "core/safetensors.h"
+#include "model/model.h"
 
 #include <string.h>
 
 void ath_cmd_inspect_usage(FILE *out)
 {
     fprintf(out,
-            "usage: athanor inspect <model_dir> [--json] [--filter <substring>]\n\n"
+            "usage: athanor inspect <model_dir> [--roles] [--json] [--filter <substring>]\n\n"
             "Describe a checkpoint without loading it: config summary, shard files,\n"
             "every tensor with dtype, shape and size, totals per dtype, and a check\n"
             "that the tensors cover the data sections of the shard files exactly.\n\n"
+            "  --roles              load the checkpoint through its model family and show\n"
+            "                       what pipelines see: layer schedule, every param with\n"
+            "                       role, layer, expert and flags, totals per role, the\n"
+            "                       tensors left unbound on purpose\n"
             "  --json               machine-readable output on stdout\n"
-            "  --filter <substring> list and total only tensors whose name contains it\n");
+            "  --filter <substring> list and total only tensors (params) whose name contains it\n");
 }
 
 typedef struct {
     const char *dir;
     bool        json;
+    bool        roles;
     const char *filter;
 } options;
 
@@ -342,6 +353,277 @@ static void print_json(const options *opt, const ath_json *cfg, const ath_safete
     fprintf(o, "  \"consistent\": %s\n}\n", st->tensor_bytes == st->data_bytes ? "true" : "false");
 }
 
+/* ---- --roles: the model contract ------------------------------------------------ */
+
+static void fmt_flags(char *out, size_t cap, uint32_t flags)
+{
+    static const struct { uint32_t bit; const char *name; } names[] = {
+        {ATH_P_WRITES_RESIDUAL, "residual"},
+        {ATH_P_SENSITIVE, "sensitive"},
+        {ATH_P_SHARED_EXPERT, "shared"},
+    };
+    size_t n = 0;
+    out[0] = '\0';
+    for (size_t i = 0; i < ATH_ARRAY_LEN(names) && n < cap; i++)
+        if (flags & names[i].bit)
+            n += (size_t)snprintf(out + n, cap - n, "%s%s", n ? "," : "", names[i].name);
+    if (!n)
+        snprintf(out, cap, "-");
+}
+
+static void fmt_index(char *out, size_t cap, int32_t v)
+{
+    if (v < 0)
+        snprintf(out, cap, "-");
+    else
+        snprintf(out, cap, "%d", v);
+}
+
+typedef struct {
+    uint32_t params;
+    uint64_t bytes;
+} param_total;
+
+/* Totals per layer (index 0 holds the global params, layer -1) and per role,
+ * over the params selected by --filter. */
+typedef struct {
+    param_total *layer;   /* [n_layers + 1] */
+    param_total  role[ATH_ROLE_COUNT];
+    param_total  all;
+    uint32_t     ignored_tensors;
+} roles_totals;
+
+static ath_status roles_totals_compute(ath_arena *a, const options *opt, const ath_model *m,
+                                       roles_totals *t)
+{
+    memset(t, 0, sizeof *t);
+    t->layer = ath_arena_zalloc(a, ((size_t)m->n_layers + 1) * sizeof *t->layer, _Alignof(param_total));
+    if (!t->layer)
+        return ATH_ERR_NOMEM;
+    for (uint32_t i = 0; i < m->n_params; i++) {
+        const ath_param *p = &m->params[i];
+        if (!selected(opt, p->name))
+            continue;
+        uint64_t b = ath_tensor_nbytes(&p->t);
+        param_total *bins[] = {&t->layer[p->layer + 1], &t->role[p->role], &t->all};
+        for (size_t k = 0; k < ATH_ARRAY_LEN(bins); k++) {
+            bins[k]->params++;
+            bins[k]->bytes += b;
+        }
+    }
+    for (uint32_t g = 0; g < m->n_ignored; g++)
+        t->ignored_tensors += m->ignored[g].n_tensors;
+    return ATH_OK;
+}
+
+/* "18 gated_deltanet + 6 attention": counts of a per-layer label, in order
+ * of first appearance. */
+static void print_label_counts(const ath_model *m, bool mixer)
+{
+    const char *seen[16];
+    size_t      n_seen = 0;
+    for (int32_t i = 0; i < m->n_layers; i++) {
+        const char *l = mixer ? m->layers[i].mixer : m->layers[i].ffn;
+        bool known = false;
+        for (size_t k = 0; k < n_seen && !known; k++)
+            known = strcmp(seen[k], l) == 0;
+        if (known || n_seen == ATH_ARRAY_LEN(seen))
+            continue;
+        seen[n_seen++] = l;
+        int32_t count = 0;
+        for (int32_t j = i; j < m->n_layers; j++)
+            count += strcmp(mixer ? m->layers[j].mixer : m->layers[j].ffn, l) == 0;
+        printf("%s%d %s", n_seen > 1 ? " + " : "", count, l);
+    }
+}
+
+static void print_roles_text(const options *opt, const ath_model *m, const roles_totals *t)
+{
+    char b1[64], b2[64], b3[64], shape[256], flags[64];
+
+    printf("model    %s\n", opt->dir);
+    printf("family   %s: %d layers, hidden size %d, vocab %d, %s embeddings\n", m->family->name,
+           m->n_layers, m->hidden_size, m->vocab_size, m->tie_embeddings ? "tied" : "untied");
+    if (m->n_experts)
+        printf("experts  %d routed per MoE layer, %d active per token\n", m->n_experts, m->n_experts_active);
+    printf("schedule ");
+    print_label_counts(m, true);
+    printf("; ");
+    print_label_counts(m, false);
+    printf("\n");
+
+    printf("\n%5s  %-16s  %-4s  %7s  %7s  %14s\n", "layer", "mixer", "ffn", "experts", "params", "bytes");
+    for (int32_t i = 0; i < m->n_layers; i++) {
+        const ath_layer *l = &m->layers[i];
+        fmt_index(b2, sizeof b2, l->n_experts ? l->n_experts : -1);
+        fmt_bytes(b1, sizeof b1, t->layer[i + 1].bytes);
+        printf("%5d  %-16s  %-4s  %7s  %7u  %14llu  %s\n", i, l->mixer, l->ffn, b2, t->layer[i + 1].params,
+               (unsigned long long)t->layer[i + 1].bytes, b1);
+    }
+    fmt_bytes(b1, sizeof b1, t->layer[0].bytes);
+    printf("%5s  %-16s  %-4s  %7s  %7u  %14llu  %s\n", "-", "(global)", "", "", t->layer[0].params,
+           (unsigned long long)t->layer[0].bytes, b1);
+
+    int wname = 4, wshape = 5;
+    for (uint32_t i = 0; i < m->n_params; i++) {
+        const ath_param *p = &m->params[i];
+        if (!selected(opt, p->name))
+            continue;
+        int l = (int)strlen(p->name);
+        wname = l > wname ? l : wname;
+        fmt_shape(shape, sizeof shape, &p->t);
+        l = (int)strlen(shape);
+        wshape = l > wshape ? l : wshape;
+    }
+    printf("\n%-*s  %-10s  %5s  %6s  %-18s  %-5s  %-*s  %12s\n", wname, "name", "role", "layer", "expert",
+           "flags", "dtype", wshape, "shape", "bytes");
+    for (uint32_t i = 0; i < m->n_params; i++) {
+        const ath_param *p = &m->params[i];
+        if (!selected(opt, p->name))
+            continue;
+        fmt_index(b1, sizeof b1, p->layer);
+        fmt_index(b2, sizeof b2, p->expert);
+        fmt_flags(flags, sizeof flags, p->flags);
+        fmt_shape(shape, sizeof shape, &p->t);
+        printf("%-*s  %-10s  %5s  %6s  %-18s  %-5s  %-*s  %12llu\n", wname, p->name, ath_role_name(p->role),
+               b1, b2, flags, ath_dtype_name(p->t.dtype), wshape, shape,
+               (unsigned long long)ath_tensor_nbytes(&p->t));
+    }
+
+    if (opt->filter)
+        printf("\nfilter '%s': %u of %u params\n", opt->filter, t->all.params, m->n_params);
+    printf("\n%-10s  %8s  %14s\n", "role", "params", "bytes");
+    for (int r = 0; r < ATH_ROLE_COUNT; r++) {
+        if (!t->role[r].params)
+            continue;
+        fmt_bytes(b1, sizeof b1, t->role[r].bytes);
+        printf("%-10s  %8u  %14llu  %s\n", ath_role_name((ath_role)r), t->role[r].params,
+               (unsigned long long)t->role[r].bytes, b1);
+    }
+    fmt_bytes(b1, sizeof b1, t->all.bytes);
+    printf("%-10s  %8u  %14llu  %s\n", opt->filter ? "matched" : "total", t->all.params,
+           (unsigned long long)t->all.bytes, b1);
+
+    printf("\n");
+    bool first = true;
+    for (uint32_t g = 0; g < m->n_ignored; g++) {
+        const ath_ignored *ig = &m->ignored[g];
+        if (!ig->n_tensors)
+            continue;
+        fmt_bytes(b1, sizeof b1, ig->bytes);
+        printf("%s %-16s %5u tensors  %10s  %s\n", first ? "ignored " : "        ", ig->prefix, ig->n_tensors,
+               b1, ig->reason);
+        first = false;
+    }
+    if (first)
+        printf("ignored  none\n");
+    uint32_t unbound = m->ckpt.n_tensors - m->n_bound - t->ignored_tensors;
+    fmt_bytes(b3, sizeof b3, m->ckpt.tensor_bytes);
+    printf("check    %u checkpoint tensors (%s): %u bound to %u params, %u ignored, %u unbound\n",
+           m->ckpt.n_tensors, b3, m->n_bound, m->n_params, t->ignored_tensors, unbound);
+}
+
+static void print_roles_json(const options *opt, const ath_model *m, const roles_totals *t)
+{
+    FILE *o = stdout;
+    char  flags[64];
+    fputs("{\n  \"model_dir\": ", o);
+    json_cstr(o, opt->dir);
+    fputs(",\n  \"family\": ", o);
+    json_cstr(o, m->family->name);
+    fprintf(o, ",\n  \"n_layers\": %d,\n  \"hidden_size\": %d,\n  \"vocab_size\": %d,\n"
+               "  \"tie_embeddings\": %s,\n  \"n_experts\": %d,\n  \"n_experts_active\": %d,\n",
+            m->n_layers, m->hidden_size, m->vocab_size, m->tie_embeddings ? "true" : "false",
+            m->n_experts, m->n_experts_active);
+    fputs("  \"filter\": ", o);
+    if (opt->filter)
+        json_cstr(o, opt->filter);
+    else
+        fputs("null", o);
+
+    fputs(",\n  \"layers\": [", o);
+    for (int32_t i = 0; i < m->n_layers; i++) {
+        const ath_layer *l = &m->layers[i];
+        fprintf(o, "%s\n    {\"layer\": %d, \"mixer\": ", i ? "," : "", i);
+        json_cstr(o, l->mixer);
+        fputs(", \"ffn\": ", o);
+        json_cstr(o, l->ffn);
+        fprintf(o, ", \"n_experts\": %d, \"params\": %u, \"bytes\": %llu}", l->n_experts,
+                t->layer[i + 1].params, (unsigned long long)t->layer[i + 1].bytes);
+    }
+
+    fputs("\n  ],\n  \"params\": [", o);
+    bool first = true;
+    for (uint32_t i = 0; i < m->n_params; i++) {
+        const ath_param *p = &m->params[i];
+        if (!selected(opt, p->name))
+            continue;
+        fputs(first ? "\n    {\"name\": " : ",\n    {\"name\": ", o);
+        first = false;
+        json_cstr(o, p->name);
+        fmt_flags(flags, sizeof flags, p->flags);
+        fprintf(o, ", \"role\": \"%s\", \"layer\": %d, \"expert\": %d, \"flags\": [", ath_role_name(p->role),
+                p->layer, p->expert);
+        if (p->flags)
+            for (char *f = flags; f;) {
+                char *comma = strchr(f, ',');
+                fprintf(o, "%s\"%.*s\"", f == flags ? "" : ", ", comma ? (int)(comma - f) : (int)strlen(f), f);
+                f = comma ? comma + 1 : NULL;
+            }
+        fprintf(o, "], \"dtype\": \"%s\", \"shape\": [", ath_dtype_name(p->t.dtype));
+        for (int32_t d = 0; d < p->t.ndim; d++)
+            fprintf(o, d ? ", %lld" : "%lld", (long long)p->t.shape[d]);
+        fprintf(o, "], \"bytes\": %llu}", (unsigned long long)ath_tensor_nbytes(&p->t));
+    }
+
+    fputs("\n  ],\n  \"roles\": [", o);
+    first = true;
+    for (int r = 0; r < ATH_ROLE_COUNT; r++) {
+        if (!t->role[r].params)
+            continue;
+        fprintf(o, "%s\n    {\"role\": \"%s\", \"params\": %u, \"bytes\": %llu}", first ? "" : ",",
+                ath_role_name((ath_role)r), t->role[r].params, (unsigned long long)t->role[r].bytes);
+        first = false;
+    }
+    fputs("\n  ],\n  \"ignored\": [", o);
+    for (uint32_t g = 0; g < m->n_ignored; g++) {
+        const ath_ignored *ig = &m->ignored[g];
+        fputs(g ? ",\n    {\"prefix\": " : "\n    {\"prefix\": ", o);
+        json_cstr(o, ig->prefix);
+        fputs(", \"reason\": ", o);
+        json_cstr(o, ig->reason);
+        fprintf(o, ", \"tensors\": %u, \"bytes\": %llu}", ig->n_tensors, (unsigned long long)ig->bytes);
+    }
+    fprintf(o, "\n  ],\n  \"selected\": {\"params\": %u, \"bytes\": %llu},\n", t->all.params,
+            (unsigned long long)t->all.bytes);
+    fprintf(o, "  \"checkpoint_tensors\": %u,\n  \"bound_tensors\": %u,\n  \"ignored_tensors\": %u,\n"
+               "  \"n_params\": %u\n}\n",
+            m->ckpt.n_tensors, m->n_bound, t->ignored_tensors, m->n_params);
+}
+
+/* Loading fails, with the reason logged by the library, on any tensor the
+ * family cannot account for: that is the point of the check. */
+static int inspect_roles(ath_arena *a, const options *opt)
+{
+    ath_model m;
+    ath_status s = ath_model_open(&m, a, opt->dir);
+    if (s != ATH_OK) {
+        fprintf(stderr, "athanor inspect: cannot load %s through a model family: %s\n", opt->dir,
+                ath_status_str(s));
+        return ATH_EXIT_FAILURE;
+    }
+    roles_totals t;
+    s = roles_totals_compute(a, opt, &m, &t);
+    if (s == ATH_OK) {
+        if (opt->json)
+            print_roles_json(opt, &m, &t);
+        else
+            print_roles_text(opt, &m, &t);
+    }
+    ath_model_close(&m);
+    return s == ATH_OK ? ATH_EXIT_OK : ATH_EXIT_FAILURE;
+}
+
 /* ---- entry point --------------------------------------------------------------- */
 
 int ath_cmd_inspect(ath_arena *a, int argc, char **argv)
@@ -353,6 +635,8 @@ int ath_cmd_inspect(ath_arena *a, int argc, char **argv)
             return ATH_EXIT_OK;
         } else if (strcmp(argv[i], "--json") == 0) {
             opt.json = true;
+        } else if (strcmp(argv[i], "--roles") == 0) {
+            opt.roles = true;
         } else if (strcmp(argv[i], "--filter") == 0) {
             if (++i >= argc) {
                 fprintf(stderr, "athanor inspect: --filter needs a value\n");
@@ -376,6 +660,8 @@ int ath_cmd_inspect(ath_arena *a, int argc, char **argv)
         ath_cmd_inspect_usage(stderr);
         return ATH_EXIT_USAGE;
     }
+    if (opt.roles)
+        return inspect_roles(a, &opt);
 
     const ath_json *cfg;
     ath_status s = load_config(a, opt.dir, &cfg);
