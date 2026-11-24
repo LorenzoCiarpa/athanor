@@ -14,6 +14,13 @@ step, and records every op the reference computes as one record:
 tests/test_golden.c replays every record through the _ref functions in
 src/ops/ and compares both outputs.
 
+Then the forward records, for the end-to-end comparison of
+tests/test_forward.c: fixed prompts, each followed by a few greedy decode
+steps of the bf16 reference, and the same tokens through the reference
+loaded in fp32 (the exact model, up to fp32 rounding). For every position,
+both runs record the residual stream entering every decoder layer and the
+final norm, and the logits.
+
     tests/golden/.venv/bin/python tests/golden/dump.py models/Qwen3.5-0.8B
 
 writes tests/golden/data/qwen35-0.8b/{golden.safetensors,manifest.json}.
@@ -60,6 +67,17 @@ PROMPT = (
     "Its name comes from the Arabic al-tannur, an oven, and old treatises called it the "
     "slow furnace, because it never hurried and never went cold."
 )
+
+# Forward records: the op prompt and a chat-formatted one (the template of
+# the checkpoint with add_generation_prompt, written out so that the data
+# does not depend on the template), each followed by FORWARD_DECODE greedy
+# decode steps of the bf16 reference.
+FORWARD_PROMPTS = (
+    ("prose", PROMPT),
+    ("chat", "<|im_start|>user\nWhat does an alchemist's athanor do? Answer in one sentence.<|im_end|>\n"
+             "<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+)
+FORWARD_DECODE = 8
 
 CKPT_PREFIX = "model.language_model."
 
@@ -409,6 +427,81 @@ def gdn_wrap(orig, form):
     return wrapped
 
 
+# ---- forward records ----------------------------------------------------------
+
+
+def run_forward(model, prompt_ids, steps, decode_ids=None):
+    """Prefill prompt_ids, then `steps` decode steps of one token with the
+    cache: the tokens in decode_ids, or the greedy choice of the model.
+    Returns the tokens fed, the residual stream entering every decoder layer
+    and the final norm [layers + 1, tokens, hidden], and the logits
+    [tokens, vocab]."""
+    lm = model.model
+    n_layers = len(lm.layers)
+    seen = {}
+
+    def capture(i):
+        def hook(mod, args, kwargs):
+            x = args[0] if args else kwargs["hidden_states"]
+            seen[i] = x[0].detach().clone()
+        return hook
+
+    hooks = [layer.register_forward_pre_hook(capture(i), with_kwargs=True) for i, layer in enumerate(lm.layers)]
+    hooks.append(lm.norm.register_forward_pre_hook(capture(n_layers), with_kwargs=True))
+    try:
+        fed, residual, logits = list(prompt_ids), [], []
+        out = model(input_ids=torch.tensor([prompt_ids]), use_cache=True)
+        cache = out.past_key_values
+        residual.append(torch.stack([seen[i] for i in range(n_layers + 1)]))
+        logits.append(out.logits[0])
+        for step in range(steps):
+            nxt = decode_ids[step] if decode_ids is not None else int(out.logits[0, -1].argmax())
+            fed.append(nxt)
+            out = model(input_ids=torch.tensor([[nxt]]), cache=cache, use_cache=True)
+            residual.append(torch.stack([seen[i] for i in range(n_layers + 1)]))
+            logits.append(out.logits[0])
+    finally:
+        for h in hooks:
+            h.remove()
+    return fed, torch.cat(residual, dim=1), torch.cat(logits, dim=0)
+
+
+def kl_per_position(logits32, logits):
+    """KL(p32 || p) per row, in float64: what tests/test_forward.c computes."""
+    lp32 = torch.log_softmax(logits32.double(), dim=-1)
+    lp = torch.log_softmax(logits.double(), dim=-1)
+    return (lp32.exp() * (lp32 - lp)).sum(dim=-1)
+
+
+def forward_records(model, model32, tok):
+    """Runs every forward prompt through the bf16 reference (greedy decode)
+    and the fp32 reference (the same tokens) and stores the results."""
+    out = []
+    for name, text in FORWARD_PROMPTS:
+        ids = tok(text)["input_ids"]
+        with torch.no_grad():
+            fed, res, lg = run_forward(model, ids, FORWARD_DECODE)
+            fed32, res32, lg32 = run_forward(model32, ids, FORWARD_DECODE, decode_ids=fed[len(ids):])
+        assert fed == fed32 and res.dtype == torch.bfloat16 and res32.dtype == torch.float32
+        kl = kl_per_position(lg32, lg)
+        rid = f"fwd.{name}"
+        R.tensors[f"{rid}.tokens"] = torch.tensor(fed, dtype=torch.int32)
+        R.tensors[f"{rid}.residual"] = res.contiguous()
+        R.tensors[f"{rid}.residual32"] = res32.contiguous()
+        R.tensors[f"{rid}.logits"] = lg.contiguous()
+        R.tensors[f"{rid}.logits32"] = lg32.contiguous()
+        out.append({
+            "id": rid, "name": name, "prompt": text, "n_prompt": len(ids), "n_decode": FORWARD_DECODE,
+            "tokens": fed,
+            # the bf16 reference against the fp32 one: the KL the gate compares with
+            "kl_mean": kl.mean().item(), "kl_max": kl.max().item(),
+            "argmax_differs": int((lg.float().argmax(-1) != lg32.argmax(-1)).sum()),
+        })
+        print(f"dump.py: forward '{name}': {len(ids)} + {FORWARD_DECODE} tokens, bf16 reference vs fp32: "
+              f"KL mean {kl.mean().item():.3e}, max {kl.max().item():.3e}")
+    return out
+
+
 def install(model):
     ref.apply_rotary_pos_emb = rope_wrap
     ref.eager_attention_forward = attn_wrap
@@ -468,6 +561,16 @@ def main():
         next_id = int(out.logits[0, -1].argmax())
         R.phase, R.positions = "d", torch.tensor([T], dtype=torch.int32)
         model(input_ids=torch.tensor([[next_id]]), cache=cache, use_cache=True)
+    R.on = False
+
+    # The exact model: every weight widened to fp32 (exact), the f32 tensors
+    # as stored. Same attention implementation and torch fallbacks.
+    model32 = AutoModelForCausalLM.from_pretrained(args.model_dir, dtype=torch.float32, attn_implementation="eager")
+    model32.eval()
+    for name in restored:
+        p32 = model32.get_parameter("model." + name[len(CKPT_PREFIX):])
+        assert torch.equal(p32, model.get_parameter("model." + name[len(CKPT_PREFIX):]))
+    forward = forward_records(model, model32, tok)
 
     os.makedirs(args.out, exist_ok=True)
     data_path = os.path.join(args.out, "golden.safetensors")
@@ -494,6 +597,7 @@ def main():
         "decode_token": next_id,
         "data": {"file": "golden.safetensors", "sha256": sha256_file(data_path), "tensors": len(R.tensors)},
         "records": R.records,
+        "forward": forward,
     }
     with open(os.path.join(args.out, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=1)

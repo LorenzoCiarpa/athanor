@@ -48,7 +48,8 @@ LIB_OBJ   := $(LIB_SRC:%.c=$(BUILD)/obj/%.o)
 
 TOOL_SRC := $(wildcard tools/*.c)
 TOOL_OBJ := $(TOOL_SRC:%.c=$(BUILD)/obj/%.o)
-TESTS    := $(BUILD)/test_core $(BUILD)/test_model $(BUILD)/test_ops $(BUILD)/test_golden
+TESTS    := $(BUILD)/test_core $(BUILD)/test_model $(BUILD)/test_ops $(BUILD)/test_golden \
+            $(BUILD)/test_forward
 
 .PHONY: all cpu cuda hip test check-alloc golden clean FORCE
 .SECONDARY:
