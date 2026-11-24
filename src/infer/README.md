@@ -5,7 +5,7 @@ The inference engine. Decode at batch 1 is limited by memory bandwidth, so the g
 | File | Content | Step |
 | --- | --- | --- |
 | `engine.c` | load → placement → warm-up (graph capture) → prefill/decode loop | 8–10 |
-| `state.c` | per-sequence state allocated from the model's `state_specs`: paged KV cache, recurrent and conv states; snapshots for prefix reuse | 8, 14 |
+| `state.c` | per-sequence state allocated from the model's `state_specs`: paged KV cache, recurrent and conv states; snapshots for prefix reuse; on-disk persistence of prefix snapshots (hash of token prefix → KV pages + recurrent and conv state), with a size budget and LRU eviction | 8, 14 |
 | `sched.c` | request queue, small continuous batching for the server | 13 |
 | `tier.c` | MoE expert placement across VRAM, pinned RAM, RAM and disk; usage statistics; copy-or-compute-on-CPU cost model; router-ahead prefetch | 12 |
 | `spec.c` | speculative decoding with the MTP head | 13 |
@@ -16,6 +16,8 @@ The inference engine. Decode at batch 1 is limited by memory bandwidth, so the g
 | --- | --- | --- |
 | Full attention (one in four) | paged KV cache, quantizable | linear |
 | Gated DeltaNet (three in four) | recurrent matrix per head + conv state | constant |
+
+Hybrid models make prefix snapshots small: three layers in four keep a fixed-size recurrent and conv state, and only the attention layers keep KV pages that grow with the prefix. A snapshot saved on disk survives a restart, so a harness that resends a long system prompt and tool list resumes it instead of recomputing it (step 14).
 
 ## MoE placement
 

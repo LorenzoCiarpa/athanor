@@ -18,6 +18,7 @@ Within inference, the first five steps run on the CPU only. They produce a slow 
 | Build system | plain Makefile | default |
 | Binary | one `athanor` binary with subcommands | decided |
 | Docs language | English | decided |
+| Scope | engine + server; no agent harness (no tool execution, agent loop, conversation memory or UI; tool rendering and parsing are in scope). CHANGE-001, 2026-11-24 | decided |
 
 ## 2. Assumptions
 
@@ -57,10 +58,10 @@ Training memory on 16 GB, weights plus optimizer, before activations:
 | Step | Deliverable | Main files | Gate |
 | --- | --- | --- | --- |
 | 1 | Core and `athanor inspect` | `src/core/*`, `tools/athanor.c`, `Makefile` | lists every tensor of Qwen3.5-0.8B with dtype, shape and size; `make test` green |
-| 2 | Contract and family loading | `src/model/model.h`, `registry.c`, `src/models/qwen35/config.c`, `weights.c` | every tensor bound to a param with role, layer and flags; layer schedule printed |
+| 2 | Contract and family loading | `src/model/model.h`, `registry.c`, `src/models/qwen35/config.c`, `weights.c` | every tensor bound to a param with role, layer and flags; layer schedule printed; vision-encoder tensors bound with `ATH_P_UNUSED`; any other unbound tensor is an error (added by CHANGE-001, 2026-11-24) |
 | 3 | CPU reference ops and golden harness | `src/ops/*.c`, `src/backend/cpu.c`, `tests/golden/dump.py`, `tests/test_ops.c` | every op within tolerance of golden tensors on real weights |
 | 4 | CPU forward | `src/models/qwen35/forward.c` | logits match the reference implementation on fixed prompts |
-| 5 | Tokenizer, sampling, CPU chat | `src/text/bpe.c`, `unicode.h`, `src/models/qwen35/text.c`, `src/ops/sample.c` | exact token round-trip on a corpus; first chat, slow and correct |
+| 5 | Tokenizer, sampling, CPU chat | `src/text/bpe.c`, `unicode.h`, `src/models/qwen35/text.c` (`pretokenize`, `chat` with tool definitions, `parse`), `src/ops/sample.c` | exact token round-trip on a corpus; first chat, slow and correct; rendered prompts byte-identical to the reference chat template for a fixture set with and without tools; parser fixtures pass (added by CHANGE-001) |
 | 6 | GPU backend | `src/backend/gpu.cu`, `compat.h` | allocation, copies, streams, events, timing on CUDA |
 | 7 | GPU ops, one by one | `src/ops/*.cu` | every kernel matches its CPU reference |
 | 8 | Sequence state and engine | `src/infer/state.c`, `engine.c` | GPU chat in bf16; greedy output identical to reference for 256 tokens on 50 prompts |
@@ -68,8 +69,8 @@ Training memory on 16 GB, weights plus optimizer, before activations:
 | 10 | Fast prefill | tiled attention, chunked Gated DeltaNet, GEMM path | prefill within 15% of vLLM for a single request |
 | 11 | HIP build | Makefile `hip` target, `compat.h` coverage | all tests green on AMD; performance report published |
 | 12 | MoE and tiering | `src/ops/moe.*`, `src/infer/tier.c`, CPU `_fast` expert path | Qwen3.6-35B-A3B decode ≥ Strata on the same machine and quantization |
-| 13 | Server and MTP | `src/net/*`, `src/infer/spec.c` | works with Claude Code, Codex CLI and OpenCode; speculative-decoding speedup reported |
-| 14 | Long context | KV quantization, state snapshots for prefix reuse | 128k context on Qwen3.5-9B in 16 GB |
+| 13 | Server and MTP | `src/net/*`, `src/infer/spec.c` | works with Claude Code, Codex CLI and OpenCode; speculative-decoding speedup reported; tool-calling conformance: multi-turn sessions with tool calls succeed with Claude Code, OpenCode and Codex CLI on a fixed task set (added by CHANGE-001) |
+| 14 | Long context | KV quantization, state snapshots for prefix reuse; persistent prefix snapshots on disk keyed by a hash of the token prefix (added by CHANGE-001) | 128k context on Qwen3.5-9B in 16 GB; resume after restart; snapshot size reported per context length |
 
 Steps 1–5 need no GPU. Steps 1–9 use bf16 weights and one simple 8-bit format at most; quantization proper is phase 2.
 
@@ -114,7 +115,7 @@ Steps 1–5 need no GPU. Steps 1–9 use bf16 weights and one simple 8-bit forma
 | Reference | Meaning for athanor | Same model? |
 | --- | --- | --- |
 | Strata | MoE inference with VRAM/RAM/SSD placement | yes: Qwen3.6-35B-A3B, Qwen3.8-Flash-Next |
-| DwarfStar (ds4) | design quality: specialization, per-component quantization, small C code | no: compared through llama.cpp |
+| DwarfStar (ds4) | design quality: specialization, per-component quantization, small C code | possibly yes on Qwen3.8-Flash-Next (verify); otherwise compared through llama.cpp. Checked 2026-11-24: the ds4 README (commit `5379c1c`, 2026-10-19) lists Qwen3.8 Flash Next on Metal and CUDA, with its own Q2 and Q4K weights; still to verify by running it when that model enters scope |
 | Unsloth | training memory and speed | yes: Qwen3.5 sizes |
 | llama.cpp, vLLM | decode and prefill baselines | yes |
 | Heretic | abliteration quality and time | yes |
@@ -129,7 +130,7 @@ Gates are measured, not promised; every comparison records the competitor's vers
 | The family moves fast | block library per layer type; new releases add ops, not rewrites |
 | No AMD hardware | second-GPU decision; cloud runner as fallback |
 | One-person bandwidth | narrow scope, published gates, contributor-friendly issues per step |
-| Qwen3.5 models are multimodal | text path only; vision encoder is a later milestone |
+| Qwen3.5 models are multimodal | text path only; vision encoder is a later milestone; its tensors are bound with `ATH_P_UNUSED`, never silently ignored (CHANGE-001) |
 | Name shared with unrelated projects (AI dev tools, MU* frameworks) | clear tagline and repository description |
 
 ## 10. Open decisions

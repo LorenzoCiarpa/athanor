@@ -25,6 +25,7 @@ athanor is a single C engine that runs, quantizes, abliterates and trains one fa
 7. **Placement never changes results.** Where a tensor lives (VRAM, RAM, disk) must not change outputs.
 8. **No performance claims without a report** under `docs/results/` following `docs/BENCHMARKS.md`.
 9. **Minimal by default.** No abstraction until it has two real users. No speculative features outside the current step. Prefer one clear function over a framework.
+10. **No agent features.** athanor never executes tools, runs agent loops, stores conversation memory or compacts context. Requests in that direction are out of scope; note them under "Open questions" in `docs/STATUS.md` instead of implementing them. Rendering tool definitions into the prompt and parsing tool calls out of the output are in scope (`docs/ARCHITECTURE.md`, Scope: engine versus harness).
 
 ## Workflow for every task
 

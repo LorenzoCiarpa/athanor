@@ -10,9 +10,11 @@ Maps each article and lesson of the course to the athanor code that implements i
 | 4 | Linear attention and Gated DeltaNet, from the recurrence | 3–4 | `src/ops/gdn.c`, `src/ops/conv.c`, `ath_l2norm_ref` in `src/ops/norm.c`; the layer as composed: `gated_deltanet()` in `src/models/qwen35/forward.c` | recurrent reference landed (step 3); composed in the forward pass (step 4) |
 | 5 | Byte-level BPE from scratch | 5 | `src/text/bpe.c` | planned |
 | 6 | Sampling: temperature, top-k, top-p | 5 | `src/ops/sample.c` | planned |
+| 6b | Tool calling: from chat template to API | 5, 13 | `src/models/qwen35/text.c` (`chat` with tool definitions, `parse`), `src/net/api.c` | planned (added by CHANGE-001, 2026-11-24) |
 | 7 | How a GPU runs a kernel; one source for CUDA and HIP | 6–7 | `src/backend/`, `src/ops/*.cu` | planned |
 | 8 | Why decode is memory-bound | 4, 9 | `src/ops/matmul.cu`; on the CPU first: `ath_matmul_fast` reaches the RAM bandwidth on the lm_head with 8 threads, where every faster instruction stops helping (`src/ops/README.md`, Fast CPU paths; `docs/proposals/cpu-matmul-avx512.md`, Measurements) | CPU illustration landed (step 4); GPU planned (step 9) |
 | 9 | KV cache vs recurrent state | 4, 8 | state specs in `src/model/model.h`, `src/model/state.c`; the buffers of Qwen3.5 in `src/models/qwen35/forward.c` (layouts in its README); `src/infer/state.c` | CPU state of one sequence landed (step 4); GPU engine planned (step 8) |
+| 9b | Prefix caching on disk with hybrid models | 14 | `src/infer/state.c` | planned (added by CHANGE-001, 2026-11-24) |
 | 10 | Chunkwise Gated DeltaNet on the GPU | 10 | `src/ops/gdn.cu` | planned |
 | 11 | Mixture of experts and placing experts across VRAM, RAM and disk | 12 | `src/ops/moe.*`, `src/infer/tier.c` | planned |
 | 12 | Speculative decoding with an MTP head | 13 | `src/infer/spec.c` | planned |

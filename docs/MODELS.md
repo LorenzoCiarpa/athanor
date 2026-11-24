@@ -89,4 +89,4 @@ Multi-token prediction head used for speculative decoding in step 13; structure 
 
 ### Not in scope until later
 
-Vision encoder (Qwen3.5 models are vision-language models): text path first.
+Vision encoder (Qwen3.5 models are vision-language models): text path first. Its tensors are bound as params flagged `ATH_P_UNUSED` and skipped by the text path, never ignored silently (`docs/ARCHITECTURE.md`, The contract).

@@ -45,7 +45,7 @@ Records are captured with forward hooks on modules and by wrapping the module-le
 - `out`: the reference's own result, in its own dtype, with its own intermediate roundings.
 - `out32`: the same reference function recomputed in fp32 from the same inputs (weights widened, fp32 RoPE tables). For the Gated DeltaNet the fp32 rerun uses the recurrent form, athanor's algorithm, also for the chunked prefill. No bf16 rounding is left in `out32`, so it checks the math of the `_ref` functions tightly.
 
-Each record carries the checkpoint names of its weights and its parameters (eps, RoPE theta and dimension, attention scale, Gated DeltaNet query scale and L2-norm epsilon), read from the reference modules. `manifest.json` lists the records, the prompt and its tokens, the versions, the CPU, the sha256 of `config.json` and of the data file.
+Each record carries the checkpoint names of its weights and its parameters (eps, RoPE theta and dimension, attention scale, Gated DeltaNet query scale and L2-norm epsilon), read from the reference modules. `manifest.json` lists the records, the prompt and its tokens, the versions, the reference class, the CPU, the sha256 of `config.json` and of the data file. The checkpoint is a vision-language model; `dump.py` runs its text path only (`AutoModelForCausalLM` gives `Qwen3_5ForCausalLM`, without the vision encoder), stops if it loads anything else, and records the class as `reference.class`.
 
 ## Forward records
 

@@ -7,11 +7,13 @@ The Qwen hybrid family (Qwen3.5, Qwen3.6, Qwen3.8 dense and MoE). The only direc
 | `qwen35.h` | `ath_qwen35_config`; `ath_qwen35_layer` (the params of a layer by what the forward pass does with them, and its state indices) and `ath_qwen35_model` (the family data: config, layer table, embedding, final norm, output head); the functions shared by the files below; private to this directory (and the family's tests) | 2, 4 |
 | `family.c` | `ath_family_qwen35`: `load` = parse the config, fill dimensions and the layer schedule, bind, declare the state specs (KV per attention layer, conv and recurrent per Gated DeltaNet layer); `forward` | 2, 4 |
 | `config.c` | `config.json` → dimensions, layer schedule (Gated DeltaNet / full attention), MLP or MoE parameters; `match` on `model_type`; rejects keys the reference does not support | 2 |
-| `weights.c` | checkpoint tensor names → `ath_param` with role, layer, expert, flags; dtype and shape checked against the config; fused experts become one view per expert; vision encoder and MTP head are ignored groups; every param recorded in the layer table for the forward pass | 2, 4 |
+| `weights.c` | checkpoint tensor names → `ath_param` with role, layer, expert, flags; dtype and shape checked against the config; fused experts become one view per expert; vision encoder and MTP head are ignored groups, their tensors bound last as params flagged `ATH_P_UNUSED`; every param recorded in the layer table for the forward pass | 2, 4 |
 | `forward.c` | the forward pass from the CPU reference ops, with `ath_matmul_fast` (the same bits as `ath_matmul_ref`, on the caller's pool) for the matmuls: embedding, per layer the Gated DeltaNet or attention mixer and the MLP with their norms and residual additions, final norm, fp32 logits; one path for prefill, pieces and decode; KV, conv and recurrent state in the buffers of the state specs; activations in the state's dtype; calls `on_residual` at every layer boundary. MoE layers fail with `ATH_ERR_UNSUPPORTED` until step 12 | 4 |
-| `text.c` | Qwen pre-tokenization split and chat template | 5 |
+| `text.c` | pre-tokenization, chat template with tool definitions and thinking switch, incremental output parser (thinking blocks, tool calls) | 5 |
 | `backward.c` | per-block backward | T1 |
 | `fused.cu` | optional fused kernels, admitted only with a benchmark | 9+ |
+
+The exact markup of the chat template (roles, tool definitions, tool calls and results, thinking blocks) must be taken from the reference chat template shipped with the checkpoint (`tokenizer_config.json` or `chat_template.jinja`) and recorded in `docs/contract/`, never guessed; the rendered prompts are compared byte for byte with the reference's (`tests/test_text.c`).
 
 ## Forward pass
 
@@ -35,7 +37,7 @@ Text path of Qwen3.5 dense (0.8B, 2B, 4B, 9B, 27B) and MoE (35B-A3B, 122B-A10B),
 
 | `model_type` | Keys | Tensor prefix | Notes |
 | --- | --- | --- | --- |
-| `qwen3_5`, `qwen3_5_moe` | under `text_config` | `model.language_model.` | vision-language checkpoints as published; `model.visual.` and `mtp.` are ignored groups |
+| `qwen3_5`, `qwen3_5_moe` | under `text_config` | `model.language_model.` | vision-language checkpoints as published; `model.visual.` and `mtp.` are ignored groups (params flagged `ATH_P_UNUSED`) |
 | `qwen3_5_text`, `qwen3_5_moe_text` | top level | `model.` | text-only checkpoints saved by `Qwen3_5ForCausalLM` |
 
 `lm_head.weight` is a top-level tensor in both layouts and exists only when `tie_word_embeddings` is false. MoE checkpoints store each layer's routed experts fused (`mlp.experts.gate_up_proj` [E, 2·I, H], `mlp.experts.down_proj` [E, H, I]); per-expert tensors (as in the MTP head) are not accepted for the language model. Roles and flags of every tensor: `docs/contract/qwen35-0.8b.md` and `docs/contract/qwen35-35b-a3b.md`, section Parameter binding.

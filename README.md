@@ -9,7 +9,7 @@ It follows the thesis of [DwarfStar](https://github.com/antirez/ds4), [Strata](h
 
 ## Status
 
-Pre-alpha. Step 1 done: the core library and `athanor inspect` read a checkpoint without copying it (CPU only, no model math yet). Live status: [docs/STATUS.md](docs/STATUS.md).
+Pre-alpha. Steps 1 to 4 done: the core library and `athanor inspect` read a checkpoint without copying it, the model contract binds every tensor, and the whole Qwen3.5-0.8B forward pass runs on the CPU, checked against the reference implementation. Live status: [docs/STATUS.md](docs/STATUS.md).
 
 ## What it does
 
@@ -19,6 +19,7 @@ Pre-alpha. Step 1 done: the core library and `athanor inspect` read a checkpoint
 | Quantization | own weight formats from 2 to 8 bits, FP8 and FP4 (NVFP4, MXFP4); RTN, importance-weighted, GPTQ- and AWQ-class algorithms; GGUF interop |
 | Abliteration | refusal-direction removal with automatic multi-objective search, MoE-aware |
 | Training | LoRA, QLoRA, full fine-tuning beyond VRAM, quantization-aware training, small-scale pre-training, RL with verifiable rewards |
+| Agent harness (tool execution, agent memory, UI) | out of scope by design: athanor renders tool definitions and parses tool calls, and any harness (Claude Code, OpenCode, Codex CLI, your own) runs the tools through the API |
 
 ## Supported models
 

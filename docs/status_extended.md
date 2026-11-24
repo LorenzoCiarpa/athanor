@@ -633,6 +633,37 @@ What was implemented:
 
 Commits `715c7f7` (the pool), `cdc40aa` (`ath_matmul_fast` and its tests), `25c4bed` (the pool in the contract, the forward pass on the fast matmul), and the documentation commit that follows them.
 
+#### 4.8 CHANGE-001: scope boundary, tool calling, prefix cache, vision tensors (added after the step closed)
+
+A specification change from the maintainer, `docs/CHANGE-001-scope-tools-cache.md`, applied on 2026-11-24 before step 4 was merged. The STATUS log lists each of its edits and what was deferred.
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `docs/CHANGE-001-scope-tools-cache.md` | New | The change itself, as the maintainer wrote it |
+| `src/model/model.h` | Changed | `ATH_P_UNUSED`; the header comment, `ath_ignored`, `params` and `ath_model_open` describe the new coverage rule |
+| `src/model/registry.c` | Changed | Coverage: every tensor bound; a group's tensors bound only by unused params and in one group; every unused param in a group |
+| `src/models/qwen35/weights.c`, `qwen35.h` | Changed | The tensors of the two ignored groups bound last, one whole-tensor param each, role other, layer −1, flagged `ATH_P_UNUSED`; capacity counted from the checkpoint |
+| `tools/inspect.c` | Changed | Flag name `unused`; per-layer and per-role totals over the used params, the unused ones on their own line (`unused` in JSON); coverage line `B bound to P params (I in ignored groups, unused), U unbound` |
+| `tests/test_model.c` | Changed | `count_role` counts used params; the tiny checkpoints check the 4 unused params (flag, role, layer, zero-copy, after the used ones) and the MoE count; the real checkpoint: all tensors bound, unused params = ignored tensors |
+| `tests/golden/dump.py`, `README.md` | Changed | `check_text_path`: stop unless the loaded class is `Qwen3_5ForCausalLM` with no vision parameters; `reference.class` in the manifest |
+| `AGENTS.md` | Changed | Invariant 10, no agent features |
+| `README.md` | Changed | The agent-harness row (out of scope by design); the status line, still at step 1, brought to step 4 |
+| `docs/ARCHITECTURE.md` | Changed | Section "Scope: engine versus harness"; `ATH_P_UNUSED` and the text members (`ath_tool_def`, `ath_msg_role`, `ath_out_kind`, `ath_out_event`, `chat`, `parse`) as the contract target; the coverage rule; how quant, ablit, train and net use them; tool rendering and output parsing family-specific; the tree |
+| `docs/PLAN.md` | Changed | Scope decision; gates of steps 2, 5, 13 and 14; the ds4 row; the multimodal risk |
+| `docs/MODELS.md`, `docs/contract/qwen35-0.8b.md`, `docs/contract/qwen35-35b-a3b.md` | Changed | The vision encoder and MTP head bound as unused |
+| `src/model/README.md`, `src/models/qwen35/README.md`, `src/net/README.md`, `src/infer/README.md`, `src/text/README.md`, `tools/README.md` | Changed | Coverage rule; `text.c` (tool definitions, thinking switch, parser; markup from the reference template, recorded in `docs/contract/`); event conversion, `ATH_MSG_TOOL`, session id; prefix snapshots on disk; `parse`; the `inspect` output |
+| `docs/program/PROGRAM.md` | Changed | Rows 6b (tool calling) and 9b (prefix caching on disk) |
+| `docs/STATUS.md` | Changed | Task 4.8, criterion 9 and its result, notes, the amended step 5 preview, the log |
+
+What was implemented:
+
+- **Unused params.**
+  - Before, the vision encoder and the MTP head were ignored groups: declared with a reason and counted, but unbound.
+  - Now each of their tensors is a param flagged `ATH_P_UNUSED`, so pipelines see them. An export can copy them unchanged, and the text path skips them.
+  - The groups stay as the family's declaration of why the tensors are there. The registry checks that each group and the unused params coincide, so a tensor can be neither used and unused at once, nor unused without a reason.
+- **Unchanged results.** The 320 used params, their order and every forward and golden number are the same; the regenerated golden data only adds the reference class to the manifest.
+- **Deferred to step 5.** The text members of the contract, the template fixtures and `tests/test_text.c` arrive with `text.c`, their first user.
+
 ---
 
 ## Files by step
@@ -649,32 +680,35 @@ Every file of the repository and the steps that created or changed it (documenta
 | `src/core/tensor.{h,c}` | 1.6 | | 3.2 | |
 | `src/core/safetensors.{h,c}` | 1.7 | | | |
 | `src/core/threads.{h,c}` | | | | 4.7 |
-| `src/model/model.h` | | 2.2 | | 4.2, 4.7 |
-| `src/model/registry.c` | | 2.3 | | |
+| `src/model/model.h` | | 2.2 | | 4.2, 4.7, 4.8 |
+| `src/model/registry.c` | | 2.3 | | 4.8 |
 | `src/model/state.c` | | | | 4.2, 4.7 |
-| `src/models/qwen35/qwen35.h`, `config.c` | | 2.4 | | 4.3, 4.7 (`qwen35.h`) |
-| `src/models/qwen35/weights.c`, `family.c` | | 2.5 | | 4.3 |
+| `src/models/qwen35/qwen35.h`, `config.c` | | 2.4 | | 4.3, 4.7, 4.8 (`qwen35.h`) |
+| `src/models/qwen35/weights.c`, `family.c` | | 2.5 | | 4.3, 4.8 (`weights.c`) |
 | `src/models/qwen35/forward.c` | | | | 4.3, 4.7 |
 | `src/ops/ops.h`, `check.h`, `embed.c`, `matmul.c`, `norm.c`, `rope.c`, `act.c`, `attn.c`, `conv.c`, `gdn.c` | | | 3.3 | 4.7 (`ops.h`, `matmul.c`) |
 | `tools/athanor.c`, `commands.h` | 1.8 | | | |
-| `tools/inspect.c` | 1.8 | 2.6 | | |
+| `tools/inspect.c` | 1.8 | 2.6 | | 4.8 |
 | `tools/dev/alloc_trace.c` | 1.8 | | | |
 | `tools/dev/check_alloc.sh` | 1.8 | 2.6 | | |
 | `tests/test.h` | 1.9 | | | |
 | `tests/test_core.c` | 1.9 | 2.7 | | 4.7 |
-| `tests/util.h`, `tests/test_model.c` | | 2.7 | | 4.5 (`test_model.c`) |
+| `tests/util.h`, `tests/test_model.c` | | 2.7 | | 4.5, 4.8 (`test_model.c`) |
 | `tests/test_ops.c` | | | 3.5 | 4.7 |
 | `tests/test_golden.c` | | | 3.6 | 4.7 |
 | `tests/tiny.h`, `tests/test_forward.c` | | | | 4.5, 4.7 (`test_forward.c`) |
-| `tests/golden/dump.py`, `README.md` | | | 3.4 | 4.4 |
+| `tests/golden/dump.py`, `README.md` | | | 3.4 | 4.4, 4.8 |
 | `tests/golden/requirements.in`, `requirements.txt` | | | 3.1 | |
-| `docs/contract/qwen35-0.8b.md` | closing | 2.1 | 3.1, 3.7 | 4.6 |
-| `docs/contract/qwen35-35b-a3b.md` | | 2.1 | | |
-| `docs/MODELS.md` | | 2.1 | 3.7 | 4.6 |
-| `docs/ARCHITECTURE.md` | closing | 2.2 | 3.7 | 4.6, 4.7 |
-| `docs/STATUS.md` | closing | 2.1 to 2.7, closing | 3.1, closing | 4.1, closing, 4.7 |
-| `docs/program/PROGRAM.md` | closing | closing | 3.7 | 4.6, 4.7 |
+| `docs/contract/qwen35-0.8b.md` | closing | 2.1 | 3.1, 3.7 | 4.6, 4.8 |
+| `docs/contract/qwen35-35b-a3b.md` | | 2.1 | | 4.8 |
+| `docs/MODELS.md` | | 2.1 | 3.7 | 4.6, 4.8 |
+| `docs/ARCHITECTURE.md` | closing | 2.2 | 3.7 | 4.6, 4.7, 4.8 |
+| `docs/PLAN.md` | | | | 4.8 |
+| `docs/STATUS.md` | closing | 2.1 to 2.7, closing | 3.1, closing | 4.1, closing, 4.7, 4.8 |
+| `docs/program/PROGRAM.md` | closing | closing | 3.7 | 4.6, 4.7, 4.8 |
 | `docs/proposals/cpu-matmul-avx512.md` | | | | 4.7 |
-| `docs/status_extended.md` | | | closing | 4.6, 4.7 |
-| `AGENTS.md` | | 2.3 | 3.7 | |
-| module READMEs | closing (`src/core`, `tests`, `tools`) | 2.2, 2.5, 2.6, 2.7 (`src/model`, `src/models/qwen35`, `tools`, `tests`) | 3.2, 3.3, 3.6, 3.7 (`src/core`, `src/ops`, `tests`, `tests/golden`, `src/backend`) | 4.6 (`src/model`, `src/models/qwen35`, `tests`, `tests/golden`); 4.7 (`src/core`, `src/ops`, `src/backend`, `src/model`, `src/models/qwen35`, `tests`) |
+| `docs/CHANGE-001-scope-tools-cache.md` | | | | 4.8 |
+| `docs/status_extended.md` | | | closing | 4.6, 4.7, 4.8 |
+| `AGENTS.md` | | 2.3 | 3.7 | 4.8 |
+| `README.md` | closing | | | 4.8 |
+| module READMEs | closing (`src/core`, `tests`, `tools`) | 2.2, 2.5, 2.6, 2.7 (`src/model`, `src/models/qwen35`, `tools`, `tests`) | 3.2, 3.3, 3.6, 3.7 (`src/core`, `src/ops`, `tests`, `tests/golden`, `src/backend`) | 4.6 (`src/model`, `src/models/qwen35`, `tests`, `tests/golden`); 4.7 (`src/core`, `src/ops`, `src/backend`, `src/model`, `src/models/qwen35`, `tests`); 4.8 (`src/model`, `src/models/qwen35`, `src/net`, `src/infer`, `src/text`, `tools`) |

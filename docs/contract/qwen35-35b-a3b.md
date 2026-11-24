@@ -36,7 +36,7 @@ Language-model tensors are under `model.language_model.`, except `lm_head.weight
 | `layers.N.linear_attn.in_proj_a.weight`, `in_proj_b.weight` | [32, 2048] | same |
 | `layers.N.linear_attn.in_proj_qkv.weight` | [8192, 2048] | 2 × 16 × 128 + 32 × 128 |
 
-Every layer is MoE. The MTP head (`mtp.`, 785 tensors) stores its experts one tensor per expert (`mtp.layers.0.mlp.experts.E.gate_proj.weight` [512, 2048]); it is ignored until step 13. The vision encoder is under `model.visual.`.
+Every layer is MoE. The MTP head (`mtp.`, 785 tensors) stores its experts one tensor per expert (`mtp.layers.0.mlp.experts.E.gate_proj.weight` [512, 2048]); it is an ignored group until step 13, its tensors bound as `unused` params. The vision encoder is under `model.visual.`, also an ignored group of `unused` params.
 
 ## MoE op contract
 

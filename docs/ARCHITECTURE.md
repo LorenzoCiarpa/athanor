@@ -2,6 +2,22 @@
 
 athanor is organized in layers. Each layer may depend only on the layers below it. Only one layer, `src/models/`, knows anything about a specific model family; everything above it talks to models through a narrow contract.
 
+## Scope: engine versus harness
+
+athanor is an engine plus a server, not an agent harness (decided 2026-11-24, CHANGE-001). It owns everything that depends on the model or on the computation: weights, memory placement, KV and recurrent state (including on disk), prompt rendering, tool-call formatting and parsing, and the OpenAI- and Anthropic-compatible APIs. It never executes tools, runs an agent loop, keeps long-term memory, compacts conversations or ships a UI. Any harness (Claude Code, OpenCode, Codex CLI, a custom one) connects through the API. AGENTS.md, invariant 10.
+
+| Function | Layer | In athanor |
+| --- | --- | --- |
+| VRAM/RAM/disk placement; KV and recurrent state; on-disk prefix snapshots | engine (`src/infer`) | yes |
+| Prompt rendering, tool definitions in the template | family (`text.c`) | yes |
+| Parsing text, thinking and tool calls from output | family (`text.c`) | yes |
+| OpenAI/Anthropic APIs, streaming, tool-call conversion | server (`src/net`) | yes |
+| Tool execution, agent loop, permissions | harness | no |
+| Long-term memory, knowledge base, context compaction | harness | no |
+| Desktop app, GUI | product | no |
+
+Tool calling is model-specific: how tool definitions enter the prompt and how a tool call, or a thinking block, looks in the output is fixed by the model's chat template. So rendering and parsing belong to the family, and converting the parsed events into API formats belongs to `src/net`.
+
 ## Layers
 
 | Layer | Directory | Knows about families? | Role |
@@ -34,6 +50,7 @@ typedef enum {
 #define ATH_P_WRITES_RESIDUAL 1u   /* abliteration projects the direction out of these */
 #define ATH_P_SENSITIVE       2u   /* quantization keeps these at higher precision by default */
 #define ATH_P_SHARED_EXPERT   4u
+#define ATH_P_UNUSED          8u   /* present in the checkpoint, unused by the text path (e.g. vision encoder) */
 
 typedef struct {
     ath_tensor t;          /* contiguous view of checkpoint memory (one expert of a fused tensor is a slice) */
@@ -45,7 +62,7 @@ typedef struct {
 } ath_param;
 
 typedef struct { const char *mixer, *ffn; int32_t n_experts; } ath_layer;   /* schedule, labels for people */
-typedef struct { const char *prefix, *reason; uint32_t n_tensors; uint64_t bytes; } ath_ignored;
+typedef struct { const char *prefix, *reason; uint32_t n_tensors; uint64_t bytes; } ath_ignored;  /* ATH_P_UNUSED params */
 
 /* per-sequence state (step 4): sizes in elements; KV and CONV hold activations
  * (the state's activation dtype), RECURRENT is always fp32 */
@@ -86,7 +103,7 @@ struct ath_family {
     ath_status  (*load)   (ath_model *m, ath_arena *a);      /* reads m->config, m->ckpt */
     ath_status  (*forward)(const ath_model *m, const ath_batch *b, ath_state *s,
                            const ath_hooks *h, ath_arena *scratch, ath_pool *pool);
-    /* later: pretokenize and chat (step 5), backward (phase 4) */
+    /* later: pretokenize, chat and parse (step 5), backward (phase 4) */
 };
 
 ath_status ath_model_open(ath_model *m, ath_arena *a, const char *dir);
@@ -109,10 +126,45 @@ typedef struct {
 
     ath_status   (*backward)   (ath_model *m, ath_batch *b, ath_grads *g);     /* NULL until phase 4 */
     ath_status   (*pretokenize)(const char *text, size_t n, ath_spans *out);
-    ath_status   (*chat)       (const ath_msg *msgs, int32_t n, ath_buf *out);
 ```
 
+The text members, as CHANGE-001 (2026-11-24) specifies them. They join `model.h` in step 5 with their first user, `src/models/qwen35/text.c`; step 5 settles the members of `ath_msg`, `ath_buf` and `ath_parse_state` and records them here:
+
+```c
+typedef struct {
+    const char *name;
+    const char *description;
+    const char *json_schema;      /* parameters schema, raw JSON */
+} ath_tool_def;
+
+typedef enum { ATH_MSG_SYSTEM, ATH_MSG_USER, ATH_MSG_ASSISTANT, ATH_MSG_TOOL } ath_msg_role;
+/* ath_msg: role, content, optional tool calls (assistant), tool_call_id (tool results) */
+
+typedef enum {
+    ATH_OUT_TEXT, ATH_OUT_THINKING,
+    ATH_OUT_TOOL_CALL_BEGIN, ATH_OUT_TOOL_CALL_ARGS, ATH_OUT_TOOL_CALL_END
+} ath_out_kind;
+
+typedef struct {
+    ath_out_kind kind;
+    const char  *data;  size_t len;   /* text, thinking or argument bytes */
+    const char  *tool_name;           /* set on TOOL_CALL_BEGIN */
+} ath_out_event;
+
+    ath_status (*chat) (const ath_msg *msgs, int32_t n_msgs,
+                        const ath_tool_def *tools, int32_t n_tools,
+                        uint32_t opts,                 /* e.g. ATH_CHAT_THINKING */
+                        ath_buf *out);
+    ath_status (*parse)(ath_parse_state *st,           /* incremental, streaming-safe */
+                        const char *piece, size_t n,
+                        ath_out_event *events, int32_t cap, int32_t *n_events);
+```
+
+`chat` renders a conversation, with the tool definitions and the thinking switch, into the exact prompt text of the model's chat template. `parse` turns the decoded output, piece by piece as it streams, into events: text, thinking, and tool calls (name, then argument bytes, then end). It must handle markup split across pieces, nested or malformed markup (emitted as text, never a crash) and an end-of-stream flush.
+
 `load` takes the open checkpoint (`ath_safetensors`) rather than the `ath_weights` abstraction of the first design: there is one weight source until the `.ath` container lands in phase 2, which will introduce the abstraction with its second user.
+
+Since CHANGE-001 (2026-11-24) every checkpoint tensor is a param. Tensors the text path does not use, the vision encoder of a vision-language checkpoint and, until step 13, the MTP head, are bound as whole-tensor params flagged `ATH_P_UNUSED` (role other, layer −1, after all the other params), and each belongs to an ignored group that the family declares with a prefix and a reason. Pipelines on the text path skip them; an export (quantized container, abliterated checkpoint) copies them unchanged, so the result keeps its vision encoder.
 
 Step 4 departs from the first design of the state in three places. A spec counts elements, not bytes, because the element type depends on the activation dtype the state is created with (bf16, as the reference runs, or f32 for an exact forward pass); the kind fixes the rest (KV and conv state hold activations, the recurrent state is fp32). `forward` takes the model as `const` and a scratch arena for its working tensors, which the contract releases after every call. A batch is one sequence; batches of several sequences arrive with the engine (step 8). Since task 4.7, `forward` also takes the caller's thread pool (`ath_pool`, `src/core/threads.h`; NULL runs on the calling thread). It is passed explicitly because the code has no globals. The CPU matmuls spread over it with the same bits as on one thread.
 
@@ -122,7 +174,7 @@ A model lists the state one sequence needs as specs: for Qwen3.5, a KV cache per
 
 ### Loading and the coverage rule
 
-`ath_model_open(dir)` parses `config.json`, asks each compiled-in family whether it `match`es, maps the checkpoint, and calls the family's `load`. Then it checks, independently of the family, that every checkpoint tensor is viewed by at least one param or falls in exactly one ignored group, never both, and that every param is a contiguous view inside the tensor it names. A tensor nobody accounts for fails the load (`ATH_ERR_FORMAT`): a checkpoint that is not what the family thinks it is must not run. Families report missing tensors (`ATH_ERR_NOT_FOUND`) and shapes or dtypes that do not follow from the config (`ATH_ERR_FORMAT`). `athanor inspect <dir> --roles` prints the result.
+`ath_model_open(dir)` parses `config.json`, asks each compiled-in family whether it `match`es, maps the checkpoint, and calls the family's `load`. Then it checks, independently of the family, that every checkpoint tensor is viewed by at least one param, that the tensors of each ignored group are viewed by `ATH_P_UNUSED` params only and belong to no other group, that every `ATH_P_UNUSED` param views a tensor of some group, and that every param is a contiguous view inside the tensor it names. A tensor nobody accounts for fails the load (`ATH_ERR_FORMAT`): a checkpoint that is not what the family thinks it is must not run, and no tensor is ignored silently. Families report missing tensors (`ATH_ERR_NOT_FOUND`) and shapes or dtypes that do not follow from the config (`ATH_ERR_FORMAT`). `athanor inspect <dir> --roles` prints the result.
 
 The family list is compiled in from the Makefile: `FAMILIES=qwen35` generates `build/gen/families.h` with one `ATH_FAMILY(qwen35)` line, and each family defines `const ath_family ath_family_<name>`. `registry.c` names no family.
 
@@ -131,9 +183,10 @@ The family list is compiled in from the Makefile: `FAMILIES=qwen35` generates `b
 | Pipeline | Uses |
 | --- | --- |
 | infer | `states` (the state specs) to allocate KV, recurrent and conv state without knowing the block types; `ath_model_forward`; params with `layer` and `expert` to place MoE experts across tiers |
-| quant | params by `role` and `flags` to choose formats; `on_matmul_in` to collect activation statistics for importance-weighted RTN, GPTQ and AWQ |
-| ablit | `on_residual` to capture activations; every param with `ATH_P_WRITES_RESIDUAL` is orthogonalized |
-| train | `backward`; LoRA targets by `role`; hot/cold blocks by `layer` |
+| quant | params by `role` and `flags` to choose formats; `on_matmul_in` to collect activation statistics for importance-weighted RTN, GPTQ and AWQ; `ATH_P_UNUSED` params copied unchanged into the container |
+| ablit | `on_residual` to capture activations; every param with `ATH_P_WRITES_RESIDUAL` is orthogonalized; `ATH_P_UNUSED` params exported unchanged |
+| train | `backward`; LoRA targets by `role`; hot/cold blocks by `layer`; `ATH_P_UNUSED` params frozen and never loaded |
+| net | `chat` with the request's tool definitions to render the prompt; `parse` to turn the output into text, thinking and tool-call events, which `api.c` converts to OpenAI and Anthropic formats |
 
 ## Common versus family-specific
 
@@ -142,10 +195,10 @@ The family list is compiled in from the Makefile: `FAMILIES=qwen35` generates `b
 | core, backend, all ops (kernels parameterized by shape and format) | `config.c`: `config.json` → dimensions and layer schedule |
 | BPE engine and Unicode tables | `weights.c`: checkpoint names → params with roles and flags |
 | inference engine: states, scheduler, sampling, MoE tiering, speculative decoding | `forward.c` and later `backward.c`: composition of ops per block |
-| quantization formats, algorithms, recipes driven by roles | `text.c`: pre-tokenization split and chat template |
+| quantization formats, algorithms, recipes driven by roles | `text.c`: pre-tokenization split, chat template with tool definitions and thinking switch, output parser (thinking blocks, tool calls): tool rendering and output parsing are family-specific |
 | abliteration driven by hooks and flags | default quantization recipe (which tensors are sensitive) |
 | training: optimizers, LoRA, hot/cold layout, planner, data | optional fused kernels in `fused.cu`, admitted only with a benchmark |
-| server, tools, test harness | golden test configuration |
+| server (API formats: conversion of output events to OpenAI `tool_calls` and Anthropic `tool_use`), tools, test harness | golden test configuration |
 
 ## Adding models
 
@@ -184,7 +237,8 @@ athanor/
 ├── tests/         test.h (runner) util.h tiny.h test_core.c test_model.c test_ops.c test_golden.c test_forward.c ...
 │                  golden/ (dump.py, requirements.txt; data/ generated, not committed)
 └── docs/          ARCHITECTURE.md PLAN.md STATUS.md status_extended.md MODELS.md BENCHMARKS.md
-                   contract/ program/ results/
+                   CHANGE-*.md (specification changes, applied as recorded in STATUS.md)
+                   contract/ program/ proposals/ results/
 ```
 
 ## What athanor writes itself instead of using libraries

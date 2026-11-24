@@ -4,7 +4,7 @@ The contract between pipelines and model families, and the static registry. Intr
 
 | File | Content |
 | --- | --- |
-| `model.h` | `ath_role` and `ath_role_name`, param flags, `ath_param`, the layer schedule `ath_layer`, ignored groups `ath_ignored`, state kinds and specs (`ath_state_spec`), `ath_model`, `ath_state`, `ath_batch`, `ath_hooks`, `ath_family` (`match`, `load`, `forward`); the functions of `registry.c` and `state.c` |
+| `model.h` | `ath_role` and `ath_role_name`, param flags, `ath_param`, the layer schedule `ath_layer`, ignored groups `ath_ignored` (their tensors are params flagged `ATH_P_UNUSED`), state kinds and specs (`ath_state_spec`), `ath_model`, `ath_state`, `ath_batch`, `ath_hooks`, `ath_family` (`match`, `load`, `forward`); the functions of `registry.c` and `state.c` |
 | `registry.c` | the compiled-in families (from the Makefile `FAMILIES` list through the generated `families.h`); `ath_model_open(dir)` reads `config.json`, picks the family whose `match` accepts it, maps the checkpoint, calls `load`, then runs the coverage check |
 | `state.c` | `ath_state_bytes`, `ath_state_init`, `ath_state_reset`: the state of one sequence from the model's specs, in host memory; `ath_model_forward`: argument checks, the family's `forward` (with the caller's thread pool), scratch memory released, `n_past` advanced |
 
@@ -57,7 +57,7 @@ The logits tensor has one row per token or one row for the last token. `n_past` 
 
 ## The coverage rule
 
-After the family's `load`, the registry checks that every checkpoint tensor is either viewed by at least one param or matched by exactly one ignored group (never both), and that every param is a contiguous view inside the tensor it names. Anything else fails with `ATH_ERR_FORMAT` and names the tensor. Families only have to look for the tensors they need; the registry catches the ones they did not expect.
+After the family's `load`, the registry checks that every checkpoint tensor is viewed by at least one param, and that every param is a contiguous view inside the tensor it names. Tensors the text path does not use (the vision encoder of a vision-language checkpoint, a head for a later step) are bound too, as params flagged `ATH_P_UNUSED` (role other, layer −1), and belong to an ignored group the family declares with a prefix and a reason. The registry checks that each group and the unused params coincide: a tensor of a group is viewed by unused params only and is in no other group, and every unused param views a tensor of some group. So no tensor is ignored silently: it is either used or bound as unused with a reason. Anything else fails with `ATH_ERR_FORMAT` and names the tensor. Families only have to look for the tensors they need; the registry catches the ones they did not expect. (Until 2026-11-24, CHANGE-001, the tensors of an ignored group were left unbound.)
 
 ## Why roles and flags
 
