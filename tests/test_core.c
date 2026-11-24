@@ -12,6 +12,9 @@
 #include "core/json.h"
 #include "core/safetensors.h"
 #include "core/tensor.h"
+#include "core/threads.h"
+
+#include <pthread.h>
 
 #include <stdint.h>
 #include <unistd.h>
@@ -875,6 +878,112 @@ ATH_TEST(safetensors_real_model)
 
 /* ---- runner --------------------------------------------------------------- */
 
+/* ---- threads -------------------------------------------------------------------- */
+
+enum { MAX_TASKS = 12 };
+
+/* Each task counts its own runs: a task run twice, or by two threads, shows. */
+static void count_task(void *ctx, int32_t task, int32_t n_tasks)
+{
+    int32_t *runs = ctx;
+    if (n_tasks <= MAX_TASKS)
+        runs[task]++;
+}
+
+static bool each_ran_once(const int32_t *runs, int32_t n_tasks)
+{
+    for (int32_t i = 0; i < MAX_TASKS; i++)
+        if (runs[i] != (i < n_tasks))
+            return false;
+    return true;
+}
+
+typedef struct {
+    int32_t order[MAX_TASKS];
+    int32_t n;
+} order_log;
+
+static void log_task(void *ctx, int32_t task, int32_t n_tasks)
+{
+    (void)n_tasks;
+    order_log *l = ctx;
+    l->order[l->n++] = task;
+}
+
+ATH_TEST(pool_runs_every_task_once)
+{
+    ath_arena a;
+    ath_arena_init(&a, 0);
+    ath_pool p = {.n_threads = 0};
+    ATH_EXPECT_STATUS(ath_pool_init(&p, 0, &a), ATH_ERR_INVALID_ARG);
+    ATH_EXPECT_STATUS(ath_pool_init(&p, 2, NULL), ATH_ERR_INVALID_ARG);
+    ATH_EXPECT(ath_pool_default_threads() >= 1);
+
+    /* no pool, or a pool of one thread: in order, on the caller */
+    ATH_EXPECT_EQ_INT(ath_pool_threads(NULL), 1);
+    order_log l = {.n = 0};
+    ath_pool_run(NULL, 4, log_task, &l);
+    ATH_EXPECT(l.n == 4 && l.order[0] == 0 && l.order[1] == 1 && l.order[2] == 2 && l.order[3] == 3);
+
+    /* fewer, as many and more tasks than threads, run after run */
+    for (int32_t threads = 1; threads <= 5; threads += 2) {
+        ATH_REQUIRE_OK(ath_pool_init(&p, threads, &a));
+        ATH_EXPECT_EQ_INT(ath_pool_threads(&p), threads);
+        bool ok = true;
+        for (int32_t n = 0; n <= MAX_TASKS; n++)
+            for (int rep = 0; rep < 50; rep++) {
+                int32_t runs[MAX_TASKS] = {0};
+                ath_pool_run(&p, n, count_task, runs);
+                ok = ok && each_ran_once(runs, n);
+            }
+        ATH_EXPECT(ok);
+        ath_pool_free(&p);
+        ATH_EXPECT_EQ_INT(ath_pool_threads(&p), 1);
+    }
+    ath_pool_free(&p);   /* freeing again is harmless */
+    ath_arena_free(&a);
+}
+
+typedef struct {
+    ath_pool *pool;
+    bool      ok;
+} caller;
+
+static void *call_pool(void *arg)
+{
+    caller *c = arg;
+    for (int rep = 0; rep < 200; rep++) {
+        int32_t runs[MAX_TASKS] = {0};
+        ath_pool_run(c->pool, 7, count_task, runs);
+        c->ok = c->ok && each_ran_once(runs, 7);
+    }
+    return NULL;
+}
+
+/* Runs from several threads on one pool take turns and stay complete. */
+ATH_TEST(pool_shared_by_threads)
+{
+    ath_arena a;
+    ath_arena_init(&a, 0);
+    ath_pool p = {.n_threads = 0};
+    ATH_REQUIRE_OK(ath_pool_init(&p, 4, &a));
+    caller c[4];
+    pthread_t th[4];
+    int started = 0;
+    for (; started < 4; started++) {
+        c[started] = (caller){.pool = &p, .ok = true};
+        if (pthread_create(&th[started], NULL, call_pool, &c[started]) != 0)
+            break;
+    }
+    for (int i = 0; i < started; i++)
+        pthread_join(th[i], NULL);
+    ath_pool_free(&p);
+    ATH_EXPECT(started == 4);
+    for (int i = 0; i < started; i++)
+        ATH_EXPECT(c[i].ok);
+    ath_arena_free(&a);
+}
+
 static const ath_test_case tests[] = {
     ATH_TEST_ENTRY(status_strings),
     ATH_TEST_ENTRY(check_propagates),
@@ -898,6 +1007,8 @@ static const ath_test_case tests[] = {
     ATH_TEST_ENTRY(safetensors_rejects_bad_headers),
     ATH_TEST_ENTRY(safetensors_sharded),
     ATH_TEST_ENTRY(safetensors_real_model),
+    ATH_TEST_ENTRY(pool_runs_every_task_once),
+    ATH_TEST_ENTRY(pool_shared_by_threads),
 };
 
 int main(int argc, char **argv)

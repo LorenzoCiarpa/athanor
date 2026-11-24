@@ -10,7 +10,7 @@ The bottom layer: memory, tensors, files, parsing, threads. No GPU code and no k
 | `file.h`, `file.c` | read-only `mmap`, `pread`, path join; async reads later (io_uring via raw syscalls) | 1 |
 | `json.h`, `json.c` | read-only JSON parser into an arena; lookup by key, index and dotted path | 1 |
 | `safetensors.h`, `safetensors.c` | single and multi-shard readers, zero-copy views; writer added in phase 4 for checkpoint export | 1 |
-| `threads.c/.h` | fixed pthread pool for CPU work (experts, dequantization, I/O completion) | later |
+| `threads.c/.h` | fixed pthread pool for CPU work: `ath_pool_init`, `ath_pool_run` (fork and join, tasks assigned statically, runs from several threads take turns), `ath_pool_free`; first user `ath_matmul_fast`; later experts, dequantization, I/O completion | 4 |
 | `rng.c/.h` | small deterministic PRNG for sampling, tests and training | later |
 
 ## Conventions
