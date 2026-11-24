@@ -5,7 +5,9 @@
 #   make check-alloc  verify that inspect allocates only through arenas
 #   make golden     regenerate tests/golden/data from the reference implementation
 #   make DEBUG=1    -O0 -g, ATH_ASSERT enabled, address and UB sanitizers
-#   make cuda/hip   GPU builds (arrive in step 6 and step 11)
+#   make cuda       the same with the CUDA backend, in build/cuda; `make cuda test`
+#                   runs every suite of that build (CUDA_HOME and CUDA_ARCH below)
+#   make hip        the HIP build (arrives in step 11)
 #   make clean
 
 FAMILIES ?= qwen35
@@ -16,7 +18,22 @@ export ATH_MODEL_DIR ATH_GOLDEN_DIR
 # Python of the golden-data environment (tests/golden/README.md).
 GOLDEN_PYTHON ?= tests/golden/.venv/bin/python
 CC       ?= cc
-ifeq ($(DEBUG),1)
+
+# GPU backend: none (the default) or cuda, chosen by naming the goal `cuda`
+# anywhere on the command line, so that `make cuda test` tests the CUDA build.
+GPU ?= none
+ifneq ($(filter cuda,$(MAKECMDGOALS)),)
+GPU := cuda
+endif
+# CUDA toolkit 12.8 or newer, the first that targets sm_120 (RTX 50 series).
+# Set CUDA_HOME if the toolkit is not in /usr/local/cuda.
+CUDA_HOME ?= /usr/local/cuda
+CUDA_ARCH ?= 120
+NVCC      := $(CUDA_HOME)/bin/nvcc
+
+ifeq ($(GPU),cuda)
+BUILD    ?= build/cuda$(if $(filter 1,$(DEBUG)),-debug)
+else ifeq ($(DEBUG),1)
 BUILD    ?= build/debug
 else
 BUILD    ?= build
@@ -32,6 +49,20 @@ endif
 CFLAGS += -Isrc
 LDLIBS := -lm -lpthread
 
+# Device code: CUDA C (the C subset of CUDA C++), machine code for one
+# architecture. The CUDA runtime is linked statically, so the binary needs
+# only the driver at run time, which the runtime loads itself.
+NVCCFLAGS := -std=c++17 -gencode arch=compute_$(CUDA_ARCH),code=sm_$(CUDA_ARCH) -Werror all-warnings \
+             -Xcompiler -Wall,-Wextra,-Werror,-fno-exceptions,-fno-rtti -Isrc -MMD -MP
+ifeq ($(DEBUG),1)
+NVCCFLAGS += -O0 -g -lineinfo -DATH_DEBUG -Xcompiler -fsanitize=address,-fsanitize=undefined,-fno-omit-frame-pointer
+else
+NVCCFLAGS += -O2 -lineinfo
+endif
+ifeq ($(GPU),cuda)
+LDLIBS += $(CUDA_HOME)/lib64/libcudart_static.a -ldl -lrt
+endif
+
 # Families are selected at compile time (docs/ARCHITECTURE.md, rule 1): each
 # one is a folder src/models/<name>/ that defines `ath_family_<name>`, and the
 # registry learns the list from the generated header $(BUILD)/gen/families.h.
@@ -44,15 +75,23 @@ CORE_SRC  := $(wildcard src/core/*.c)
 OPS_SRC   := $(wildcard src/ops/*.c)
 TEXT_SRC  := $(wildcard src/text/*.c)
 MODEL_SRC := $(wildcard src/model/*.c)
-LIB_SRC   := $(CORE_SRC) $(OPS_SRC) $(TEXT_SRC) $(MODEL_SRC) $(FAMILY_SRC)
-LIB_OBJ   := $(LIB_SRC:%.c=$(BUILD)/obj/%.o)
+# The backend: gpu.cu with a GPU, gpu_none.c without (src/backend/README.md).
+BACKEND_SRC := $(filter-out src/backend/gpu_none.c,$(wildcard src/backend/*.c))
+ifeq ($(GPU),cuda)
+GPU_SRC   := src/backend/gpu.cu
+else
+BACKEND_SRC += src/backend/gpu_none.c
+GPU_SRC   :=
+endif
+LIB_SRC   := $(CORE_SRC) $(OPS_SRC) $(TEXT_SRC) $(MODEL_SRC) $(FAMILY_SRC) $(BACKEND_SRC)
+LIB_OBJ   := $(LIB_SRC:%.c=$(BUILD)/obj/%.o) $(GPU_SRC:%.cu=$(BUILD)/obj/%.o)
 
 TOOL_SRC := $(wildcard tools/*.c)
 TOOL_OBJ := $(TOOL_SRC:%.c=$(BUILD)/obj/%.o)
 TESTS    := $(BUILD)/test_core $(BUILD)/test_model $(BUILD)/test_ops $(BUILD)/test_golden \
-            $(BUILD)/test_forward $(BUILD)/test_text
+            $(BUILD)/test_forward $(BUILD)/test_text $(BUILD)/test_backend
 
-.PHONY: all cpu cuda hip test check-alloc golden clean FORCE
+.PHONY: all cpu cuda cuda-check hip test check-alloc golden clean FORCE
 .SECONDARY:
 .DEFAULT_GOAL := cpu
 
@@ -69,6 +108,10 @@ $(BUILD)/obj/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+$(BUILD)/obj/%.o: %.cu | cuda-check
+	@mkdir -p $(dir $@)
+	$(NVCC) $(NVCCFLAGS) -c -o $@ $<
+
 # One ATH_FAMILY(name) line per family. Rewritten only when the list changes,
 # so that a rebuild with the same FAMILIES does not recompile the registry.
 $(FAMILIES_H): FORCE
@@ -80,8 +123,12 @@ $(BUILD)/obj/src/model/registry.o: $(FAMILIES_H)
 
 FORCE:
 
+# AddressSanitizer reserves the address range the NVIDIA driver maps its
+# memory into; the CUDA debug build lets the driver have it.
+TEST_ENV := $(if $(and $(filter cuda,$(GPU)),$(filter 1,$(DEBUG))),ASAN_OPTIONS=protect_shadow_gap=0)
+
 test: $(TESTS) $(BUILD)/athanor
-	@set -e; for t in $(TESTS); do echo "== $$t"; ./$$t; done
+	@set -e; for t in $(TESTS); do echo "== $$t"; $(TEST_ENV) ./$$t; done
 	@set -e; if [ -d "$(ATH_MODEL_DIR)" ]; then \
 		echo "== athanor inspect $(ATH_MODEL_DIR)"; \
 		./$(BUILD)/athanor inspect "$(ATH_MODEL_DIR)" > /dev/null; echo "ok"; \
@@ -106,8 +153,12 @@ golden:
 	$(GOLDEN_PYTHON) tests/golden/dump.py "$(ATH_MODEL_DIR)" --out "$(ATH_GOLDEN_DIR)"
 	$(GOLDEN_PYTHON) tests/golden/text.py "$(ATH_MODEL_DIR)" --out "$(ATH_GOLDEN_DIR)"
 
-cuda:
-	@echo "make cuda: the CUDA backend arrives in step 6 (docs/PLAN.md section 4)" >&2; exit 1
+# `make cuda` builds everything with the CUDA backend; with `test` it also
+# runs the suites of that build (GPU is set from the goals, above).
+cuda: cuda-check $(BUILD)/athanor
+
+cuda-check:
+	@sh tools/dev/check_nvcc.sh "$(NVCC)" $(CUDA_ARCH)
 
 hip:
 	@echo "make hip: the HIP backend arrives in step 11 (docs/PLAN.md section 4)" >&2; exit 1
