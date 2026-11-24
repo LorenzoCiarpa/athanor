@@ -15,6 +15,7 @@ How to read it:
   - [Step 1: core and `athanor inspect`](#step-1-core-and-athanor-inspect)
   - [Step 2: contract and family loading](#step-2-contract-and-family-loading)
   - [Step 3: CPU reference ops and golden harness](#step-3-cpu-reference-ops-and-golden-harness)
+  - [Step 4: CPU forward](#step-4-cpu-forward)
 - [Files by step](#files-by-step)
 
 ---
@@ -473,42 +474,159 @@ Commit `3cbc234`.
 
 Commits `3cbc234`, `c508b76`. This file, `docs/status_extended.md`, was added after step 3 was closed.
 
+### Step 4: CPU forward
+
+Done 2026-11-24 on branch `step4-cpu-forward`. Goal: the whole Qwen3.5-0.8B forward pass on the CPU, composed from the step 3 ops, with the per-sequence state that prefill and decode need, reached by pipelines only through the contract; and evidence on fixed prompts that its logits are as close to the exact model as the reference implementation's.
+
+#### 4.1 End-to-end metric
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `docs/STATUS.md` | Changed | Step 4 plan (tasks, acceptance criteria); step 3 moved to completed steps; the open question on the end-to-end metric resolved |
+
+What was decided (before any measurement):
+
+- The gate is option (b) of the open question: the mean KL against an fp32 run of the reference over every position of the fixed prompts, prefill and decode, no larger than the bf16 reference's mean KL against the same run. The reference computes logits in bf16 and rounds attention scores to bf16, athanor does neither, so the logits cannot match bit for bit; the question is whether athanor is at least as close to the exact model.
+- Greedy agreement where it is meaningful: athanor's greedy token must equal the fp32 reference's wherever the fp32 top-2 margin is larger than the bf16 noise, the largest change of that margin between the fp32 and the bf16 reference.
+- Option (a), the residual stream entering every layer, is a diagnostic, not gated.
+- In addition, athanor runs with f32 activations against the fp32 reference within a tolerance justified like the op tolerances: a tight check of the composition that the bf16 noise would hide.
+
+Commit `08ca309`.
+
+#### 4.2 The contract: state, batches, hooks, forward
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `src/model/model.h` | Changed | `ath_state_kind` (KV, conv, recurrent) and `ath_state_kind_name`; `ath_state_spec` (kind, layer, `fixed` and `per_token` element counts); `states` / `n_states` in `ath_model`; `ath_state` (activation dtype, capacity, `n_past`, one buffer per spec); `ath_batch` (tokens, optional f32 logits for every token or the last); `ath_hooks` with `on_residual`; `forward` in `ath_family`; the functions of `state.c` |
+| `src/model/state.c` | New | The state of one sequence and the only way into a family's forward pass |
+
+What was implemented:
+
+- **Specs in elements.** The element type follows from the kind and the activation dtype the state is created with: KV and conv state hold activations (bf16 or f32), the recurrent state is always fp32. The first design counted bytes; with two activation dtypes a byte count would have to be declared twice.
+- `ath_state_bytes`: the bytes of one sequence for a capacity, every buffer rounded up to 64 bytes, overflow checked.
+- `ath_state_init`: one 64-byte aligned host buffer per spec from an arena, then a reset. Accepts bf16 or f32 activations and a capacity of at least one token.
+- `ath_state_reset`: `n_past = 0`, conv and recurrent state zeroed; the KV cache is left as it is, since positions at or past `n_past` are never read.
+- `ath_model_forward`: checks everything a family would otherwise check (model, batch, state and scratch present; the family has a forward pass; the state initialized; at least one token; room in the state; every token id inside the vocabulary; logits f32, host memory, contiguous, `[n_tokens, vocab]` or `[1, vocab]`), marks the scratch arena, calls the family, releases the scratch memory, and advances `n_past` on success. A batch that does not fit leaves the state untouched; a failure inside the family leaves it undefined until a reset.
+- `on_residual(u, layer, x)`: the residual stream entering layer `layer`, and with `layer == n_layers` the stream entering the final norm. Its first users are the forward tests; abliteration will capture it in phase 3. The matmul hook of the design (`on_matmul_in`) waits for its first user in phase 2.
+- `forward` takes the model as `const` and a scratch arena, two departures from the first design recorded in `docs/ARCHITECTURE.md`.
+
+Commit `b8a0a56`.
+
+#### 4.3 `src/models/qwen35/forward.c`: the forward pass
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `src/models/qwen35/forward.c` | New | The forward pass composed from the CPU reference ops |
+| `src/models/qwen35/qwen35.h` | Changed | `ath_qwen35_layer` (the params of a layer by what the forward pass does with them, and its state indices); `ath_qwen35_model` (the family data: config, layer table, embedding, final norm, output head); `ath_qwen35_forward` |
+| `src/models/qwen35/weights.c` | Changed | `bind` records every bound param in the layer table (`add` returns the param, whose address is stable because `m->params` is allocated once with its capacity); the output head is the embedding when tied |
+| `src/models/qwen35/family.c` | Changed | `load` allocates the family data and the layer table, then declares the state specs (a KV spec per attention layer, a conv and a recurrent spec per Gated DeltaNet layer, in layer order); `.forward` |
+
+What was implemented:
+
+- **One path for every call.** T tokens at positions `n_past …`: a whole prompt, a piece of one and a single decode token run the same code. Per layer, as in the contract: input RMSNorm (zero-centered), the mixer, the residual addition, post-attention RMSNorm, the SwiGLU MLP, the residual addition. Then the final norm and the logits in fp32, for every token or only the last.
+- **Attention.** `q_proj` gives query and output gate interleaved per head; both are copied out into contiguous tensors (the ops take contiguous tensors only; the copies are exact). Values go from `v_proj` straight into the KV cache; keys after QK-norm and RoPE. `ath_attn_ref` runs over every position so far; output gate, `o_proj`.
+- **Gated DeltaNet.** The four projections; the causal convolution with SiLU over all q, k, v channels, continuing from the conv state; q, k, v copied out of the convolution output; L2 norm of q and k into fp32 (the reference normalizes after its fp32 cast) with the fixed epsilon 1e-6; the gates (`beta` rounded to the activation dtype as the reference computes it on its bf16 projection, `g` in fp32); the delta rule on the fp32 recurrent state with the query scale `1/sqrt(dk)`; the gated RMSNorm per value head with `z`; `out_proj`.
+- **Activation dtype.** Every activation is stored in the state's dtype. bf16 rounds each op's output once; f32 keeps everything in fp32, an exact forward pass. What the reference keeps in fp32 in any case stays fp32.
+- **Memory.** Working tensors come from the scratch arena and are released after each layer: one layer's worth for the tokens of the call (10 MiB for the 75-token prompt). No heap allocation.
+- MoE layers fail with `ATH_ERR_UNSUPPORTED` until step 12.
+- First run on the real checkpoint: the 75-token golden prompt gives the reference's greedy token, at 0.29 s per token (the scalar `matmul_ref`, about 3.6 GFLOP/s, is almost all of it).
+
+Commit `1344b30`.
+
+#### 4.4 `tests/golden/dump.py`: forward records
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `tests/golden/dump.py` | Changed | Forward records after the op records |
+| `tests/golden/README.md` | Changed | Forward records section, new size and time |
+
+What was implemented:
+
+- Two prompts: the op prompt (75 tokens) and a chat-formatted one (28 tokens: the checkpoint's template with the generation prompt, written out as text so that the data does not depend on the template). Each is followed by 8 greedy decode steps of the bf16 reference with its cache.
+- `run_forward` captures, with pre-hooks on every decoder layer and on the final norm, the residual stream entering each, plus the logits, for the prefill and every decode step.
+- The same tokens through the reference loaded in fp32 (every weight widened exactly; the f32 tensors checked to equal the restored ones of the bf16 model).
+- Per prompt: tokens, residual stream and logits of both runs, and in the manifest the bf16 reference's KL against the fp32 run (mean, max) and the number of positions where their greedy choices differ. On the data of 2026-11-24: mean KL 5.3e-4 (prose) and 4.4e-4 (chat).
+- The golden data grows to 620 MiB and about 9 s.
+
+Commit `ed38a7c`.
+
+#### 4.5 `tests/test_forward.c` and `tests/tiny.h`
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `tests/tiny.h` | New | The tiny synthetic Qwen3.5 checkpoints, moved out of `test_model.c` and shared; new: pseudo-random contents from a seed, and `real_dtypes` (`A_log` and `linear_attn.norm.weight` in F32, as published) |
+| `tests/test_model.c` | Changed | Uses `tests/tiny.h` |
+| `tests/test_forward.c` | New | The forward pass through the contract only |
+| `Makefile` | Changed | `test_forward` in `TESTS` |
+
+What was implemented:
+
+- `state_specs`: the specs of a tiny model (kinds, layers, element counts), `ath_state_bytes` in bf16 and f32, kind names, `ath_state_init` errors, `ath_state_reset`.
+- `forward_rejects`: every argument check of `ath_model_forward`, the state filling up, the scratch arena released after every call, MoE unsupported.
+- `forward_pieces_bf16`, `forward_pieces_f32`: 12 tokens all at once, as 5 + 1 + 6 and one at a time give bit-identical logits and states; logits of the last token alone equal the last row; a reset state runs the sequence again bit for bit.
+- `forward_hooks`: `on_residual` called once per layer and for the final norm, in order, with the call's rows and the activation dtype; the stream entering layer 0 is the embedding of the tokens.
+- `real_state_specs`: 6 KV, 18 conv and 18 recurrent buffers on Qwen3.5-0.8B; 18.6 MiB fixed plus 12 KiB per token in bf16.
+- `forward_golden`: four runs in parallel threads (each prompt in bf16 and in f32, the prompt in one call and then one token at a time), with `on_residual` comparing the residual stream with both reference runs as it goes. Results: the bf16 mean KL over all 119 positions 3.0e-4 against the reference's 5.0e-4; greedy agreement at all 104 positions above the bf16 noise (0.21); with f32 activations, mean KL 4e-11, the residual stream within 4.7e-5 and the logits within 2.7e-5 of the fp32 reference (tolerances 2e-4 and 1e-4). A DEBUG build runs the first 4 positions only.
+- What the measurements showed along the way, recorded in `tests/README.md` and the contract: per prompt, athanor beats the reference on prose (1.7e-4 against 5.3e-4) but not on chat (6.0e-4 against 4.4e-4), because the chat prompt's first position is ill-conditioned (a near-cancellation in layer 15 that turns one bf16 rounding into a 10% error; the reference's own KL there goes from 2.7e-4 to 5.5e-3 when two small tensors are rounded as transformers does by default). The gate pools all positions, as the resolution of the open question wrote it; the per-prompt test that was implemented first failed on chat, and the reference with its default sdpa attention would fail it too.
+- A tiny-model check of bf16 against f32 activations was dropped: with uniform random weights the network is ill-conditioned (bf16 and f32 logits differ by 2% to 30% depending on the seed), so no fixed bound would mean anything; the real checkpoint does that check.
+
+Commit `ed38a7c`.
+
+#### 4.6 Documentation and closing step 4
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `docs/ARCHITECTURE.md` | Changed | The contract as of step 4 (state specs, `ath_state`, `ath_batch`, `ath_hooks`, `forward`, the functions of `state.c`); the departures from the first design; a section on state and the forward pass; tree (`state.c`, `tiny.h`, `test_forward.c`) |
+| `src/model/README.md` | Changed | `state.c`; running a model; state specs |
+| `src/models/qwen35/README.md` | Changed | What `qwen35.h`, `family.c`, `weights.c` and `forward.c` hold now; the forward pass and the layout of the state buffers |
+| `docs/contract/qwen35-0.8b.md` | Changed | The logits difference measured; End-to-end section (results, the ill-conditioned position) |
+| `tests/README.md` | Changed | Forward pass section (checks, measured values, why the gate pools the prompts, environment variables), `tiny.h`, `test_forward` in the suite table |
+| `docs/MODELS.md` | Changed | Status: the forward pass checked end to end |
+| `docs/program/PROGRAM.md` | Changed | Rows 3, 4 and 9: the forward pass, the composed Gated DeltaNet layer, the CPU state of one sequence |
+| `docs/STATUS.md` | Changed | Step 4 tasks, criteria and results; step 5 preview; decisions in the log |
+
+Commit `docs: close step 4`.
+
 ---
 
 ## Files by step
 
 Every file of the repository and the steps that created or changed it (documentation-only edits included).
 
-| File | Step 1 | Step 2 | Step 3 |
-| --- | --- | --- | --- |
-| `Makefile` | 1.1, 1.8 | 2.3, 2.6 | 3.3, 3.4, 3.5, 3.6 |
-| `src/core/base.{h,c}` | 1.2 | | |
-| `src/core/arena.{h,c}` | 1.3 | | |
-| `src/core/file.{h,c}` | 1.4, 1.7 | | |
-| `src/core/json.{h,c}` | 1.5 | | |
-| `src/core/tensor.{h,c}` | 1.6 | | 3.2 |
-| `src/core/safetensors.{h,c}` | 1.7 | | |
-| `src/model/model.h` | | 2.2 | |
-| `src/model/registry.c` | | 2.3 | |
-| `src/models/qwen35/qwen35.h`, `config.c` | | 2.4 | |
-| `src/models/qwen35/weights.c`, `family.c` | | 2.5 | |
-| `src/ops/ops.h`, `check.h`, `embed.c`, `matmul.c`, `norm.c`, `rope.c`, `act.c`, `attn.c`, `conv.c`, `gdn.c` | | | 3.3 |
-| `tools/athanor.c`, `commands.h` | 1.8 | | |
-| `tools/inspect.c` | 1.8 | 2.6 | |
-| `tools/dev/alloc_trace.c` | 1.8 | | |
-| `tools/dev/check_alloc.sh` | 1.8 | 2.6 | |
-| `tests/test.h` | 1.9 | | |
-| `tests/test_core.c` | 1.9 | 2.7 | |
-| `tests/util.h`, `tests/test_model.c` | | 2.7 | |
-| `tests/test_ops.c` | | | 3.5 |
-| `tests/test_golden.c` | | | 3.6 |
-| `tests/golden/dump.py`, `README.md` | | | 3.4 |
-| `tests/golden/requirements.in`, `requirements.txt` | | | 3.1 |
-| `docs/contract/qwen35-0.8b.md` | closing | 2.1 | 3.1, 3.7 |
-| `docs/contract/qwen35-35b-a3b.md` | | 2.1 | |
-| `docs/MODELS.md` | | 2.1 | 3.7 |
-| `docs/ARCHITECTURE.md` | closing | 2.2 | 3.7 |
-| `docs/STATUS.md` | closing | 2.1 to 2.7, closing | 3.1, closing |
-| `docs/program/PROGRAM.md` | closing | closing | 3.7 |
-| `AGENTS.md` | | 2.3 | 3.7 |
-| module READMEs | closing (`src/core`, `tests`, `tools`) | 2.2, 2.5, 2.6, 2.7 (`src/model`, `src/models/qwen35`, `tools`, `tests`) | 3.2, 3.3, 3.6, 3.7 (`src/core`, `src/ops`, `tests`, `tests/golden`, `src/backend`) |
+| File | Step 1 | Step 2 | Step 3 | Step 4 |
+| --- | --- | --- | --- | --- |
+| `Makefile` | 1.1, 1.8 | 2.3, 2.6 | 3.3, 3.4, 3.5, 3.6 | 4.5 |
+| `src/core/base.{h,c}` | 1.2 | | | |
+| `src/core/arena.{h,c}` | 1.3 | | | |
+| `src/core/file.{h,c}` | 1.4, 1.7 | | | |
+| `src/core/json.{h,c}` | 1.5 | | | |
+| `src/core/tensor.{h,c}` | 1.6 | | 3.2 | |
+| `src/core/safetensors.{h,c}` | 1.7 | | | |
+| `src/model/model.h` | | 2.2 | | 4.2 |
+| `src/model/registry.c` | | 2.3 | | |
+| `src/model/state.c` | | | | 4.2 |
+| `src/models/qwen35/qwen35.h`, `config.c` | | 2.4 | | 4.3 (`qwen35.h`) |
+| `src/models/qwen35/weights.c`, `family.c` | | 2.5 | | 4.3 |
+| `src/models/qwen35/forward.c` | | | | 4.3 |
+| `src/ops/ops.h`, `check.h`, `embed.c`, `matmul.c`, `norm.c`, `rope.c`, `act.c`, `attn.c`, `conv.c`, `gdn.c` | | | 3.3 | |
+| `tools/athanor.c`, `commands.h` | 1.8 | | | |
+| `tools/inspect.c` | 1.8 | 2.6 | | |
+| `tools/dev/alloc_trace.c` | 1.8 | | | |
+| `tools/dev/check_alloc.sh` | 1.8 | 2.6 | | |
+| `tests/test.h` | 1.9 | | | |
+| `tests/test_core.c` | 1.9 | 2.7 | | |
+| `tests/util.h`, `tests/test_model.c` | | 2.7 | | 4.5 (`test_model.c`) |
+| `tests/test_ops.c` | | | 3.5 | |
+| `tests/test_golden.c` | | | 3.6 | |
+| `tests/tiny.h`, `tests/test_forward.c` | | | | 4.5 |
+| `tests/golden/dump.py`, `README.md` | | | 3.4 | 4.4 |
+| `tests/golden/requirements.in`, `requirements.txt` | | | 3.1 | |
+| `docs/contract/qwen35-0.8b.md` | closing | 2.1 | 3.1, 3.7 | 4.6 |
+| `docs/contract/qwen35-35b-a3b.md` | | 2.1 | | |
+| `docs/MODELS.md` | | 2.1 | 3.7 | 4.6 |
+| `docs/ARCHITECTURE.md` | closing | 2.2 | 3.7 | 4.6 |
+| `docs/STATUS.md` | closing | 2.1 to 2.7, closing | 3.1, closing | 4.1, closing |
+| `docs/program/PROGRAM.md` | closing | closing | 3.7 | 4.6 |
+| `docs/status_extended.md` | | | closing | 4.6 |
+| `AGENTS.md` | | 2.3 | 3.7 | |
+| module READMEs | closing (`src/core`, `tests`, `tools`) | 2.2, 2.5, 2.6, 2.7 (`src/model`, `src/models/qwen35`, `tools`, `tests`) | 3.2, 3.3, 3.6, 3.7 (`src/core`, `src/ops`, `tests`, `tests/golden`, `src/backend`) | 4.6 (`src/model`, `src/models/qwen35`, `tests`, `tests/golden`) |

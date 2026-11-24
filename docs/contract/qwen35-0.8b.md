@@ -174,7 +174,7 @@ logits = rmsnorm(x_last; norm) · embed_tokensᵀ      tie_word_embeddings: true
 
 - The residual additions happen in the activation dtype (bf16); the reference keeps no fp32 copy of the residual stream across layers.
 - The layer schedule is `text_config.layer_types` (`linear_attention` → Gated DeltaNet, `full_attention`). When the key is absent the reference derives it from `full_attention_interval` (default 4): layer `i` is full attention iff `(i + 1) % interval == 0`.
-- The reference computes logits with `lm_head` in the activation dtype (bf16). `docs/MODELS.md` asks for fp32 logits in athanor: a deliberate difference, to be measured in step 4.
+- The reference computes logits with `lm_head` in the activation dtype (bf16). `docs/MODELS.md` asks for fp32 logits in athanor: a deliberate difference, measured in step 4. On the prefill of the two forward prompts of the golden data, computing the reference's own logits in fp32 from its bf16 final hidden state lowers its mean KL against an fp32 run of the model from 5.4e-4 to 2.2e-4 (prose) and from 5.1e-4 to 3.6e-4 (chat): the bf16 rounding of the logits is about half of the reference's distance from the exact model on prose.
 
 ### RMSNorm (zero-centered)
 
@@ -239,6 +239,18 @@ y = (w · n) · silu(z)                 w plain (f32 in the checkpoint), silu(z)
 `A_log` and `linear_attn.norm.weight` are f32 in the checkpoint; every other tensor is bf16. The reference upcasts `A_log` itself (`A_log.float()`). athanor uses the checkpoint values as stored.
 
 Resolved in step 3: transformers 5.24.0 rounds both tensors to bf16 on load, with `dtype="auto"` as well as `dtype=torch.bfloat16` (the model has no `_keep_in_fp32_modules`). The forward code works unchanged with f32 values: `A_log.float()` is a no-op, and in the gated RMSNorm an f32 weight promotes `w · n` to fp32 before the gate. The golden data restores the stored f32 values after loading (`tests/golden/README.md`), so the reference and athanor compute with the same weights. On the golden prompt, against an fp32 run of the whole model, the bf16 reference has a mean KL of 5.4e-4 (max 1.4e-3) with the stored values and 5.7e-4 (max 2.9e-3) with the default rounding.
+
+### End-to-end (step 4)
+
+athanor's forward pass (`src/models/qwen35/forward.c`) composes the ops above in this order. Measured by `tests/test_forward.c` against the forward records of the golden data (two prompts, 75 + 8 and 28 + 8 positions, prefill and greedy decode; `tests/README.md`, Forward pass):
+
+| Run | Against | Result |
+| --- | --- | --- |
+| athanor, f32 activations | reference loaded in fp32 | mean KL 4e-11 (prose) and 5e-11 (chat); residual stream within 4.7e-5 at every layer, logits within 2.7e-5 |
+| athanor, bf16 activations | reference loaded in fp32 | mean KL 3.0e-4 over all 119 positions (prose 1.7e-4, chat 6.0e-4) |
+| reference, bf16 (eager) | reference loaded in fp32 | mean KL 5.0e-4 (prose 5.3e-4, chat 4.4e-4) |
+
+The chat prompt's first position (`<|im_start|>`) is ill-conditioned. In layer 15 (full attention) the attention output nearly cancels the residual stream (RMS 0.53 and 0.27 give a sum of RMS 0.13), so the relative error of one bf16 rounding at the layer input becomes about 10% at its output, and the KL at that position depends on which way the roundings fall. The reference itself goes from a KL of 2.7e-4 there to 5.5e-3 when `A_log` and `linear_attn.norm.weight` are rounded to bf16 as transformers does by default; athanor's is 7.3e-3. Without that position, athanor's mean KL on chat is 4.1e-4 against the reference's 4.5e-4.
 
 ### MTP head
 

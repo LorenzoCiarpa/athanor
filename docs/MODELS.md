@@ -29,7 +29,7 @@ The alternative inside the same vendor is **Qwen3** (April 2025): classic transf
 
 Source of truth: the reference implementation in Hugging Face `transformers` (pinned version, file sha256 recorded) plus each model's `config.json`. Values marked *config* are read at load time and never hard-coded. Items marked **verify** must be confirmed against the reference before the corresponding kernel is written; the confirmed contract goes in `docs/contract/<model>.md`.
 
-Status (step 2, transformers 5.24.0): every **verify** item below is resolved in [`docs/contract/qwen35-0.8b.md`](contract/qwen35-0.8b.md) (RMSNorm, RoPE, output gate, L2 norm, Gated DeltaNet output) and [`docs/contract/qwen35-35b-a3b.md`](contract/qwen35-35b-a3b.md) (router, shared expert), except the MTP head, which transformers does not implement (step 13). Step 3 checked every dense op against the reference on the real Qwen3.5-0.8B weights, op by op ([`tests/README.md`](../tests/README.md), Tolerances).
+Status (step 2, transformers 5.24.0): every **verify** item below is resolved in [`docs/contract/qwen35-0.8b.md`](contract/qwen35-0.8b.md) (RMSNorm, RoPE, output gate, L2 norm, Gated DeltaNet output) and [`docs/contract/qwen35-35b-a3b.md`](contract/qwen35-35b-a3b.md) (router, shared expert), except the MTP head, which transformers does not implement (step 13). Step 3 checked every dense op against the reference on the real Qwen3.5-0.8B weights, op by op ([`tests/README.md`](../tests/README.md), Tolerances). Step 4 composed them into the forward pass and checked it end to end against the reference run in bf16 and in fp32 ([`docs/contract/qwen35-0.8b.md`](contract/qwen35-0.8b.md), End-to-end).
 
 ### Shared
 

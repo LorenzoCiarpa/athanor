@@ -1,6 +1,6 @@
 # tests/golden
 
-Golden data: what the pinned reference implementation computes, op by op, on the real weights. `tests/test_golden.c` replays it through athanor's `_ref` functions. Development only: Python is never needed to build, test without golden data, or run athanor.
+Golden data: what the pinned reference implementation computes, op by op and for the whole forward pass, on the real weights. `tests/test_golden.c` replays the ops through athanor's `_ref` functions; `tests/test_forward.c` runs the forward pass on the same tokens. Development only: Python is never needed to build, test without golden data, or run athanor.
 
 | File | Content |
 | --- | --- |
@@ -15,10 +15,10 @@ Golden data: what the pinned reference implementation computes, op by op, on the
 uv venv --python 3.14 tests/golden/.venv
 VIRTUAL_ENV=tests/golden/.venv uv pip install -r tests/golden/requirements.txt --index-strategy unsafe-best-match
 make golden                       # tests/golden/.venv/bin/python tests/golden/dump.py models/Qwen3.5-0.8B
-make test                         # test_golden replays it; skipped while data/ is missing
+make test                         # test_golden and test_forward use it; skipped while data/ is missing
 ```
 
-`dump.py` refuses to run unless transformers is 5.24.0, torch is 2.15.0+cpu, `modeling_qwen3_5.py` has the sha256 recorded in `docs/contract/qwen35-0.8b.md`, and none of `fla`, `causal_conv1d`, `kernels` is installed (any of them would replace the torch functions with fused kernels). It takes about 4 seconds and writes 434 MiB for Qwen3.5-0.8B; the numbers are reproducible run to run (one CPU thread).
+`dump.py` refuses to run unless transformers is 5.24.0, torch is 2.15.0+cpu, `modeling_qwen3_5.py` has the sha256 recorded in `docs/contract/qwen35-0.8b.md`, and none of `fla`, `causal_conv1d`, `kernels` is installed (any of them would replace the torch functions with fused kernels). It takes about 9 seconds and writes 620 MiB for Qwen3.5-0.8B (434 MiB of op records, the rest forward records); the numbers are reproducible run to run (one CPU thread).
 
 ## What is recorded
 
@@ -46,6 +46,20 @@ Records are captured with forward hooks on modules and by wrapping the module-le
 - `out32`: the same reference function recomputed in fp32 from the same inputs (weights widened, fp32 RoPE tables). For the Gated DeltaNet the fp32 rerun uses the recurrent form, athanor's algorithm, also for the chunked prefill. No bf16 rounding is left in `out32`, so it checks the math of the `_ref` functions tightly.
 
 Each record carries the checkpoint names of its weights and its parameters (eps, RoPE theta and dimension, attention scale, Gated DeltaNet query scale and L2-norm epsilon), read from the reference modules. `manifest.json` lists the records, the prompt and its tokens, the versions, the CPU, the sha256 of `config.json` and of the data file.
+
+## Forward records
+
+For the end-to-end comparison of step 4, `dump.py` then runs fixed prompts through the whole model twice:
+
+| Prompt | Tokens | Decode |
+| --- | --- | --- |
+| `prose`: the op prompt | 75 | 8 greedy steps |
+| `chat`: a user question in the checkpoint's chat template, with the generation prompt (empty thinking block) written out | 28 | 8 greedy steps |
+
+- the bf16 reference (the same model as the op records: eager attention, f32 tensors restored) prefills the prompt, then decodes 8 tokens one at a time with its cache, each the greedy choice of the previous step;
+- the reference loaded in fp32 (every weight widened exactly; the f32 tensors as stored) runs the same tokens the same way.
+
+Per prompt, `fwd.<name>.tokens` (the prompt and the 8 decoded tokens), `.residual` and `.residual32` (the residual stream entering every decoder layer and the final norm, `[25, positions, 1024]`, from the bf16 and the fp32 run), `.logits` and `.logits32` (`[positions, 248320]`). The manifest lists the prompts under `forward`, with the KL of the bf16 reference against the fp32 run (mean and maximum over positions; `test_forward` recomputes the mean and checks it) and the number of positions where their greedy choices differ.
 
 ## Two deliberate choices
 

@@ -6,13 +6,13 @@ Maps each article and lesson of the course to the athanor code that implements i
 | --- | --- | --- | --- | --- |
 | 1 | Reading a model from disk: safetensors, mmap and zero-copy | 1 | `src/core/file.c`, `safetensors.c`, `json.c`, `arena.c` | code landed (step 1) |
 | 2 | What is inside a Qwen checkpoint | 1–2 | `tools/inspect.c` (`--roles`), `src/model/model.h`, `src/model/registry.c`, `src/models/qwen35/config.c`, `weights.c`; tensor groups, op contract and parameter binding in `docs/contract/qwen35-0.8b.md` and `qwen35-35b-a3b.md` | inspect landed (step 1); roles landed (step 2) |
-| 3 | The forward pass in plain C: embeddings, norms, attention, MLP | 3–4 | `src/ops/*.c` (`embed`, `matmul`, `norm`, `rope`, `act`, `attn`), `src/models/qwen35/forward.c`; checking each op against the reference: `tests/golden/dump.py`, `tests/test_golden.c`, tolerances in `tests/README.md` | CPU reference ops landed (step 3); forward planned (step 4) |
-| 4 | Linear attention and Gated DeltaNet, from the recurrence | 3–4 | `src/ops/gdn.c`, `src/ops/conv.c`, `ath_l2norm_ref` in `src/ops/norm.c` | recurrent reference landed (step 3) |
+| 3 | The forward pass in plain C: embeddings, norms, attention, MLP | 3–4 | `src/ops/*.c` (`embed`, `matmul`, `norm`, `rope`, `act`, `attn`), `src/models/qwen35/forward.c`, `ath_model_forward` in `src/model/state.c`; checking each op against the reference: `tests/golden/dump.py`, `tests/test_golden.c`, tolerances in `tests/README.md`; checking the whole pass (KL against an fp32 run, greedy agreement, an exact f32 run): `tests/test_forward.c`, `tests/README.md` (Forward pass), `docs/contract/qwen35-0.8b.md` (End-to-end) | CPU reference ops landed (step 3); forward landed (step 4) |
+| 4 | Linear attention and Gated DeltaNet, from the recurrence | 3–4 | `src/ops/gdn.c`, `src/ops/conv.c`, `ath_l2norm_ref` in `src/ops/norm.c`; the layer as composed: `gated_deltanet()` in `src/models/qwen35/forward.c` | recurrent reference landed (step 3); composed in the forward pass (step 4) |
 | 5 | Byte-level BPE from scratch | 5 | `src/text/bpe.c` | planned |
 | 6 | Sampling: temperature, top-k, top-p | 5 | `src/ops/sample.c` | planned |
 | 7 | How a GPU runs a kernel; one source for CUDA and HIP | 6–7 | `src/backend/`, `src/ops/*.cu` | planned |
 | 8 | Why decode is memory-bound | 9 | `src/ops/matmul.cu` | planned |
-| 9 | KV cache vs recurrent state | 8 | `src/infer/state.c` | planned |
+| 9 | KV cache vs recurrent state | 4, 8 | state specs in `src/model/model.h`, `src/model/state.c`; the buffers of Qwen3.5 in `src/models/qwen35/forward.c` (layouts in its README); `src/infer/state.c` | CPU state of one sequence landed (step 4); GPU engine planned (step 8) |
 | 10 | Chunkwise Gated DeltaNet on the GPU | 10 | `src/ops/gdn.cu` | planned |
 | 11 | Mixture of experts and placing experts across VRAM, RAM and disk | 12 | `src/ops/moe.*`, `src/infer/tier.c` | planned |
 | 12 | Speculative decoding with an MTP head | 13 | `src/infer/spec.c` | planned |
