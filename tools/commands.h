@@ -17,5 +17,7 @@
 
 int  ath_cmd_inspect(ath_arena *a, int argc, char **argv);
 void ath_cmd_inspect_usage(FILE *out);
+int  ath_cmd_chat(ath_arena *a, int argc, char **argv);
+void ath_cmd_chat_usage(FILE *out);
 
 #endif /* ATH_TOOLS_COMMANDS_H */
