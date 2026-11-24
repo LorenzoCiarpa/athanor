@@ -19,6 +19,7 @@ const char *ath_status_str(ath_status s)
         [ATH_ERR_TYPE]        = "wrong type",
         [ATH_ERR_RANGE]       = "out of range",
         [ATH_ERR_UNSUPPORTED] = "unsupported",
+        [ATH_ERR_DEVICE]      = "device error",
     };
     if ((unsigned)s >= ATH_STATUS_COUNT || !names[s])
         return "unknown status";

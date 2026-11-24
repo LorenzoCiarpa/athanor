@@ -11,6 +11,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* C linkage when included from CUDA code (src/backend/gpu.cu), which nvcc
+ * compiles as C++. */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* ---- status codes --------------------------------------------------------- */
 
 /* Every fallible function returns an ath_status. ATH_OK is zero so that
@@ -27,6 +33,7 @@ typedef enum {
     ATH_ERR_TYPE,          /* a value has a different type than requested  */
     ATH_ERR_RANGE,         /* out of bounds, overflow or truncation        */
     ATH_ERR_UNSUPPORTED,   /* valid input that athanor does not handle yet */
+    ATH_ERR_DEVICE,        /* the GPU runtime or driver reported an error  */
     ATH_STATUS_COUNT
 } ath_status;
 
@@ -83,5 +90,9 @@ void ath_log(ath_log_level level, const char *fmt, ...) __attribute__((format(pr
 #endif
 
 #define ATH_ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* ATH_BASE_H */

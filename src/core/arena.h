@@ -21,6 +21,10 @@
 
 #include "core/base.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define ATH_ARENA_DEFAULT_BLOCK ((size_t)1 << 20)   /* 1 MiB */
 
 typedef struct ath_arena_block ath_arena_block;
@@ -63,5 +67,9 @@ void          ath_arena_reset(ath_arena *a, ath_arena_pos pos);
 /* Bytes handed out (including alignment padding) and bytes reserved in blocks. */
 size_t ath_arena_used(const ath_arena *a);
 size_t ath_arena_reserved(const ath_arena *a);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* ATH_ARENA_H */
