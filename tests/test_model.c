@@ -29,11 +29,13 @@ static ath_status parse_config(ath_arena *a, const tiny *c, ath_qwen35_config *o
     return st ? st : ath_qwen35_config_parse(out, a, root);
 }
 
+/* Params of role r that the text path uses (ATH_P_UNUSED ones are counted
+ * with count_flag). */
 static uint32_t count_role(const ath_model *m, ath_role r)
 {
     uint32_t n = 0;
     for (uint32_t i = 0; i < m->n_params; i++)
-        n += m->params[i].role == r;
+        n += m->params[i].role == r && !(m->params[i].flags & ATH_P_UNUSED);
     return n;
 }
 
@@ -202,10 +204,12 @@ ATH_TEST(qwen35_bind_dense)
     ath_model m;
     ATH_REQUIRE_OK(open_tiny(&a, &m, &d, &DENSE, (ckpt){.skip = NULL}, NULL));
 
-    /* embed + final norm + 3 x Gated DeltaNet (2 + 9 + 3) + 1 x attention (2 + 6 + 3) */
-    ATH_EXPECT_EQ_INT(m.n_params, 2 + 3 * 14 + 11);
+    /* embed + final norm + 3 x Gated DeltaNet (2 + 9 + 3) + 1 x attention (2 + 6 + 3),
+     * then the 4 tensors of the ignored groups, bound as unused */
+    const uint32_t used = 2 + 3 * 14 + 11;
+    ATH_EXPECT_EQ_INT(m.n_params, used + 4);
     ATH_EXPECT_EQ_INT(m.n_bound, m.n_params);
-    ATH_EXPECT_EQ_INT(m.ckpt.n_tensors, m.n_bound + 4);
+    ATH_EXPECT_EQ_INT(m.ckpt.n_tensors, m.n_bound);
     ATH_EXPECT_STR_EQ(m.family->name, "qwen35");
     ATH_EXPECT_EQ_INT(m.n_layers, 4);
     ATH_EXPECT_EQ_INT(m.hidden_size, H);
@@ -222,14 +226,25 @@ ATH_TEST(qwen35_bind_dense)
     ATH_EXPECT_EQ_INT(m.ignored[0].bytes, (6 * 4 + H * 4) * 2);
     ATH_EXPECT_EQ_INT(m.ignored[1].n_tensors, 2);
 
+    /* the ignored groups' tensors: whole, unused, role other, no layer, last */
+    ATH_EXPECT_EQ_INT(count_flag(&m, ATH_P_UNUSED), 4);
+    for (uint32_t i = used; i < m.n_params; i++) {
+        const ath_param *p = &m.params[i];
+        ATH_EXPECT_EQ_INT(p->flags, ATH_P_UNUSED);
+        ATH_EXPECT_EQ_INT(p->role, ATH_ROLE_OTHER);
+        ATH_EXPECT_EQ_INT(p->layer, -1);
+        ATH_EXPECT(strncmp(p->name, "model.visual.", 13) == 0 || strncmp(p->name, "mtp.", 4) == 0);
+        ATH_EXPECT(p->t.data == ath_safetensors_find(&m.ckpt, p->name)->t.data);
+    }
+
     /* forward order: embedding first, final norm last (tied: no head) */
     ATH_EXPECT_EQ_INT(m.params[0].role, ATH_ROLE_EMBED);
     ATH_EXPECT_EQ_INT(m.params[0].flags, ATH_P_WRITES_RESIDUAL | ATH_P_SENSITIVE);
-    ATH_EXPECT_EQ_INT(m.params[m.n_params - 1].role, ATH_ROLE_NORM);
-    ATH_EXPECT_EQ_INT(m.params[m.n_params - 1].layer, -1);
+    ATH_EXPECT_EQ_INT(m.params[used - 1].role, ATH_ROLE_NORM);
+    ATH_EXPECT_EQ_INT(m.params[used - 1].layer, -1);
     ATH_EXPECT_EQ_INT(count_role(&m, ATH_ROLE_LM_HEAD), 0);
     int32_t prev = -1;
-    for (uint32_t i = 0; i + 1 < m.n_params; i++) {
+    for (uint32_t i = 0; i + 1 < used; i++) {
         ATH_EXPECT(m.params[i].layer >= prev);   /* layers are contiguous and in order */
         prev = m.params[i].layer;
         ATH_EXPECT_EQ_INT(m.params[i].expert, -1);
@@ -269,14 +284,16 @@ ATH_TEST(qwen35_bind_moe)
 
     /* per layer: 2 norms, mixer, router, 2 views per expert, 3 shared + gate */
     uint32_t moe = 1 + 2 * E + 4;
-    ATH_EXPECT_EQ_INT(m.n_params, 3 + 3 * (2 + 9 + moe) + (2 + 6 + moe));
+    const uint32_t used = 3 + 3 * (2 + 9 + moe) + (2 + 6 + moe);
+    ATH_EXPECT_EQ_INT(m.n_params, used + count_flag(&m, ATH_P_UNUSED));
+    ATH_EXPECT_EQ_INT(m.n_bound, m.ckpt.n_tensors);
     ATH_EXPECT_EQ_INT(m.n_experts, E);
     ATH_EXPECT_EQ_INT(m.n_experts_active, TOPK);
     ATH_EXPECT_STR_EQ(m.layers[0].ffn, "moe");
     ATH_EXPECT_EQ_INT(m.layers[0].n_experts, E);
     ATH_EXPECT(!m.tie_embeddings);
     ATH_EXPECT_EQ_INT(count_role(&m, ATH_ROLE_LM_HEAD), 1);
-    ATH_EXPECT_EQ_INT(m.params[m.n_params - 1].role, ATH_ROLE_LM_HEAD);
+    ATH_EXPECT_EQ_INT(m.params[used - 1].role, ATH_ROLE_LM_HEAD);
     ATH_EXPECT_EQ_INT(m.params[0].flags, ATH_P_WRITES_RESIDUAL);   /* untied: not sensitive */
     ATH_EXPECT_EQ_INT(count_role(&m, ATH_ROLE_ROUTER), 4);
     ATH_EXPECT_EQ_INT(count_role(&m, ATH_ROLE_EXPERT_IN), 4 * E);
@@ -327,6 +344,7 @@ ATH_TEST(qwen35_bind_text_only)
     ATH_EXPECT_EQ_INT(m.n_params, 2 + 3 * 14 + 11);
     ATH_EXPECT_EQ_INT(m.n_bound, m.ckpt.n_tensors);
     ATH_EXPECT_EQ_INT(m.ignored[0].n_tensors + m.ignored[1].n_tensors, 0);
+    ATH_EXPECT_EQ_INT(count_flag(&m, ATH_P_UNUSED), 0);
     ATH_EXPECT(find_param(&m, "model.layers.0.linear_attn.A_log", -1) != NULL);
     ath_model_close(&m);
     tmpdir_remove(&d);
@@ -418,10 +436,13 @@ ATH_TEST(qwen35_real_model)
     ath_model m;
     ATH_REQUIRE_OK(ath_model_open(&m, &a, model_dir()));
 
+    /* every tensor bound; the ignored groups are exactly the unused params */
     uint32_t ignored = 0;
     for (uint32_t g = 0; g < m.n_ignored; g++)
         ignored += m.ignored[g].n_tensors;
-    ATH_EXPECT_EQ_INT(m.n_bound + ignored, m.ckpt.n_tensors);
+    ATH_EXPECT_EQ_INT(m.n_bound, m.ckpt.n_tensors);
+    ATH_EXPECT_EQ_INT(count_flag(&m, ATH_P_UNUSED), ignored);
+    ATH_EXPECT(ignored > 0);
 
     /* the schedule follows layer_types (or its fallback) exactly */
     const ath_json *types = ath_json_path(m.config, "text_config.layer_types");

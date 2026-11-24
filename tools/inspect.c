@@ -361,6 +361,7 @@ static void fmt_flags(char *out, size_t cap, uint32_t flags)
         {ATH_P_WRITES_RESIDUAL, "residual"},
         {ATH_P_SENSITIVE, "sensitive"},
         {ATH_P_SHARED_EXPERT, "shared"},
+        {ATH_P_UNUSED, "unused"},
     };
     size_t n = 0;
     out[0] = '\0';
@@ -385,11 +386,13 @@ typedef struct {
 } param_total;
 
 /* Totals per layer (index 0 holds the global params, layer -1) and per role,
- * over the params selected by --filter. */
+ * over the params selected by --filter that the text path uses; the
+ * ATH_P_UNUSED params are counted apart. */
 typedef struct {
     param_total *layer;   /* [n_layers + 1] */
     param_total  role[ATH_ROLE_COUNT];
     param_total  all;
+    param_total  unused;
     uint32_t     ignored_tensors;
 } roles_totals;
 
@@ -405,6 +408,11 @@ static ath_status roles_totals_compute(ath_arena *a, const options *opt, const a
         if (!selected(opt, p->name))
             continue;
         uint64_t b = ath_tensor_nbytes(&p->t);
+        if (p->flags & ATH_P_UNUSED) {
+            t->unused.params++;
+            t->unused.bytes += b;
+            continue;
+        }
         param_total *bins[] = {&t->layer[p->layer + 1], &t->role[p->role], &t->all};
         for (size_t k = 0; k < ATH_ARRAY_LEN(bins); k++) {
             bins[k]->params++;
@@ -491,7 +499,7 @@ static void print_roles_text(const options *opt, const ath_model *m, const roles
     }
 
     if (opt->filter)
-        printf("\nfilter '%s': %u of %u params\n", opt->filter, t->all.params, m->n_params);
+        printf("\nfilter '%s': %u of %u params\n", opt->filter, t->all.params + t->unused.params, m->n_params);
     printf("\n%-10s  %8s  %14s\n", "role", "params", "bytes");
     for (int r = 0; r < ATH_ROLE_COUNT; r++) {
         if (!t->role[r].params)
@@ -503,6 +511,11 @@ static void print_roles_text(const options *opt, const ath_model *m, const roles
     fmt_bytes(b1, sizeof b1, t->all.bytes);
     printf("%-10s  %8u  %14llu  %s\n", opt->filter ? "matched" : "total", t->all.params,
            (unsigned long long)t->all.bytes, b1);
+    if (t->unused.params) {
+        fmt_bytes(b1, sizeof b1, t->unused.bytes);
+        printf("%-10s  %8u  %14llu  %s  (not in the totals above)\n", "unused", t->unused.params,
+               (unsigned long long)t->unused.bytes, b1);
+    }
 
     printf("\n");
     bool first = true;
@@ -517,10 +530,10 @@ static void print_roles_text(const options *opt, const ath_model *m, const roles
     }
     if (first)
         printf("ignored  none\n");
-    uint32_t unbound = m->ckpt.n_tensors - m->n_bound - t->ignored_tensors;
     fmt_bytes(b3, sizeof b3, m->ckpt.tensor_bytes);
-    printf("check    %u checkpoint tensors (%s): %u bound to %u params, %u ignored, %u unbound\n",
-           m->ckpt.n_tensors, b3, m->n_bound, m->n_params, t->ignored_tensors, unbound);
+    printf("check    %u checkpoint tensors (%s): %u bound to %u params (%u in ignored groups, unused), "
+           "%u unbound\n",
+           m->ckpt.n_tensors, b3, m->n_bound, m->n_params, t->ignored_tensors, m->ckpt.n_tensors - m->n_bound);
 }
 
 static void print_roles_json(const options *opt, const ath_model *m, const roles_totals *t)
@@ -596,6 +609,8 @@ static void print_roles_json(const options *opt, const ath_model *m, const roles
     }
     fprintf(o, "\n  ],\n  \"selected\": {\"params\": %u, \"bytes\": %llu},\n", t->all.params,
             (unsigned long long)t->all.bytes);
+    fprintf(o, "  \"unused\": {\"params\": %u, \"bytes\": %llu},\n", t->unused.params,
+            (unsigned long long)t->unused.bytes);
     fprintf(o, "  \"checkpoint_tensors\": %u,\n  \"bound_tensors\": %u,\n  \"ignored_tensors\": %u,\n"
                "  \"n_params\": %u\n}\n",
             m->ckpt.n_tensors, m->n_bound, t->ignored_tensors, m->n_params);

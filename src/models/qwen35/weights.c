@@ -3,10 +3,11 @@
  * Binding is driven by the config, not by the checkpoint: for every layer the
  * family knows which tensors must exist and what shape each one has, finds
  * them by name, and fails on the first one that is missing, has a non-float
- * dtype or has a shape that does not follow from config.json. Tensors the
- * family does not ask for are caught afterwards by the registry's coverage
- * check, unless they fall in one of the two ignored groups (vision encoder,
- * MTP head), the same prefixes the reference text model drops.
+ * dtype or has a shape that does not follow from config.json. The tensors
+ * of the two ignored groups (vision encoder, MTP head: the prefixes the
+ * reference text model drops) are bound too, each as one param flagged
+ * ATH_P_UNUSED, after all the others. Any other tensor is caught afterwards
+ * by the registry's coverage check.
  *
  * Roles and flags per tensor: docs/contract/qwen35-0.8b.md (Parameter
  * binding) and docs/contract/qwen35-35b-a3b.md for MoE. Params come in
@@ -201,13 +202,38 @@ static const ath_ignored ignored_groups[] = {
     {.prefix = "mtp.", .reason = "multi-token prediction head: speculative decoding, step 13"},
 };
 
+static uint32_t count_prefix(const ath_safetensors *st, const char *prefix)
+{
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < st->n_tensors; i++)
+        n += strncmp(st->tensors[i].name, prefix, strlen(prefix)) == 0;
+    return n;
+}
+
+/* Every tensor of an ignored group becomes one param flagged ATH_P_UNUSED:
+ * the whole tensor, role other, no layer. Shapes and dtypes are not checked:
+ * the text path never reads these tensors, and an export copies them as they
+ * are. */
+static void bind_unused(binder *b, const char *prefix)
+{
+    const ath_safetensors *st = &b->m->ckpt;
+    for (uint32_t i = 0; i < st->n_tensors; i++) {
+        const ath_safetensors_entry *e = &st->tensors[i];
+        if (strncmp(e->name, prefix, strlen(prefix)) == 0)
+            add(b, &e->t, e->name, ATH_ROLE_OTHER, -1, -1, ATH_P_UNUSED);
+    }
+}
+
 ath_status ath_qwen35_bind(ath_model *m, ath_arena *a, ath_qwen35_model *q)
 {
     const ath_qwen35_config *c = &q->c;
     /* Upper bound on the param count: 3 global params and, per layer, two
-     * norms, at most 9 mixer tensors and the MLP or MoE params. */
+     * norms, at most 9 mixer tensors and the MLP or MoE params; then one
+     * param per tensor of the ignored groups. */
     uint64_t per_layer = 2 + 9 + (c->moe ? 5 + 2 * (uint64_t)c->n_experts : 3);
     uint64_t cap = 3 + (uint64_t)c->n_layers * per_layer;
+    for (size_t g = 0; g < ATH_ARRAY_LEN(ignored_groups); g++)
+        cap += count_prefix(&m->ckpt, ignored_groups[g].prefix);
     if (cap > UINT32_MAX)
         return ATH_ERR_RANGE;
     m->params = ath_arena_alloc(a, (size_t)cap * sizeof *m->params, _Alignof(ath_param));
@@ -245,10 +271,13 @@ ath_status ath_qwen35_bind(ath_model *m, ath_arena *a, ath_qwen35_model *q)
             return ATH_ERR_FORMAT;
         }
         q->head = q->embed;
-        return ATH_OK;
+    } else {
+        const ath_safetensors_entry *e;
+        ATH_CHECK(find(&b, "lm_head.weight", S2(v, h), &e));
+        q->head = add(&b, &e->t, e->name, ATH_ROLE_LM_HEAD, -1, -1, SENS);
     }
-    const ath_safetensors_entry *e;
-    ATH_CHECK(find(&b, "lm_head.weight", S2(v, h), &e));
-    q->head = add(&b, &e->t, e->name, ATH_ROLE_LM_HEAD, -1, -1, SENS);
+
+    for (size_t g = 0; g < ATH_ARRAY_LEN(ignored_groups); g++)
+        bind_unused(&b, ignored_groups[g].prefix);
     return ATH_OK;
 }

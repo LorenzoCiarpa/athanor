@@ -82,7 +82,9 @@ static void log_no_family(const char *dir, const ath_json *cfg)
 
 /* ---- coverage ----------------------------------------------------------------- */
 
-enum { MARK_BOUND = 1, MARK_IGNORED = 2 };
+/* Per checkpoint tensor: viewed by a param the text path uses, viewed by an
+ * ATH_P_UNUSED param, in an ignored group. */
+enum { MARK_USED = 1, MARK_UNUSED = 2, MARK_GROUP = 4 };
 
 /* Mark the checkpoint tensor behind every param, checking that the param is a
  * contiguous view inside it. */
@@ -108,12 +110,14 @@ static ath_status mark_params(const ath_model *m, uint8_t *mark)
                     m->family->name, i, p->name, p->expert);
             return ATH_ERR_FORMAT;
         }
-        mark[e - st->tensors] |= MARK_BOUND;
+        mark[e - st->tensors] |= (p->flags & ATH_P_UNUSED) ? MARK_UNUSED : MARK_USED;
     }
     return ATH_OK;
 }
 
-static ath_status mark_ignored(ath_model *m, uint8_t *mark)
+/* Count the tensors of every ignored group, and check that each is in one
+ * group only and bound as unused, never as a param the text path uses. */
+static ath_status mark_groups(ath_model *m, uint8_t *mark)
 {
     const ath_safetensors *st = &m->ckpt;
     for (uint32_t g = 0; g < m->n_ignored; g++) {
@@ -125,13 +129,16 @@ static ath_status mark_ignored(ath_model *m, uint8_t *mark)
             const ath_safetensors_entry *e = &st->tensors[i];
             if (strncmp(e->name, ig->prefix, plen) != 0)
                 continue;
-            if (mark[i]) {
-                ath_log(ATH_LOG_ERROR, "%s: tensor %s is in ignored group '%s' but already %s",
-                        m->family->name, e->name, ig->prefix,
-                        (mark[i] & MARK_BOUND) ? "bound" : "in another ignored group");
+            const char *bad = (mark[i] & MARK_GROUP)    ? "is in another ignored group too"
+                              : (mark[i] & MARK_USED)   ? "is bound to a param the text path uses"
+                              : !(mark[i] & MARK_UNUSED) ? "is not bound"
+                                                         : NULL;
+            if (bad) {
+                ath_log(ATH_LOG_ERROR, "%s: tensor %s of ignored group '%s' %s", m->family->name, e->name,
+                        ig->prefix, bad);
                 return ATH_ERR_FORMAT;
             }
-            mark[i] |= MARK_IGNORED;
+            mark[i] |= MARK_GROUP;
             ig->n_tensors++;
             ig->bytes += e->end - e->begin;
         }
@@ -139,8 +146,9 @@ static ath_status mark_ignored(ath_model *m, uint8_t *mark)
     return ATH_OK;
 }
 
-/* Every checkpoint tensor must be bound or ignored: a tensor the family does
- * not know about means the checkpoint is not what the family thinks it is. */
+/* Every checkpoint tensor must be bound: a tensor the family does not know
+ * about means the checkpoint is not what the family thinks it is. A tensor
+ * bound as unused must be in an ignored group, so that the family says why. */
 static ath_status check_coverage(ath_model *m, ath_arena *a)
 {
     const ath_safetensors *st = &m->ckpt;
@@ -151,18 +159,22 @@ static ath_status check_coverage(ath_model *m, ath_arena *a)
 
     ath_status s = mark_params(m, mark);
     if (s == ATH_OK)
-        s = mark_ignored(m, mark);
+        s = mark_groups(m, mark);
     if (s == ATH_OK) {
         uint32_t unbound = 0;
         m->n_bound = 0;
         for (uint32_t i = 0; i < st->n_tensors; i++) {
-            if (mark[i] & MARK_BOUND)
-                m->n_bound++;
-            if (mark[i])
-                continue;
-            if (unbound < 10)
-                ath_log(ATH_LOG_ERROR, "%s: tensor %s is neither bound nor in an ignored group",
+            if ((mark[i] & MARK_UNUSED) && !(mark[i] & MARK_GROUP)) {
+                ath_log(ATH_LOG_ERROR, "%s: tensor %s is bound as unused but in no ignored group",
                         m->family->name, st->tensors[i].name);
+                s = ATH_ERR_FORMAT;
+            }
+            if (mark[i] & (MARK_USED | MARK_UNUSED)) {
+                m->n_bound++;
+                continue;
+            }
+            if (unbound < 10)
+                ath_log(ATH_LOG_ERROR, "%s: tensor %s is not bound", m->family->name, st->tensors[i].name);
             unbound++;
         }
         if (unbound > 10)

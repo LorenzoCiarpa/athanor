@@ -87,7 +87,8 @@ bool       ath_qwen35_match(const ath_json *config);
 ath_status ath_qwen35_config_parse(ath_qwen35_config *c, ath_arena *a, const ath_json *config);
 
 /* weights.c: fill m->params and m->ignored from m->ckpt, and the params of
- * q (q->c is parsed, q->layer allocated). */
+ * q (q->c is parsed, q->layer allocated). The tensors of the ignored groups
+ * come last, as params flagged ATH_P_UNUSED. */
 ath_status ath_qwen35_bind(ath_model *m, ath_arena *a, ath_qwen35_model *q);
 
 /* forward.c: the family's forward (model.h, ath_family.forward). */

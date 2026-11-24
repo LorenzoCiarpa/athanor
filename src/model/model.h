@@ -2,11 +2,12 @@
  *
  * Pipelines (infer, quant, ablit, train) and tools see a model only through
  * this header. A family (src/models/<family>/) turns a checkpoint into an
- * ath_model: every checkpoint tensor either becomes one or more params, each
- * with a role, a layer, an expert index and flags, or belongs to a group that
- * the family deliberately leaves unbound and says why (an ignored group).
- * Pipelines decide what to do by role and flags, never by tensor name or by
- * family:
+ * ath_model: every checkpoint tensor becomes one or more params, each with a
+ * role, a layer, an expert index and flags. Tensors the text path does not
+ * use (a vision encoder, for example) are params too, flagged ATH_P_UNUSED,
+ * and belong to a group that the family declares and explains (an ignored
+ * group): bound and ignored explicitly, never silently. Pipelines decide
+ * what to do by role and flags, never by tensor name or by family:
  *
  *   quantization   formats by role, higher precision for ATH_P_SENSITIVE
  *   abliteration   orthogonalizes every param flagged ATH_P_WRITES_RESIDUAL
@@ -55,6 +56,11 @@ const char *ath_role_name(ath_role r);
 #define ATH_P_WRITES_RESIDUAL 1u  /* its output is added to the residual stream            */
 #define ATH_P_SENSITIVE       2u  /* quantization keeps it at higher precision by default  */
 #define ATH_P_SHARED_EXPERT   4u  /* part of the always-active shared expert of a MoE layer */
+#define ATH_P_UNUSED          8u  /* present in the checkpoint, unused by the text path
+                                   * (e.g. vision encoder): the forward pass never reads it,
+                                   * pipelines on the text path skip it, an export copies it
+                                   * unchanged. Role other, layer -1, expert -1; it belongs
+                                   * to exactly one ignored group                          */
 
 typedef struct {
     ath_tensor  t;        /* contiguous view of checkpoint memory, possibly a slice of a
@@ -75,8 +81,10 @@ typedef struct {
     int32_t     n_experts;  /* routed experts in this layer, 0 if dense        */
 } ath_layer;
 
-/* Checkpoint tensors a family leaves unbound on purpose. The family sets
- * prefix and reason; ath_model_open counts the matching tensors. */
+/* Checkpoint tensors the text path does not use, grouped by name prefix.
+ * The family sets prefix and reason and binds every tensor of the group as a
+ * param flagged ATH_P_UNUSED; ath_model_open counts the matching tensors and
+ * checks that the group and the unused params coincide. */
 typedef struct {
     const char *prefix;
     const char *reason;
@@ -117,13 +125,14 @@ typedef struct {
     ath_safetensors   ckpt;              /* mapped checkpoint; params view its memory  */
 
     ath_param        *params;            /* global params and each layer's params, in
-                                          * forward order                             */
+                                          * forward order; then the ATH_P_UNUSED ones */
     uint32_t          n_params;
     ath_layer        *layers;
     int32_t           n_layers;
     ath_ignored      *ignored;
     uint32_t          n_ignored;
-    uint32_t          n_bound;           /* checkpoint tensors viewed by some param    */
+    uint32_t          n_bound;           /* checkpoint tensors viewed by some param:
+                                          * all of them once the model is open       */
 
     int32_t           hidden_size;
     int32_t           vocab_size;
@@ -190,11 +199,12 @@ struct ath_family {
 
 /* Open the checkpoint in dir: parse config.json, pick the first compiled-in
  * family whose match accepts it, map the safetensors files, load, and check
- * coverage: every checkpoint tensor is viewed by at least one param or
- * belongs to exactly one ignored group, never both, and every param lies
- * inside the tensor it names. ATH_ERR_UNSUPPORTED if no family matches,
- * ATH_ERR_FORMAT for an unbound tensor. On failure everything is closed.
- * Tables live in a, which must outlive m. */
+ * coverage: every checkpoint tensor is viewed by at least one param; the
+ * tensors of each ignored group are viewed by ATH_P_UNUSED params only, and
+ * every ATH_P_UNUSED param views a tensor of exactly one group; every param
+ * lies inside the tensor it names. ATH_ERR_UNSUPPORTED if no family matches,
+ * ATH_ERR_FORMAT for an unbound tensor or a broken group. On failure
+ * everything is closed. Tables live in a, which must outlive m. */
 ath_status ath_model_open(ath_model *m, ath_arena *a, const char *dir);
 
 /* Unmap the checkpoint. Param views become invalid. */

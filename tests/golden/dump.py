@@ -56,6 +56,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.models.qwen3_5 import modeling_qwen3_5 as ref
 
 PINNED_TRANSFORMERS = "5.24.0"
+TEXT_CLASS = "Qwen3_5ForCausalLM"            # the text path of the vision-language checkpoint
 PINNED_TORCH = "2.15.0+cpu"
 MODELING_SHA256 = "c4d847b7e809ed2a49611e5afcea8bd0db39de597b67b57ce9753fb65f550de2"
 
@@ -88,6 +89,15 @@ def sha256_file(path):
         for block in iter(lambda: f.read(1 << 20), b""):
             h.update(block)
     return h.hexdigest()
+
+
+def check_text_path(model):
+    """The checkpoint is a vision-language model (Qwen3_5ForConditionalGeneration);
+    AutoModelForCausalLM must load its text path only, without the vision
+    encoder, as athanor runs it (docs/contract/qwen35-0.8b.md, Classes)."""
+    name = type(model).__name__
+    if name != TEXT_CLASS or any(n.startswith(("model.visual.", "visual.")) for n, _ in model.named_parameters()):
+        sys.exit(f"dump.py: loaded {name}, expected the text path {TEXT_CLASS} without a vision encoder")
 
 
 def cpu_name():
@@ -541,6 +551,7 @@ def main():
 
     model = AutoModelForCausalLM.from_pretrained(args.model_dir, dtype=torch.bfloat16, attn_implementation="eager")
     model.eval()
+    check_text_path(model)
     restored = restore_f32(model, args.model_dir)
     tok = AutoTokenizer.from_pretrained(args.model_dir)
     CONFIG["rope_theta"] = model.config.rope_parameters["rope_theta"]
@@ -567,6 +578,7 @@ def main():
     # as stored. Same attention implementation and torch fallbacks.
     model32 = AutoModelForCausalLM.from_pretrained(args.model_dir, dtype=torch.float32, attn_implementation="eager")
     model32.eval()
+    check_text_path(model32)
     for name in restored:
         p32 = model32.get_parameter("model." + name[len(CKPT_PREFIX):])
         assert torch.equal(p32, model.get_parameter("model." + name[len(CKPT_PREFIX):]))
@@ -585,6 +597,7 @@ def main():
             "python": platform.python_version(),
             "threads": torch.get_num_threads(),
             "cpu": cpu_name(),
+            "class": f"{type(model).__module__}.{type(model).__name__}",
             "attn_implementation": model.config._attn_implementation,
             "dtype": "bfloat16",
             "restored_f32": restored,
