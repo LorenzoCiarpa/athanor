@@ -37,13 +37,14 @@ FAMILIES_H := $(BUILD)/gen/families.h
 CFLAGS     += -I$(BUILD)/gen
 
 CORE_SRC  := $(wildcard src/core/*.c)
+OPS_SRC   := $(wildcard src/ops/*.c)
 MODEL_SRC := $(wildcard src/model/*.c)
-LIB_SRC   := $(CORE_SRC) $(MODEL_SRC) $(FAMILY_SRC)
+LIB_SRC   := $(CORE_SRC) $(OPS_SRC) $(MODEL_SRC) $(FAMILY_SRC)
 LIB_OBJ   := $(LIB_SRC:%.c=$(BUILD)/obj/%.o)
 
 TOOL_SRC := $(wildcard tools/*.c)
 TOOL_OBJ := $(TOOL_SRC:%.c=$(BUILD)/obj/%.o)
-TESTS    := $(BUILD)/test_core $(BUILD)/test_model
+TESTS    := $(BUILD)/test_core $(BUILD)/test_model $(BUILD)/test_ops
 
 .PHONY: all cpu cuda hip test check-alloc clean FORCE
 .SECONDARY:

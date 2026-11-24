@@ -1,0 +1,87 @@
+/* norm.c: RMSNorm (plain and zero-centered), gated RMSNorm, L2 norm. See ops.h.
+ *
+ * All three normalize each row over the last dimension with the statistic
+ * summed in fp32 in order, then scale, in the order the reference does it
+ * (contract, sections RMSNorm and Gated RMSNorm):
+ *
+ *   rmsnorm        x · rsqrt(mean(x²) + eps) · (w_offset + w)
+ *   rmsnorm_gated  round(x · rsqrt(mean(x²) + eps)) · w · silu(z)
+ *   l2norm         x · rsqrt(Σ x² + eps)
+ */
+#include "ops/check.h"
+#include "ops/ops.h"
+
+#include <math.h>
+
+/* 1 / sqrt(Σ x² / div + eps) over the row starting at element base. */
+static float inv_rms(const ath_tensor *x, int64_t base, int64_t D, float div, float eps)
+{
+    float ss = 0.0f;
+    for (int64_t i = 0; i < D; i++) {
+        float v = ld(x, base + i);
+        ss += v * v;
+    }
+    return 1.0f / sqrtf(ss / div + eps);
+}
+
+/* x and out of the same shape; w (if with_weight) a vector over the last dimension. */
+static ath_status check_rows(const char *op, const ath_tensor *x, const ath_tensor *out,
+                             bool with_weight, const ath_tensor *w)
+{
+    ATH_CHECK(ops_float(x, op, "x"));
+    ATH_CHECK(ops_float(out, op, "out"));
+    if (!ath_tensor_same_shape(x, out) || x->ndim < 1)
+        return ops_fail(ATH_ERR_INVALID_ARG, op, "x and out must have the same shape");
+    if (with_weight) {
+        ATH_CHECK(ops_float(w, op, "w"));
+        if (w->ndim != 1 || w->shape[0] != ops_last(x))
+            return ops_fail(ATH_ERR_INVALID_ARG, op, "w must be [%lld]", (long long)ops_last(x));
+    }
+    return ATH_OK;
+}
+
+ath_status ath_rmsnorm_ref(const ath_tensor *x, const ath_tensor *w, float w_offset, float eps,
+                           ath_tensor *out)
+{
+    ATH_CHECK(check_rows("rmsnorm", x, out, true, w));
+    const int64_t D = ops_last(x), rows = ops_rows(x);
+    for (int64_t r = 0; r < rows; r++) {
+        float inv = inv_rms(x, r * D, D, (float)D, eps);
+        for (int64_t i = 0; i < D; i++)
+            st(out, r * D + i, ld(x, r * D + i) * inv * (w_offset + ld(w, i)));
+    }
+    return ATH_OK;
+}
+
+ath_status ath_rmsnorm_gated_ref(const ath_tensor *x, const ath_tensor *z, const ath_tensor *w,
+                                 float eps, ath_tensor *out)
+{
+    static const char op[] = "rmsnorm_gated";
+    ATH_CHECK(check_rows(op, x, out, true, w));
+    ATH_CHECK(ops_float(z, op, "z"));
+    if (!ath_tensor_same_shape(x, z))
+        return ops_fail(ATH_ERR_INVALID_ARG, op, "x and z must have the same shape");
+    const int64_t D = ops_last(x), rows = ops_rows(x);
+    for (int64_t r = 0; r < rows; r++) {
+        float inv = inv_rms(x, r * D, D, (float)D, eps);
+        for (int64_t i = 0; i < D; i++) {
+            int64_t e = r * D + i;
+            float n = ath_round_to(x->dtype, ld(x, e) * inv);
+            float g = ld(z, e);
+            st(out, e, ld(w, i) * n * (g / (1.0f + expf(-g))));
+        }
+    }
+    return ATH_OK;
+}
+
+ath_status ath_l2norm_ref(const ath_tensor *x, float eps, ath_tensor *out)
+{
+    ATH_CHECK(check_rows("l2norm", x, out, false, NULL));
+    const int64_t D = ops_last(x), rows = ops_rows(x);
+    for (int64_t r = 0; r < rows; r++) {
+        float inv = inv_rms(x, r * D, D, 1.0f, eps);
+        for (int64_t i = 0; i < D; i++)
+            st(out, r * D + i, ld(x, r * D + i) * inv);
+    }
+    return ATH_OK;
+}
