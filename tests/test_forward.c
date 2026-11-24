@@ -768,9 +768,9 @@ ATH_TEST(forward_golden)
         all_bad += greedy_bad;
         all_checked += greedy_checked;
     }
-    printf("  bf16, every position of every prompt: mean KL %.3e, bf16 reference %.3e (ratio %.2f); greedy token\n"
+    printf("  bf16, all %d positions run: mean KL %.3e, bf16 reference %.3e (ratio %.2f); greedy token\n"
            "  differs from the fp32 reference at %d of %d positions whose top-2 margin exceeds the bf16 noise\n",
-           all_kl / all_n, all_ref / all_n, all_kl / all_ref, all_bad, all_checked);
+           all_n, all_kl / all_n, all_ref / all_n, all_kl / all_ref, all_bad, all_checked);
     if (full) {
         char msg[200];
         if (!(all_kl <= all_ref)) {
