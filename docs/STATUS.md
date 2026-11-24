@@ -6,7 +6,7 @@ This file is the overview. [`status_extended.md`](status_extended.md) goes one l
 
 ## Current step
 
-**Step 4: CPU forward** (see `docs/PLAN.md` §4). Started 2026-11-24 on branch `step4-cpu-forward`. **Done 2026-11-24** (pushed, to be merged into `main`); step 5 is next.
+**Step 4: CPU forward** (see `docs/PLAN.md` §4). Started 2026-11-24 on branch `step4-cpu-forward`. **Done 2026-11-24** (pushed, to be merged into `main`); step 5 is next. Task 4.7 was added after the step closed, at the maintainer's request (log, 2026-11-24).
 
 Goal: the whole Qwen3.5-0.8B forward pass on the CPU, composed from the step 3 ops, with the per-sequence state (KV cache, conv and recurrent state) that prefill and decode need, reached by pipelines only through the contract; and evidence on fixed prompts that its logits are as close to the exact model as the reference implementation's.
 
@@ -18,6 +18,7 @@ Goal: the whole Qwen3.5-0.8B forward pass on the CPU, composed from the step 3 o
 - [x] **4.4 `tests/golden/dump.py`, forward records.** Two fixed prompts (the op prompt and a chat-formatted one), each followed by 8 greedy decode steps of the bf16 reference; the same tokens through the reference loaded in fp32; per position, the residual stream entering every layer and the final norm, and the logits, of both runs.
 - [x] **4.5 `tests/test_forward.c`.** On a tiny random checkpoint (builder shared with `test_model.c` in `tests/tiny.h`): argument checks, state specs and sizes, hooks, and prefill all at once = in pieces = token by token, bit for bit, in bf16 and f32. On the real checkpoint, against the forward records: the KL gate, greedy agreement, the fp32 forward against the fp32 reference.
 - [x] **4.6 Documentation.** Contract docs (`docs/ARCHITECTURE.md`, `src/model/README.md`), family README, `tests/README.md`, `tests/golden/README.md`, `docs/contract/qwen35-0.8b.md` (logits measured), `docs/program/PROGRAM.md`, this file and `status_extended.md`.
+- [x] **4.7 Fast CPU matmul** (added after the step closed). `src/core/threads.c`: a fixed pthread pool. `ath_matmul_fast` in `src/ops/matmul.c`: several outputs per thread, each summed exactly as the reference sums it, so the same bits with any number of threads. The pool joins the contract (`forward`, `ath_model_forward`) and the forward pass uses `ath_matmul_fast`. Tests: the pool; fast against reference bit for bit, on random shapes and dtypes and on every golden matmul record. The AVX-512 variant that was not chosen is written down in `docs/proposals/cpu-matmul-avx512.md`.
 
 ### Acceptance criteria
 
@@ -28,6 +29,7 @@ Goal: the whole Qwen3.5-0.8B forward pass on the CPU, composed from the step 3 o
 5. Prefill all at once, in pieces and token by token give bit-identical logits and states.
 6. `make test` green with zero warnings, also with `DEBUG=1`; no model names in `src/` outside `src/models/`.
 7. Documentation listed in 4.6 updated.
+8. (4.7) `ath_matmul_fast` gives the same bits as `ath_matmul_ref` for every dtype combination, with and without threads, on random shapes and on every golden matmul record; the forward pass gives the same logits as before 4.7, bit for bit.
 
 Result (2026-11-24, Qwen3.5-0.8B revision `2fc0636`, transformers 5.24.0, torch 2.15.0+cpu, gcc 15.2, glibc 2.43):
 
@@ -38,10 +40,13 @@ Result (2026-11-24, Qwen3.5-0.8B revision `2fc0636`, transformers 5.24.0, torch 
 | 3 | greedy | athanor equals the fp32 reference at all 104 positions whose fp32 top-2 margin exceeds the bf16 noise (0.21); below it, athanor differs at 2 positions of chat and the bf16 reference at 2 of prose |
 | 4 | f32 forward | mean KL 4e-11 (prose) and 5e-11 (chat); residual stream within 4.7e-5 at every layer (tolerance 2e-4), logits within 2.7e-5 (tolerance 1e-4) |
 | 5 | pieces | on tiny random checkpoints, 12 tokens all at once, as 5 + 1 + 6 and one at a time give bit-identical logits and states, in bf16 and f32; the real-checkpoint runs use one prefill call and then single tokens |
-| 6 | `make test`, zero warnings, also `DEBUG=1` | 22 + 11 + 16 + 1 + 7 tests pass in release (about 45 s, `test_forward` 37 s with four threads) and with ASan/UBSan (about 4 minutes; `test_forward` runs the first 4 positions there); `grep -rni qwen src tools --include=*.[ch]` outside `src/models/` finds nothing; `ldd build/athanor`: `libm`, `libc` only |
+| 6 | `make test`, zero warnings, also `DEBUG=1` | 22 + 11 + 16 + 1 + 7 tests pass in release (about 45 s, `test_forward` 37 s with four threads) and with ASan/UBSan (about 4 minutes; `test_forward` runs the first 4 positions there); `grep -rni qwen src tools --include=*.[ch]` outside `src/models/` finds nothing; `ldd build/athanor`: `libm`, `libc` only. After 4.7: 24 + 11 + 17 + 1 + 7 tests, about 13 s in release (`test_forward` 11 s) and about 3 minutes with ASan/UBSan (`test_forward` 34 s there instead of 100 s) |
 | 7 | documentation | `docs/ARCHITECTURE.md`, READMEs of `src/model`, `src/models/qwen35`, `tests`, `tests/golden`; contract (logits, End-to-end); `docs/MODELS.md`; `docs/program/PROGRAM.md` rows 3, 4, 9; this file and `status_extended.md` |
+| 8 | fast matmul (4.7) | `matmul_fast_same_bits` (7 shapes, including partial blocks and work above the threading threshold, × 8 dtype combinations, without a pool and with 3 threads) and every matmul record of `test_golden` (all projections and the lm_head, rows 0 and T − 1, 8 threads) are bit-identical to `ath_matmul_ref`. The forward pass: a hash of every logit of 32 prefill tokens and 8 decode steps, in bf16 and f32, is the same for the tree before 4.7 and for 4.7 with 1 and 8 threads; every number `test_forward` prints is unchanged |
 
 Speed, for the record (no performance claim): 0.29 s per token per thread for prefill and decode, almost all of it in the scalar `ath_matmul_ref` (about 3.6 GFLOP/s, bound by the latency of one fp32 addition chain per output). Logits for one token add 0.14 s.
+
+After 4.7, for the record (no performance claim; Ryzen 7 9800X3D, 8 threads): a decode step with its logits takes 41 ms (0.43 s before), and 32 prefill tokens with the logits of all 32 take 0.84 s (13.7 s before). On one thread: 138 ms and 4.2 s. `ath_matmul_fast` alone, one token: 3.4× the reference on one thread, 12× to 16× on 8. On the lm_head that is about 58 GB/s of weights, close to what the memory delivers.
 
 ## Completed steps
 
@@ -199,4 +204,17 @@ Superseded preview (written in step 1): **Step 2: contract and family loading.**
 - 2026-11-24: step 4 implemented on branch `step4-cpu-forward`: state specs, `ath_state`, `ath_batch`, `ath_hooks` and `forward` in `src/model/model.h`, `src/model/state.c`, `src/models/qwen35/forward.c` (with the layer table in `qwen35.h`, `weights.c`, `family.c`), forward records in `tests/golden/dump.py`, `tests/tiny.h` (moved out of `test_model.c`), `tests/test_forward.c`. All acceptance criteria met (table above).
 - 2026-11-24: decisions taken within step 4 (`PLAN.md` unchanged): state specs count elements, not bytes, and the element type follows from the kind and the state's activation dtype (KV and conv state hold activations, the recurrent state is fp32), because a state can run with bf16 or f32 activations; `forward` takes the model as `const` and a scratch arena released by `ath_model_forward` after every call; a batch is one sequence until the engine (step 8); `ath_hooks` has `on_residual` only (its first users are the forward tests; `on_matmul_in` waits for phase 2); token ids, capacity and the logits tensor are checked once in the contract, not by each family; the family keeps a table of each layer's params, filled while binding, instead of finding params by name in the forward pass; strided slices (query and gate interleaved in `q_proj`, q/k/v in the convolution output) are copied into contiguous tensors for the ops; scratch memory is released after every layer; the minimal CPU state of one sequence is in `src/model/state.c` (host memory) and the engine's state on the GPU stays in `src/infer/state.c` (step 8); `forward_golden` runs its four independent runs in parallel threads (test only; the ops stay single-threaded) and a DEBUG build runs only the first 4 positions.
 - 2026-11-24: the KL gate as first implemented compared each prompt separately and failed on the chat prompt (athanor 6.0e-4, reference 4.4e-4) while athanor beat the reference on prose (1.7e-4 against 5.3e-4). Analysis (contract, End-to-end; `tests/README.md`, Forward pass): the excess is one ill-conditioned position (`<|im_start|>`, a near-cancellation in layer 15), whose KL varies twentyfold within the reference itself (2.7e-4 with the f32 tensors as stored, 5.5e-3 with them rounded to bf16 as transformers does by default), and the reference with its default sdpa attention would fail the per-prompt comparison against the eager reference too (7.5e-4 against 5.1e-4 on the chat prefill). The gate now pools every position of both prompts, as the resolution of the open question worded it; criterion 2 states it explicitly. Per-prompt means stay in the report. A more robust per-prompt gate would need many more positions (more prompts) than a CPU test can afford in seconds.
+- 2026-11-24: task 4.7 added after step 4 closed, at the maintainer's request: on `ath_matmul_ref` the CPU chat of step 5 would decode about 2 tokens per second. Three designs were measured with a microbenchmark:
+  - B: scalar, several outputs per thread, the same bits;
+  - C: AVX-512 across outputs on repacked weights, the same bits;
+  - along k, as BLAS libraries and `vdpbf16ps` do: other bits.
+
+  B was chosen. It reaches the memory bandwidth in decode, like C, without a copy of the weights or a CPU requirement. C is written down in `docs/proposals/cpu-matmul-avx512.md`, not scheduled. AGENTS.md admits a CPU `_fast` path for an op that runs on the CPU at runtime, which the step 5 chat does; `PLAN.md` placed the first one at step 12 (MoE experts) and stays unchanged.
+- 2026-11-24: decisions taken within task 4.7:
+  - The pool is passed explicitly, because AGENTS.md allows no globals. `forward` and `ath_model_forward` take `ath_pool *pool`; NULL means the calling thread only. This replaces "the ops stay single-threaded" of the step 4 decisions, for matmul only.
+  - The pool is in `src/core/threads.c`, as `ARCHITECTURE.md` planned. It assigns tasks statically, and runs from several threads take turns.
+  - `src/backend/cpu.c` is still not written: the pool needs no backend. It arrives with CPU feature detection or the GPU runtime.
+  - `ath_matmul_fast` computes 8 outputs per thread with bf16 weights. Weights in f32 (only in tests) and the last partial block run one output at a time, as the reference. A matmul under 2^18 multiply-adds runs on the calling thread.
+  - The bit identity relies on GCC not contracting a·b + c in ISO C mode (`-std=c11`). The tests with f32 inputs would catch a build that did.
+  - The four runs of `forward_golden` share one pool.
 - 2026-11-24: a tiny-model check of bf16 against f32 activations was dropped from `test_forward`: random uniform weights make an ill-conditioned network (bf16 and f32 logits differ by 2% to 30% of their RMS depending on the seed), so no fixed bound means anything; the real checkpoint does that comparison.

@@ -53,7 +53,7 @@ A score above its tolerance fails the test and names the record and the element.
 
 On tiny random checkpoints (`tests/tiny.h`): state specs and their sizes, every argument check of `ath_model_forward`, the hooks, and the property every pipeline relies on: a sequence run all at once, in pieces (5 + 1 + 6 tokens) or one token at a time gives the same logits and the same state, bit for bit, with bf16 and with f32 activations; the logits of the last token alone equal the last row; a reset state runs the sequence again from scratch.
 
-On the real checkpoint, against the forward records of the golden data: two prompts (the op prompt, 75 tokens, and a chat-formatted one, 28 tokens), each followed by 8 greedy decode steps of the bf16 reference, and the same tokens through the reference loaded in fp32. athanor runs each prompt twice, the prompt in one call and then one token at a time, in four parallel threads (about 36 s, 0.29 s per token per thread with the scalar reference ops):
+On the real checkpoint, against the forward records of the golden data: two prompts (the op prompt, 75 tokens, and a chat-formatted one, 28 tokens), each followed by 8 greedy decode steps of the bf16 reference, and the same tokens through the reference loaded in fp32. athanor runs each prompt twice, the prompt in one call and then one token at a time, in four parallel threads that share one pool for the matmuls (about 11 s; 36 s before `ath_matmul_fast`, task 4.7, which changed no number below):
 
 | Run | Check | Measured (2026-11-24) |
 | --- | --- | --- |
@@ -85,9 +85,9 @@ A minimal C runner: `ATH_TEST(name) { ... }`, `ATH_EXPECT_*` assertions, a summa
 `tests/test.h` holds the runner (header-only); `tests/util.h` the helpers the suites share (scratch directory, location of the real checkpoint); `tests/tiny.h` the tiny synthetic Qwen3.5 checkpoints (`config.json` and safetensors, zero-filled or pseudo-random, with mutations for the failure tests) that `test_model` and `test_forward` share. Each suite is one `tests/test_<area>.c` built into `build/test_<area>` with a table of `ATH_TEST_ENTRY(name)` at the bottom. Assertions: `ATH_EXPECT` (record and continue), `ATH_REQUIRE` (record and end the test), `ATH_EXPECT_OK`, `ATH_EXPECT_STATUS`, `ATH_EXPECT_EQ_INT`, `ATH_EXPECT_EQ_U64`, `ATH_EXPECT_STR_EQ`, `ATH_EXPECT_NEAR`, and `ATH_SKIP(why)`.
 
 ```
-make test                          # all suites, smoke runs of athanor inspect (with and without --roles), and make check-alloc; about 45 s
-make DEBUG=1 test                  # same suites with ASan and UBSan, in build/debug; about 4 minutes
-                                   # (test_golden 2.5 minutes there, 4 s in release; test_forward 100 s on 4 positions, 37 s on all)
+make test                          # all suites, smoke runs of athanor inspect (with and without --roles), and make check-alloc; about 13 s
+make DEBUG=1 test                  # same suites with ASan and UBSan, in build/debug; about 3 minutes
+                                   # (test_golden 2.6 minutes there, 5 s in release; test_forward 34 s on 4 positions, 11 s on all)
 ./build/test_core json             # only tests whose name contains "json"
 ATH_LOG=error ./build/test_core    # show the library's error messages (silenced by default)
 ```
@@ -96,8 +96,8 @@ Synthetic files (safetensors shards, indexes, broken headers) are written by the
 
 | Suite | Covers |
 | --- | --- |
-| `test_core.c` | status and logging, arenas, files, JSON (synthetic and real `config.json`, `tokenizer_config.json`, `tokenizer.json`), dtypes and tensor views, safetensors (single file, sharded, 20 malformed headers, inconsistent indexes, the real checkpoint) |
+| `test_core.c` | status and logging, arenas, files, JSON (synthetic and real `config.json`, `tokenizer_config.json`, `tokenizer.json`), dtypes and tensor views, safetensors (single file, sharded, 20 malformed headers, inconsistent indexes, the real checkpoint), the thread pool (every task once, with fewer, as many and more tasks than threads; runs from four threads at once on one pool) |
 | `test_model.c` | role names and the registry; qwen35 config parsing (dense, MoE, text-only, schedule fallback, 20 rejected configs); binding of tiny synthetic checkpoints (dense, MoE with fused experts, text-only) and every failure mode (missing, unexpected, misshaped, integer dtype, tie mismatches); the real checkpoint (coverage, schedule against `layer_types`, residual writers) |
-| `test_ops.c` | every `_ref` function of `src/ops/` on hand-computed cases (bf16 rounding, norms, RoPE pairing and relative positions, attention averaging and head grouping, conv taps, the delta rule step by step, gates around the softplus threshold) and on exact properties: streaming equals all at once for conv and Gated DeltaNet, decode equals the last prefill row for attention, causality, argument checks |
-| `test_golden.c` | every op the reference computes on Qwen3.5-0.8B (24 layers, prefill and decode, 906 records), replayed through the `_ref` functions on the real weights, native and exact (above) |
+| `test_ops.c` | every `_ref` function of `src/ops/` on hand-computed cases (bf16 rounding, norms, RoPE pairing and relative positions, attention averaging and head grouping, conv taps, the delta rule step by step, gates around the softplus threshold) and on exact properties: streaming equals all at once for conv and Gated DeltaNet, decode equals the last prefill row for attention, causality, argument checks; `ath_matmul_fast` bit for bit against `ath_matmul_ref` (7 shapes × 8 dtype combinations, without and with threads) |
+| `test_golden.c` | every op the reference computes on Qwen3.5-0.8B (24 layers, prefill and decode, 906 records), replayed through the `_ref` functions on the real weights, native and exact (above); every matmul record also through `ath_matmul_fast` on 8 threads, required bit-identical to `ath_matmul_ref` |
 | `test_forward.c` | the forward pass through the contract: state specs and sizes, argument checks, hooks, all at once = in pieces = token by token on tiny random checkpoints; the real checkpoint against the forward records (above) |

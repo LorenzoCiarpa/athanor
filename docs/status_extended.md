@@ -587,6 +587,52 @@ Commits `ed38a7c`, `370a452` (the pooled KL line names the positions it covers).
 
 Commit `d1e93fe`.
 
+#### 4.7 Fast CPU matmul (added after the step closed)
+
+Added at the maintainer's request on 2026-11-24. With `ath_matmul_ref` the CPU chat of step 5 would decode about 2 tokens per second. Three designs were measured with a microbenchmark outside the repository:
+
+- B: scalar, several outputs per thread;
+- C: AVX-512 across outputs on repacked weights;
+- along k, as BLAS libraries and `vdpbf16ps` do.
+
+B was chosen, and C was written down for later.
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `src/core/threads.h`, `threads.c` | New | A fixed pthread pool: `ath_pool_init` (n − 1 workers, their descriptors from an arena), `ath_pool_run` (fork and join), `ath_pool_free`, `ath_pool_threads`, `ath_pool_default_threads` (online CPUs) |
+| `src/ops/matmul.c` | Changed | The argument checks shared by both versions (`check`); `ath_matmul_fast` |
+| `src/ops/ops.h` | Changed | Declaration of `ath_matmul_fast`; includes `core/threads.h` |
+| `src/model/model.h`, `src/model/state.c` | Changed | `ath_pool *pool` in the family's `forward` and in `ath_model_forward`, passed through |
+| `src/models/qwen35/qwen35.h`, `forward.c` | Changed | The pool in the state of a forward call; every matmul, the lm_head included, through `ath_matmul_fast` |
+| `tests/test_core.c` | Changed | `pool_runs_every_task_once`, `pool_shared_by_threads` |
+| `tests/test_ops.c` | Changed | `matmul_fast_same_bits`; a three-thread pool for the suite |
+| `tests/test_golden.c` | Changed | Every matmul record also through `ath_matmul_fast` on a pool of all CPUs, required bit-identical to `ath_matmul_ref` |
+| `tests/test_forward.c` | Changed | The pool argument everywhere; the four golden runs share one pool, started after the setup and freed before anything can return early |
+| `docs/proposals/cpu-matmul-avx512.md` | New | Variant C, not scheduled: idea, layout, code checked bit for bit against the reference, measurements, costs, when it would pay, the decisions it would need |
+| `src/ops/README.md`, `src/core/README.md`, `src/backend/README.md`, `src/model/README.md`, `src/models/qwen35/README.md`, `tests/README.md`, `docs/ARCHITECTURE.md`, `docs/program/PROGRAM.md` (rows 3 and 8), `docs/STATUS.md` | Changed | The fast path, the pool, the contract change, the test times, task 4.7 with its criterion, results and decisions |
+
+What was implemented:
+
+- **The pool.**
+  - A run publishes the function, its context and the task count under a mutex, bumps a generation counter and wakes the workers. Each worker runs its share and decrements a pending count; the last one wakes the caller.
+  - Worker i runs tasks i, i + n, …, and the caller is thread 0. A worker that wakes without a new generation goes back to sleep.
+  - Runs from several threads take turns on a second mutex. A NULL pool, or a pool of one thread, runs the tasks in order on the caller.
+  - The pool is passed explicitly, because AGENTS.md allows no globals. That is why `forward` takes it, and why `src/backend/cpu.c` is still not written.
+- **`ath_matmul_fast`.**
+  - Each thread takes a contiguous range of blocks of 8 outputs. For every row of x, the 8 outputs of a block are 8 fp32 chains in order of k, a rounded product and a rounded sum per step, which is exactly what the reference computes. The same bits therefore come out with any number of threads.
+  - The 8 chains overlap in the pipeline: that is the whole gain on one thread. Rows pass over a block before the next block starts, so its weights stay in cache during prefill.
+  - The inner loop reads the bf16 weights directly. The first version used the generic `ld`, which branches on the dtype; the compiler then kept the 8 accumulators in memory, and the speedup on one thread was 1.6× instead of 3.5×.
+  - Weights in f32 (only in tests) and the last partial block run one output at a time. Under 2^18 multiply-adds the call stays on the calling thread.
+- **Verification.**
+  - Random shapes and dtypes in `test_ops`, and every golden matmul record in `test_golden`, bit for bit.
+  - Every number `test_forward` prints is unchanged.
+  - A scratch program hashed every logit of 32 prefill tokens and 8 decode steps, in bf16 and f32. The hashes were the same for the tree before 4.7 (`ath_matmul_ref`) and for 4.7 with 1 and 8 threads.
+- **Speed, for the record (not a performance claim).** On the Ryzen 7 9800X3D with 8 threads:
+  - a decode step with logits went from 0.43 s to 41 ms, and 32 prefill tokens with all their logits from 13.7 s to 0.84 s;
+  - `make test` went from about 45 s to about 13 s (`test_forward` 37 s to 11 s).
+
+Commits `715c7f7` (the pool), `cdc40aa` (`ath_matmul_fast` and its tests), `25c4bed` (the pool in the contract, the forward pass on the fast matmul), and the documentation commit that follows them.
+
 ---
 
 ## Files by step
@@ -602,31 +648,33 @@ Every file of the repository and the steps that created or changed it (documenta
 | `src/core/json.{h,c}` | 1.5 | | | |
 | `src/core/tensor.{h,c}` | 1.6 | | 3.2 | |
 | `src/core/safetensors.{h,c}` | 1.7 | | | |
-| `src/model/model.h` | | 2.2 | | 4.2 |
+| `src/core/threads.{h,c}` | | | | 4.7 |
+| `src/model/model.h` | | 2.2 | | 4.2, 4.7 |
 | `src/model/registry.c` | | 2.3 | | |
-| `src/model/state.c` | | | | 4.2 |
-| `src/models/qwen35/qwen35.h`, `config.c` | | 2.4 | | 4.3 (`qwen35.h`) |
+| `src/model/state.c` | | | | 4.2, 4.7 |
+| `src/models/qwen35/qwen35.h`, `config.c` | | 2.4 | | 4.3, 4.7 (`qwen35.h`) |
 | `src/models/qwen35/weights.c`, `family.c` | | 2.5 | | 4.3 |
-| `src/models/qwen35/forward.c` | | | | 4.3 |
-| `src/ops/ops.h`, `check.h`, `embed.c`, `matmul.c`, `norm.c`, `rope.c`, `act.c`, `attn.c`, `conv.c`, `gdn.c` | | | 3.3 | |
+| `src/models/qwen35/forward.c` | | | | 4.3, 4.7 |
+| `src/ops/ops.h`, `check.h`, `embed.c`, `matmul.c`, `norm.c`, `rope.c`, `act.c`, `attn.c`, `conv.c`, `gdn.c` | | | 3.3 | 4.7 (`ops.h`, `matmul.c`) |
 | `tools/athanor.c`, `commands.h` | 1.8 | | | |
 | `tools/inspect.c` | 1.8 | 2.6 | | |
 | `tools/dev/alloc_trace.c` | 1.8 | | | |
 | `tools/dev/check_alloc.sh` | 1.8 | 2.6 | | |
 | `tests/test.h` | 1.9 | | | |
-| `tests/test_core.c` | 1.9 | 2.7 | | |
+| `tests/test_core.c` | 1.9 | 2.7 | | 4.7 |
 | `tests/util.h`, `tests/test_model.c` | | 2.7 | | 4.5 (`test_model.c`) |
-| `tests/test_ops.c` | | | 3.5 | |
-| `tests/test_golden.c` | | | 3.6 | |
-| `tests/tiny.h`, `tests/test_forward.c` | | | | 4.5 |
+| `tests/test_ops.c` | | | 3.5 | 4.7 |
+| `tests/test_golden.c` | | | 3.6 | 4.7 |
+| `tests/tiny.h`, `tests/test_forward.c` | | | | 4.5, 4.7 (`test_forward.c`) |
 | `tests/golden/dump.py`, `README.md` | | | 3.4 | 4.4 |
 | `tests/golden/requirements.in`, `requirements.txt` | | | 3.1 | |
 | `docs/contract/qwen35-0.8b.md` | closing | 2.1 | 3.1, 3.7 | 4.6 |
 | `docs/contract/qwen35-35b-a3b.md` | | 2.1 | | |
 | `docs/MODELS.md` | | 2.1 | 3.7 | 4.6 |
-| `docs/ARCHITECTURE.md` | closing | 2.2 | 3.7 | 4.6 |
-| `docs/STATUS.md` | closing | 2.1 to 2.7, closing | 3.1, closing | 4.1, closing |
-| `docs/program/PROGRAM.md` | closing | closing | 3.7 | 4.6 |
-| `docs/status_extended.md` | | | closing | 4.6 |
+| `docs/ARCHITECTURE.md` | closing | 2.2 | 3.7 | 4.6, 4.7 |
+| `docs/STATUS.md` | closing | 2.1 to 2.7, closing | 3.1, closing | 4.1, closing, 4.7 |
+| `docs/program/PROGRAM.md` | closing | closing | 3.7 | 4.6, 4.7 |
+| `docs/proposals/cpu-matmul-avx512.md` | | | | 4.7 |
+| `docs/status_extended.md` | | | closing | 4.6, 4.7 |
 | `AGENTS.md` | | 2.3 | 3.7 | |
-| module READMEs | closing (`src/core`, `tests`, `tools`) | 2.2, 2.5, 2.6, 2.7 (`src/model`, `src/models/qwen35`, `tools`, `tests`) | 3.2, 3.3, 3.6, 3.7 (`src/core`, `src/ops`, `tests`, `tests/golden`, `src/backend`) | 4.6 (`src/model`, `src/models/qwen35`, `tests`, `tests/golden`) |
+| module READMEs | closing (`src/core`, `tests`, `tools`) | 2.2, 2.5, 2.6, 2.7 (`src/model`, `src/models/qwen35`, `tools`, `tests`) | 3.2, 3.3, 3.6, 3.7 (`src/core`, `src/ops`, `tests`, `tests/golden`, `src/backend`) | 4.6 (`src/model`, `src/models/qwen35`, `tests`, `tests/golden`); 4.7 (`src/core`, `src/ops`, `src/backend`, `src/model`, `src/models/qwen35`, `tests`) |
