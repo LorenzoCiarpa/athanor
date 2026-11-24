@@ -21,6 +21,7 @@
 
 #include "core/arena.h"
 #include "core/base.h"
+#include "core/buf.h"
 
 #define ATH_JSON_MAX_DEPTH 256
 
@@ -86,5 +87,21 @@ ath_status ath_json_to_bool(const ath_json *n, bool *out);
 ath_status ath_json_to_str(const ath_json *n, const char **s, size_t *len); /* len may be NULL */
 
 const char *ath_json_type_name(ath_json_type t);
+
+/* ---- writing ------------------------------------------------------------------
+ *
+ * The text Python's json.dumps(x, ensure_ascii=False) gives for the same
+ * value, because chat templates (Jinja's tojson in Hugging Face
+ * transformers) serialize with it: ", " between items, ": " after keys, no
+ * indentation; strings escape '"', '\\', \b \f \n \r \t and other control
+ * characters as \u00xx (lower-case hex) and keep every other character as
+ * it is; doubles in Python's shortest round-trip form (1.0, 1e-05, 1e+16).
+ * Keys keep their order; with duplicate keys Python would keep the last
+ * value at the first key's place, this writer writes them all. */
+ath_status ath_json_write(const ath_json *n, ath_buf *out);
+/* A string value, quotes included. */
+ath_status ath_json_write_str(ath_buf *out, const char *s, size_t n);
+/* A double in Python's repr form (as json.dumps writes it). */
+ath_status ath_json_write_double(ath_buf *out, double d);
 
 #endif /* ATH_JSON_H */

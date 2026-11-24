@@ -12,6 +12,8 @@
 #include "core/json.h"
 
 #include <errno.h>
+#include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -604,4 +606,131 @@ const char *ath_json_type_name(ath_json_type t)
     case ATH_JSON_OBJECT: return "object";
     }
     return "unknown";
+}
+
+/* ---- writing ------------------------------------------------------------------ */
+
+ath_status ath_json_write_str(ath_buf *out, const char *s, size_t n)
+{
+    ATH_CHECK(ath_buf_putc(out, '"'));
+    size_t run = 0;   /* bytes copied as they are, flushed before each escape */
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        const char *esc = NULL;
+        char hex[8];
+        switch (c) {
+        case '"':  esc = "\\\""; break;
+        case '\\': esc = "\\\\"; break;
+        case '\b': esc = "\\b"; break;
+        case '\f': esc = "\\f"; break;
+        case '\n': esc = "\\n"; break;
+        case '\r': esc = "\\r"; break;
+        case '\t': esc = "\\t"; break;
+        default:
+            if (c < 0x20) {
+                snprintf(hex, sizeof hex, "\\u%04x", c);
+                esc = hex;
+            }
+        }
+        if (!esc) {
+            run++;
+            continue;
+        }
+        ATH_CHECK(ath_buf_append(out, s + i - run, run));
+        run = 0;
+        ATH_CHECK(ath_buf_puts(out, esc));
+    }
+    ATH_CHECK(ath_buf_append(out, s + n - run, run));
+    return ath_buf_putc(out, '"');
+}
+
+/* Python's repr of a float: the shortest digits that read back to the same
+ * double, in fixed notation for decimal exponents -4 .. 15 and in
+ * scientific notation (two-digit exponent at least) otherwise. */
+ath_status ath_json_write_double(ath_buf *out, double d)
+{
+    if (isnan(d))
+        return ath_buf_puts(out, "NaN");
+    if (isinf(d))
+        return ath_buf_puts(out, d < 0 ? "-Infinity" : "Infinity");
+    char tmp[40];
+    int  p = 1;
+    for (; p < 17; p++) {
+        snprintf(tmp, sizeof tmp, "%.*e", p - 1, d);
+        if (strtod(tmp, NULL) == d)
+            break;
+    }
+    snprintf(tmp, sizeof tmp, "%.*e", p - 1, d);
+    /* tmp is [-]D[.DDD]e[+-]XX: collect the digits and the exponent. */
+    const char *t = tmp;
+    bool neg = *t == '-';
+    if (neg)
+        t++;
+    char digits[24];
+    int  nd = 0;
+    for (; *t && *t != 'e'; t++)
+        if (*t != '.')
+            digits[nd++] = *t;
+    int e = atoi(t + 1);
+    while (nd > 1 && digits[nd - 1] == '0')
+        nd--;
+    char o[48];
+    int  k = 0;
+    if (neg)
+        o[k++] = '-';
+    if (e >= -4 && e < 16) {
+        if (e < 0) {
+            o[k++] = '0';
+            o[k++] = '.';
+            for (int z = 0; z < -e - 1; z++)
+                o[k++] = '0';
+            for (int i = 0; i < nd; i++)
+                o[k++] = digits[i];
+        } else {
+            for (int i = 0; i <= e; i++)
+                o[k++] = i < nd ? digits[i] : '0';
+            o[k++] = '.';
+            if (nd > e + 1)
+                for (int i = e + 1; i < nd; i++)
+                    o[k++] = digits[i];
+            else
+                o[k++] = '0';
+        }
+    } else {
+        o[k++] = digits[0];
+        if (nd > 1) {
+            o[k++] = '.';
+            for (int i = 1; i < nd; i++)
+                o[k++] = digits[i];
+        }
+        k += snprintf(o + k, sizeof o - (size_t)k, "e%c%02d", e < 0 ? '-' : '+', e < 0 ? -e : e);
+    }
+    return ath_buf_append(out, o, (size_t)k);
+}
+
+ath_status ath_json_write(const ath_json *n, ath_buf *out)
+{
+    switch (n->type) {
+    case ATH_JSON_NULL:   return ath_buf_puts(out, "null");
+    case ATH_JSON_BOOL:   return ath_buf_puts(out, n->u.b ? "true" : "false");
+    case ATH_JSON_INT:    return ath_buf_printf(out, "%lld", (long long)n->u.i);
+    case ATH_JSON_DOUBLE: return ath_json_write_double(out, n->u.d);
+    case ATH_JSON_STRING: return ath_json_write_str(out, n->u.str.ptr, n->u.str.len);
+    case ATH_JSON_ARRAY:
+    case ATH_JSON_OBJECT: {
+        bool obj = n->type == ATH_JSON_OBJECT;
+        ATH_CHECK(ath_buf_putc(out, obj ? '{' : '['));
+        for (const ath_json *c = n->u.kids.first; c; c = c->next) {
+            if (c != n->u.kids.first)
+                ATH_CHECK(ath_buf_puts(out, ", "));
+            if (obj) {
+                ATH_CHECK(ath_json_write_str(out, c->key, c->key_len));
+                ATH_CHECK(ath_buf_puts(out, ": "));
+            }
+            ATH_CHECK(ath_json_write(c, out));
+        }
+        return ath_buf_putc(out, obj ? '}' : ']');
+    }
+    }
+    return ATH_ERR_INVALID_ARG;
 }
