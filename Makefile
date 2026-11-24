@@ -3,14 +3,18 @@
 #   make            CPU build (default), output in build/
 #   make test       build and run the test suites
 #   make check-alloc  verify that inspect allocates only through arenas
+#   make golden     regenerate tests/golden/data from the reference implementation
 #   make DEBUG=1    -O0 -g, ATH_ASSERT enabled, address and UB sanitizers
 #   make cuda/hip   GPU builds (arrive in step 6 and step 11)
 #   make clean
 
 FAMILIES ?= qwen35
-# Checkpoint used by the tests that need real weights (skipped if absent).
-ATH_MODEL_DIR ?= models/Qwen3.5-0.8B
-export ATH_MODEL_DIR
+# Checkpoint and golden data used by the tests that need them (skipped if absent).
+ATH_MODEL_DIR  ?= models/Qwen3.5-0.8B
+ATH_GOLDEN_DIR ?= tests/golden/data/qwen35-0.8b
+export ATH_MODEL_DIR ATH_GOLDEN_DIR
+# Python of the golden-data environment (tests/golden/README.md).
+GOLDEN_PYTHON ?= tests/golden/.venv/bin/python
 CC       ?= cc
 ifeq ($(DEBUG),1)
 BUILD    ?= build/debug
@@ -44,9 +48,9 @@ LIB_OBJ   := $(LIB_SRC:%.c=$(BUILD)/obj/%.o)
 
 TOOL_SRC := $(wildcard tools/*.c)
 TOOL_OBJ := $(TOOL_SRC:%.c=$(BUILD)/obj/%.o)
-TESTS    := $(BUILD)/test_core $(BUILD)/test_model $(BUILD)/test_ops
+TESTS    := $(BUILD)/test_core $(BUILD)/test_model $(BUILD)/test_ops $(BUILD)/test_golden
 
-.PHONY: all cpu cuda hip test check-alloc clean FORCE
+.PHONY: all cpu cuda hip test check-alloc golden clean FORCE
 .SECONDARY:
 .DEFAULT_GOAL := cpu
 
@@ -93,6 +97,11 @@ check-alloc: $(BUILD)/athanor
 	@sh tools/dev/check_alloc.sh $(BUILD)/athanor inspect "$(ATH_MODEL_DIR)"
 	@echo "== heap allocations of athanor inspect --roles"
 	@sh tools/dev/check_alloc.sh $(BUILD)/athanor inspect "$(ATH_MODEL_DIR)" --roles
+
+# Regenerate the golden data from the pinned reference implementation
+# (development only; needs the environment in tests/golden/requirements.txt).
+golden:
+	$(GOLDEN_PYTHON) tests/golden/dump.py "$(ATH_MODEL_DIR)" --out "$(ATH_GOLDEN_DIR)"
 
 cuda:
 	@echo "make cuda: the CUDA backend arrives in step 6 (docs/PLAN.md section 4)" >&2; exit 1

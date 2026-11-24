@@ -22,7 +22,7 @@ Op contract for the first athanor model. Step 1 recorded the checkpoint and its 
 
 ## Reference implementation
 
-Hugging Face `transformers` **5.24.0**, the latest release on 2026-11-24, read from the PyPI wheel (never imported or run by athanor). The `qwen3_5` modeling file is the source of truth for every item below; line numbers refer to that file.
+Hugging Face `transformers` **5.24.0**, the latest release on 2026-11-24, read from the PyPI wheel. athanor never imports or runs it; the golden harness does (`tests/golden/`, development only, with torch 2.15.0 CPU). The `qwen3_5` modeling file is the source of truth for every item below; line numbers refer to that file.
 
 | Item | Value |
 | --- | --- |
@@ -209,7 +209,7 @@ y = (w · n) · silu(z)                 w plain (f32 in the checkpoint), silu(z)
 | RoPE | rotate-half on the first `rope_dim = int(head_dim × partial_rotary_factor)` = 64 dimensions of each head; the other 192 pass through unchanged. `inv_freq[i] = rope_theta^(−2i / rope_dim)` for `i` in [0, 32), `rope_theta` 10,000,000; cos and sin computed in fp32 and cast to bf16; dimension `j` pairs with `j + 32` inside the rotary part. `rope_type` must be `default`. Resolves the RoPE **verify** item. |
 | M-RoPE | `mrope_section` [11, 11, 10] with `mrope_interleaved` mixes three position streams (time, height, width) across frequencies. For text the three streams are the same token index (`Qwen3_5TextModel.forward`, `compute_3d_position_ids` without image or video grids), so the interleaving is the identity and RoPE is the plain 1D form above. |
 | GQA | KV head `j` serves query heads `[4j, 4j + 4)` (`repeat_kv`). |
-| Scores | `q · kᵀ · head_dim^−0.5`, causal mask, softmax in fp32, probabilities cast to bf16, times v. |
+| Scores | `q · kᵀ · head_dim^−0.5`, causal mask, softmax in fp32, probabilities cast to bf16, times v. In the eager path `q · kᵀ` is a bf16 matmul, so the scores are rounded to bf16 before the softmax (`head_dim^−0.5` = 1/16 is a power of two and adds no rounding). athanor keeps scores and probabilities in fp32 (`ath_attn_ref`); step 3 measured the difference on this checkpoint: up to 9.8% of an output element (relative to its magnitude plus the tensor RMS), all of it from the score rounding (`tests/README.md`). |
 | Output | `o = attn · sigmoid(gate)` on the flattened [T, 8 × 256] output, then `o_proj`. |
 | Config | `attention_bias` false: no bias tensors. `attn_output_gate` is not read by the reference: the gate is always present. |
 
@@ -236,7 +236,9 @@ y = (w · n) · silu(z)                 w plain (f32 in the checkpoint), silu(z)
 
 ### Checkpoint dtypes
 
-`A_log` and `linear_attn.norm.weight` are f32 in the checkpoint; every other tensor is bf16. The reference upcasts `A_log` itself (`A_log.float()`). Whether the reference keeps these two tensors in f32 when the model is loaded in bf16 (it has no `_keep_in_fp32_modules`) decides which values the golden data contains: an open question for the golden harness of step 3 (`docs/STATUS.md`). athanor uses the checkpoint values as stored.
+`A_log` and `linear_attn.norm.weight` are f32 in the checkpoint; every other tensor is bf16. The reference upcasts `A_log` itself (`A_log.float()`). athanor uses the checkpoint values as stored.
+
+Resolved in step 3: transformers 5.24.0 rounds both tensors to bf16 on load, with `dtype="auto"` as well as `dtype=torch.bfloat16` (the model has no `_keep_in_fp32_modules`). The forward code works unchanged with f32 values: `A_log.float()` is a no-op, and in the gated RMSNorm an f32 weight promotes `w · n` to fp32 before the gate. The golden data restores the stored f32 values after loading (`tests/golden/README.md`), so the reference and athanor compute with the same weights. On the golden prompt, against an fp32 run of the whole model, the bf16 reference has a mean KL of 5.4e-4 (max 1.4e-3) with the stored values and 5.7e-4 (max 2.9e-3) with the default rounding.
 
 ### MTP head
 

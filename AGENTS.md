@@ -47,7 +47,7 @@ Never rewrite history in `STATUS.md`, `PLAN.md` or `PROGRAM.md`: mark items done
 
 - [ ] Signature in `src/ops/ops.h`, documented (shapes, dtypes, layout)
 - [ ] `<op>_ref` in `src/ops/<op>.c`: scalar, fp32 accumulation, obviously correct, never optimized
-- [ ] Test vs hand-computed or golden values in `tests/test_ops.c`
+- [ ] Tests vs hand-computed values in `tests/test_ops.c`, and vs golden data: a record in `tests/golden/dump.py`, a handler and a justified tolerance in `tests/test_golden.c` (`tests/README.md`)
 - [ ] GPU kernel in `src/ops/<op>.cu`, compiled for CUDA and HIP through `src/backend/compat.h`
 - [ ] Test GPU vs CPU reference on random and real inputs
 - [ ] Optional `<op>_fast` CPU path only if the op runs on CPU at runtime (MoE experts), tested vs `_ref`
