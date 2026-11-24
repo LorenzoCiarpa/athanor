@@ -1,7 +1,8 @@
 /* family.c: the qwen35 entry of the family registry. load() parses the
  * config, fills the model's dimensions and layer schedule, binds the tensors
  * (weights.c) and declares the per-sequence state; forward() is in
- * forward.c. The Makefile lists this family in FAMILIES.
+ * forward.c, the text functions in text.c. The Makefile lists this family
+ * in FAMILIES.
  */
 #include "qwen35.h"
 
@@ -74,4 +75,8 @@ const ath_family ath_family_qwen35 = {
     .match = ath_qwen35_match,
     .load = load,
     .forward = ath_qwen35_forward,
+    .pretokenize_regex = ath_qwen35_pretokenize_regex,
+    .pretokenize = ath_qwen35_pretokenize,
+    .chat = ath_qwen35_chat,
+    .parse = ath_qwen35_parse,
 };

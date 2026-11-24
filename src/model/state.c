@@ -108,6 +108,19 @@ void ath_state_reset(ath_state *s, const ath_model *m)
 
 /* ---- forward ------------------------------------------------------------------ */
 
+ath_status ath_state_copy(ath_state *dst, const ath_state *src, const ath_model *m)
+{
+    if (!dst || !src || !m || dst->act != src->act || dst->capacity != src->capacity || !dst->buf || !src->buf)
+        return ATH_ERR_INVALID_ARG;
+    for (uint32_t i = 0; i < m->n_states; i++) {
+        size_t b;
+        ATH_CHECK(spec_bytes(&m->states[i], src->act, src->capacity, &b));
+        memcpy(dst->buf[i], src->buf[i], b);
+    }
+    dst->n_past = src->n_past;
+    return ATH_OK;
+}
+
 static ath_status bad(ath_status st, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 
 static ath_status bad(ath_status st, const char *fmt, ...)

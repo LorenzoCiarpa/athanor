@@ -95,6 +95,15 @@ ath_status ath_qwen35_bind(ath_model *m, ath_arena *a, ath_qwen35_model *q);
 ath_status ath_qwen35_forward(const ath_model *m, const ath_batch *b, ath_state *s, const ath_hooks *h,
                               ath_arena *scratch, ath_pool *pool);
 
+/* text.c: pre-tokenization, chat template and output parser (model.h,
+ * ath_family). */
+extern const char ath_qwen35_pretokenize_regex[];
+ath_status ath_qwen35_pretokenize(const char *text, size_t n, ath_spans *out);
+ath_status ath_qwen35_chat(const ath_msg *msgs, int32_t n_msgs, const ath_tool_def *tools, int32_t n_tools,
+                           uint32_t opts, ath_buf *out);
+ath_status ath_qwen35_parse(ath_parse_state *st, const char *piece, size_t n, ath_out_event *events, int32_t cap,
+                            int32_t *n_events);
+
 extern const ath_family ath_family_qwen35;
 
 #endif /* ATH_QWEN35_H */

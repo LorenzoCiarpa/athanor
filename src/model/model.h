@@ -17,18 +17,22 @@
  * Step 2 defined roles, params, the layer schedule and loading. Step 4 adds
  * the forward pass: the per-sequence state a model needs (state specs, so
  * that pipelines allocate it without knowing the layer types), batches and
- * hooks. Pre-tokenization and chat templates (step 5), the matmul hook
- * (phase 2) and the backward pass (phase 4) join the contract when their
- * first user lands; docs/ARCHITECTURE.md shows the target.
+ * hooks. Step 5 adds text: the family's pre-tokenization, its chat template
+ * (with tool definitions and the thinking switch) and the parser of its
+ * output (thinking, tool calls). The matmul hook (phase 2) and the backward
+ * pass (phase 4) join the contract when their first user lands;
+ * docs/ARCHITECTURE.md shows the target.
  */
 #ifndef ATH_MODEL_H
 #define ATH_MODEL_H
 
 #include "core/arena.h"
+#include "core/buf.h"
 #include "core/json.h"
 #include "core/safetensors.h"
 #include "core/tensor.h"
 #include "core/threads.h"
+#include "text/bpe.h"
 
 /* What a param is for. Matmul roles name the direction relative to the
  * residual stream: _IN reads from it, _OUT writes back into it. */
@@ -117,6 +121,71 @@ typedef struct {
     int64_t        per_token;   /* elements per token (KV: keys and values)                      */
 } ath_state_spec;
 
+/* ---- text (step 5) ------------------------------------------------------------
+ *
+ * A conversation goes in as messages and tool definitions; the family
+ * renders it into the exact prompt text of the model's chat template. The
+ * model's output comes back as text pieces (decoded tokens), and the family
+ * parses them into events: answer text, thinking, and tool calls with their
+ * arguments as a JSON object. athanor never runs a tool (AGENTS.md,
+ * invariant 10): a harness reads the calls through the API and sends the
+ * results back as messages with role ATH_MSG_TOOL. */
+
+typedef struct {
+    const char *name;
+    const char *description;   /* NULL: none                                     */
+    const char *json_schema;   /* the parameters, a JSON Schema object as raw
+                                * JSON text; NULL: none                         */
+} ath_tool_def;
+
+typedef struct {
+    const char *id;            /* the harness's id of the call; may be NULL      */
+    const char *name;
+    const char *arguments;     /* a JSON object as raw text; NULL: none          */
+} ath_tool_call;
+
+typedef enum { ATH_MSG_SYSTEM, ATH_MSG_USER, ATH_MSG_ASSISTANT, ATH_MSG_TOOL } ath_msg_role;
+
+typedef struct {
+    ath_msg_role         role;
+    const char          *content;        /* UTF-8, NUL-terminated; NULL as empty        */
+    const char          *reasoning;      /* assistant: its thinking, when given apart
+                                          * from content; NULL: none given             */
+    const ath_tool_call *tool_calls;     /* assistant: the calls it made                */
+    int32_t              n_tool_calls;
+    const char          *tool_call_id;   /* tool: the id of the call this answers       */
+} ath_msg;
+
+#define ATH_CHAT_GENERATE 1u   /* end with the assistant's header: the model writes next */
+#define ATH_CHAT_THINKING 2u   /* the model thinks before it answers                       */
+
+typedef enum {
+    ATH_OUT_TEXT,              /* answer text                                              */
+    ATH_OUT_THINKING,          /* thinking text                                            */
+    ATH_OUT_TOOL_CALL_BEGIN,   /* a tool call starts; tool_name is set                     */
+    ATH_OUT_TOOL_CALL_ARGS,    /* bytes of its arguments; the bytes of all the ARGS events
+                                * of one call form a JSON object                           */
+    ATH_OUT_TOOL_CALL_END
+} ath_out_kind;
+
+typedef struct {
+    ath_out_kind kind;
+    const char  *data;         /* text, thinking or argument bytes                         */
+    size_t       len;
+    const char  *tool_name;    /* TOOL_CALL_BEGIN: the function's name, NUL-terminated     */
+} ath_out_event;
+
+/* The parser of one model output. Zero it, set the fields above priv, and
+ * pass it to every parse call of that output. */
+typedef struct {
+    uint32_t            opts;      /* the ATH_CHAT_* options the prompt was rendered with */
+    const ath_tool_def *tools;     /* the prompt's tools: their schemas give the types of
+                                    * the arguments                                       */
+    int32_t             n_tools;
+    ath_arena          *a;         /* the parser's memory and the bytes of its events      */
+    void               *priv;      /* the family's state, NULL before the first call       */
+} ath_parse_state;
+
 typedef struct ath_family ath_family;
 
 typedef struct {
@@ -195,6 +264,29 @@ struct ath_family {
      * yet. */
     ath_status (*forward)(const ath_model *m, const ath_batch *b, ath_state *s, const ath_hooks *h,
                           ath_arena *scratch, ath_pool *pool);
+
+    /* ---- text (step 5); NULL if the family has none ---- */
+
+    /* The Split regex of tokenizer.json that pretokenize implements; the
+     * tokenizer refuses a file with another one. */
+    const char *pretokenize_regex;
+    /* Split text into the pieces BPE merges within (src/text/bpe.h). */
+    ath_status (*pretokenize)(const char *text, size_t n, ath_spans *out);
+    /* Append the prompt for msgs (and the tool definitions, if n_tools > 0)
+     * to out, byte for byte as the model's chat template renders it.
+     * ATH_ERR_INVALID_ARG where the template raises an error (no messages,
+     * a system message after the first, no user message) or for arguments
+     * that are not a JSON object. */
+    ath_status (*chat)(const ath_msg *msgs, int32_t n_msgs, const ath_tool_def *tools, int32_t n_tools,
+                       uint32_t opts, ath_buf *out);
+    /* Parse the next piece of output (the decoded bytes of one or more
+     * tokens, split anywhere) into events, at most cap. piece == NULL ends
+     * the output: whatever was held back is decided. Markup split across
+     * pieces is held back until it is complete; malformed markup comes out
+     * as text. Event bytes are valid until the next call. cap >= n + 8 is
+     * always enough; otherwise ATH_ERR_RANGE, and the state is undefined. */
+    ath_status (*parse)(ath_parse_state *st, const char *piece, size_t n, ath_out_event *events, int32_t cap,
+                        int32_t *n_events);
 };
 
 /* Open the checkpoint in dir: parse config.json, pick the first compiled-in
@@ -225,6 +317,14 @@ ath_status ath_state_init(ath_state *s, const ath_model *m, ath_dtype act, int32
  * KV cache is not cleared: positions at or past n_past are never read.) */
 void ath_state_reset(ath_state *s, const ath_model *m);
 
+/* Copy the state of one sequence into another state of the same model,
+ * activation dtype and capacity: every buffer and n_past. A copy taken at
+ * a point the conversation will come back to (the end of a turn's stable
+ * prefix) lets a pipeline resume there, since a recurrent state cannot be
+ * rolled back. ATH_ERR_INVALID_ARG if the two states differ in dtype or
+ * capacity. */
+ath_status ath_state_copy(ath_state *dst, const ath_state *src, const ath_model *m);
+
 /* Run one batch through the model. Checks the arguments (ATH_ERR_INVALID_ARG,
  * ATH_ERR_TYPE; ATH_ERR_RANGE for a token id outside the vocabulary or a
  * batch that does not fit in the state; ATH_ERR_UNSUPPORTED if the family
@@ -236,6 +336,19 @@ void ath_state_reset(ath_state *s, const ath_model *m);
  * threads. */
 ath_status ath_model_forward(const ath_model *m, const ath_batch *b, ath_state *s, const ath_hooks *h,
                              ath_arena *scratch, ath_pool *pool);
+
+/* ---- text (text.c) ------------------------------------------------------------- */
+
+/* Load the tokenizer of the checkpoint in dir (tokenizer.json) with the
+ * family's pre-tokenization. ATH_ERR_UNSUPPORTED if the family has none. */
+ath_status ath_model_tokenizer(const ath_model *m, const char *dir, ath_tokenizer *t, ath_arena *a);
+
+/* The family's chat and parse (ath_family), after checking the arguments;
+ * ATH_ERR_UNSUPPORTED if the family has none. */
+ath_status ath_model_chat(const ath_model *m, const ath_msg *msgs, int32_t n_msgs, const ath_tool_def *tools,
+                          int32_t n_tools, uint32_t opts, ath_buf *out);
+ath_status ath_model_parse(const ath_model *m, ath_parse_state *st, const char *piece, size_t n,
+                           ath_out_event *events, int32_t cap, int32_t *n_events);
 
 /* Families compiled into this binary (Makefile FAMILIES), in order. */
 size_t            ath_family_count(void);
