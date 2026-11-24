@@ -13,6 +13,8 @@
 
 #include "core/base.h"
 
+#include <string.h>
+
 #define ATH_MAX_DIMS 8
 
 typedef enum {
@@ -80,5 +82,58 @@ ath_status ath_tensor_slice(const ath_tensor *t, int32_t dim, int64_t start, int
  * count must not change. */
 ath_status ath_tensor_reshape(const ath_tensor *t, int32_t ndim, const int64_t *shape,
                               ath_tensor *out);
+
+/* True if both tensors have the same number of dimensions and the same shape. */
+bool ath_tensor_same_shape(const ath_tensor *a, const ath_tensor *b);
+
+/* ---- element values --------------------------------------------------------
+ *
+ * bf16 is the upper half of an IEEE f32 (same exponent range, 7 stored
+ * mantissa bits), so widening is exact and narrowing is a rounding. athanor
+ * rounds to nearest, ties to even, and turns every NaN into the quiet NaN
+ * 0x7fc0, exactly like torch (c10::BFloat16): a tensor rounded by athanor and
+ * by the reference implementation is bit-identical when the f32 values are.
+ */
+
+static inline float ath_bf16_to_f32(uint16_t h)
+{
+    uint32_t u = (uint32_t)h << 16;
+    float f;
+    memcpy(&f, &u, sizeof f);
+    return f;
+}
+
+static inline uint16_t ath_f32_to_bf16(float f)
+{
+    uint32_t u;
+    memcpy(&u, &f, sizeof u);
+    if ((u & 0x7fffffffu) > 0x7f800000u)              /* NaN */
+        return 0x7fc0u;
+    u += 0x7fffu + ((u >> 16) & 1u);                  /* round half to even; overflow gives inf */
+    return (uint16_t)(u >> 16);
+}
+
+/* Element i of a buffer holding values of dtype dt (f32 or bf16), as a float.
+ * The reference ops read and write activations and weights through these. */
+static inline float ath_load_f32(const void *data, ath_dtype dt, int64_t i)
+{
+    if (dt == ATH_DTYPE_BF16)
+        return ath_bf16_to_f32(((const uint16_t *)data)[i]);
+    return ((const float *)data)[i];
+}
+
+static inline void ath_store_f32(void *data, ath_dtype dt, int64_t i, float v)
+{
+    if (dt == ATH_DTYPE_BF16)
+        ((uint16_t *)data)[i] = ath_f32_to_bf16(v);
+    else
+        ((float *)data)[i] = v;
+}
+
+/* The value v takes once stored as dt (f32 or bf16). */
+static inline float ath_round_to(ath_dtype dt, float v)
+{
+    return dt == ATH_DTYPE_BF16 ? ath_bf16_to_f32(ath_f32_to_bf16(v)) : v;
+}
 
 #endif /* ATH_TENSOR_H */

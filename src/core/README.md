@@ -6,7 +6,7 @@ The bottom layer: memory, tensors, files, parsing, threads. No GPU code and no k
 | --- | --- | --- |
 | `base.h`, `base.c` | fixed-width types, `ath_status` and `ath_status_str`, `ATH_CHECK`, logging (`ath_log`, `ATH_LOG` environment variable), `ATH_ASSERT` | 1 |
 | `arena.h`, `arena.c` | lifetime-scoped linear arenas (weights, per-request, per-step scratch): chained blocks, alignment, mark/reset | 1 |
-| `tensor.h`, `tensor.c` | `ath_dtype`, `ath_tier`, `ath_tensor` descriptor, slice and reshape views | 1 |
+| `tensor.h`, `tensor.c` | `ath_dtype`, `ath_tier`, `ath_tensor` descriptor, slice and reshape views; bf16 conversion (round to nearest even, as torch) and element access for f32 and bf16 (step 3) | 1, 3 |
 | `file.h`, `file.c` | read-only `mmap`, `pread`, path join; async reads later (io_uring via raw syscalls) | 1 |
 | `json.h`, `json.c` | read-only JSON parser into an arena; lookup by key, index and dotted path | 1 |
 | `safetensors.h`, `safetensors.c` | single and multi-shard readers, zero-copy views; writer added in phase 4 for checkpoint export | 1 |

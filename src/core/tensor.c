@@ -130,3 +130,13 @@ ath_status ath_tensor_reshape(const ath_tensor *t, int32_t ndim, const int64_t *
     *out = v;
     return ATH_OK;
 }
+
+bool ath_tensor_same_shape(const ath_tensor *a, const ath_tensor *b)
+{
+    if (a->ndim != b->ndim)
+        return false;
+    for (int32_t i = 0; i < a->ndim; i++)
+        if (a->shape[i] != b->shape[i])
+            return false;
+    return true;
+}
