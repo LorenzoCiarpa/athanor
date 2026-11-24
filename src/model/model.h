@@ -13,10 +13,12 @@
  *   training       LoRA targets by role, hot/cold blocks by layer
  *   MoE placement  experts by layer and expert
  *
- * Step 2 defines roles, params, the layer schedule and loading. The forward
- * pass, state specs and hooks (step 4), pre-tokenization and chat templates
- * (step 5) and the backward pass (phase 4) join the contract when their first
- * user lands; docs/ARCHITECTURE.md shows the target.
+ * Step 2 defined roles, params, the layer schedule and loading. Step 4 adds
+ * the forward pass: the per-sequence state a model needs (state specs, so
+ * that pipelines allocate it without knowing the layer types), batches and
+ * hooks. Pre-tokenization and chat templates (step 5), the matmul hook
+ * (phase 2) and the backward pass (phase 4) join the contract when their
+ * first user lands; docs/ARCHITECTURE.md shows the target.
  */
 #ifndef ATH_MODEL_H
 #define ATH_MODEL_H
@@ -81,6 +83,31 @@ typedef struct {
     uint64_t    bytes;
 } ath_ignored;
 
+/* ---- per-sequence state (step 4) ---------------------------------------------
+ *
+ * A model lists the state one sequence needs as specs; pipelines allocate it
+ * and decide where it lives by kind and size alone. The element type follows
+ * from the kind and from the activation dtype the state is created with. */
+typedef enum {
+    ATH_STATE_KV,          /* keys and values of an attention layer, per token: grows
+                            * with the sequence; activation dtype                    */
+    ATH_STATE_CONV,        /* the last inputs of a short causal convolution; fixed
+                            * size; activation dtype                                 */
+    ATH_STATE_RECURRENT,   /* the recurrent state of a linear-attention layer; fixed
+                            * size; always fp32                                      */
+    ATH_STATE_KIND_COUNT
+} ath_state_kind;
+
+/* Lower-case name ("kv"); "?" for values out of range. */
+const char *ath_state_kind_name(ath_state_kind k);
+
+typedef struct {
+    ath_state_kind kind;
+    int32_t        layer;
+    int64_t        fixed;       /* elements independent of the sequence length (CONV, RECURRENT) */
+    int64_t        per_token;   /* elements per token (KV: keys and values)                      */
+} ath_state_spec;
+
 typedef struct ath_family ath_family;
 
 typedef struct {
@@ -104,8 +131,40 @@ typedef struct {
     int32_t           n_experts;         /* routed experts per MoE layer, 0 if dense   */
     int32_t           n_experts_active;  /* experts selected per token, 0 if dense     */
 
+    ath_state_spec   *states;            /* per-sequence state, in layer order         */
+    uint32_t          n_states;
+
     void             *family_data;       /* family-private (parsed config); opaque     */
 } ath_model;
+
+/* The state of one sequence, in host memory (ath_state_init). The engine of
+ * step 8 keeps the same layout on the GPU. */
+typedef struct {
+    ath_dtype act;          /* activation dtype: ATH_DTYPE_BF16 (the checkpoint's, as the
+                             * reference runs) or ATH_DTYPE_F32 (an exact forward pass)   */
+    int32_t   capacity;     /* tokens the KV buffers hold                                 */
+    int32_t   n_past;       /* tokens processed so far: the position of the next token    */
+    void    **buf;          /* [n_states]: buf[i] holds m->states[i]                      */
+} ath_state;
+
+/* Tokens appended to the sequence of a state by one forward call. */
+typedef struct {
+    const int32_t *tokens;  /* [n_tokens] token ids                                      */
+    int32_t        n_tokens;
+    ath_tensor    *logits;  /* NULL (no output), or f32 [n_tokens, vocab_size] (every
+                             * token) or [1, vocab_size] (the last token only)            */
+} ath_batch;
+
+/* Callbacks from inside the forward pass. Every member may be NULL; the
+ * tensors are valid during the call only and must not be written. */
+typedef struct {
+    /* The residual stream entering layer `layer` (0 … n_layers − 1); with
+     * layer == n_layers, the stream entering the final norm. x is
+     * [n_tokens, hidden_size] in the activation dtype. Abliteration captures
+     * it (phase 3); the forward tests compare it with the reference. */
+    void (*on_residual)(void *u, int32_t layer, const ath_tensor *x);
+    void  *u;
+} ath_hooks;
 
 struct ath_family {
     const char *name;
@@ -117,6 +176,13 @@ struct ath_family {
      * ATH_ERR_NOT_FOUND for a missing tensor and ATH_ERR_FORMAT for a tensor
      * whose dtype or shape does not follow from the config. */
     ath_status (*load)(ath_model *m, ath_arena *a);
+    /* Run b->tokens at positions s->n_past, s->n_past + 1, ...: read and update
+     * the state buffers, call the hooks, write the logits. Called only through
+     * ath_model_forward, which has checked every argument and advances
+     * s->n_past afterwards. Working memory comes from scratch. NULL if the
+     * family cannot run models yet. */
+    ath_status (*forward)(const ath_model *m, const ath_batch *b, ath_state *s, const ath_hooks *h,
+                          ath_arena *scratch);
 };
 
 /* Open the checkpoint in dir: parse config.json, pick the first compiled-in
@@ -130,6 +196,31 @@ ath_status ath_model_open(ath_model *m, ath_arena *a, const char *dir);
 
 /* Unmap the checkpoint. Param views become invalid. */
 void ath_model_close(ath_model *m);
+
+/* ---- running a model (state.c) ----------------------------------------------- */
+
+/* Bytes of state for one sequence of up to capacity tokens, with activation
+ * dtype act (ATH_DTYPE_BF16 or ATH_DTYPE_F32). ATH_ERR_RANGE if it does not
+ * fit in size_t. */
+ath_status ath_state_bytes(const ath_model *m, ath_dtype act, int32_t capacity, size_t *bytes);
+
+/* Allocate the state of one sequence in a and reset it. capacity >= 1. */
+ath_status ath_state_init(ath_state *s, const ath_model *m, ath_dtype act, int32_t capacity,
+                          ath_arena *a);
+
+/* Start a new sequence: n_past = 0, conv and recurrent state zeroed. (The
+ * KV cache is not cleared: positions at or past n_past are never read.) */
+void ath_state_reset(ath_state *s, const ath_model *m);
+
+/* Run one batch through the model. Checks the arguments (ATH_ERR_INVALID_ARG,
+ * ATH_ERR_TYPE; ATH_ERR_RANGE for a token id outside the vocabulary or a
+ * batch that does not fit in the state; ATH_ERR_UNSUPPORTED if the family
+ * has no forward pass), calls the family's forward and, on success, advances
+ * s->n_past by b->n_tokens. On failure the state is undefined until
+ * ath_state_reset. Working memory is allocated in scratch and released
+ * before returning; h may be NULL. */
+ath_status ath_model_forward(const ath_model *m, const ath_batch *b, ath_state *s, const ath_hooks *h,
+                             ath_arena *scratch);
 
 /* Families compiled into this binary (Makefile FAMILIES), in order. */
 size_t            ath_family_count(void);
