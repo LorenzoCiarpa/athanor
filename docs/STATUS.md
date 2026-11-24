@@ -6,11 +6,38 @@ This file is the overview. [`status_extended.md`](status_extended.md) goes one l
 
 ## Current step
 
-**Step 3: CPU reference ops and golden harness** (see `docs/PLAN.md` §4). Started 2026-11-24 on branch `step3-ops-golden`. **Done 2026-11-24** (pushed, to be merged into `main`); step 4 is next.
+**Step 4: CPU forward** (see `docs/PLAN.md` §4). Started 2026-11-24 on branch `step4-cpu-forward`.
+
+Goal: the whole Qwen3.5-0.8B forward pass on the CPU, composed from the step 3 ops, with the per-sequence state (KV cache, conv and recurrent state) that prefill and decode need, reached by pipelines only through the contract; and evidence on fixed prompts that its logits are as close to the exact model as the reference implementation's.
+
+### Tasks
+
+- [ ] **4.1 End-to-end metric.** Settle the open question (below): KL against an fp32 run of the reference, gated on the bf16 reference's own KL; greedy agreement; the residual stream per layer as a diagnostic; an fp32 forward of athanor against the fp32 reference, tight.
+- [ ] **4.2 Contract.** `src/model/model.h`: state kinds and specs (`ath_state_spec`, listed by the model), `ath_state` (one sequence: activation dtype, capacity, tokens so far, one buffer per spec), `ath_batch`, `ath_hooks` with `on_residual`, and `forward` in `ath_family`. `src/model/state.c`: `ath_state_init`, `ath_state_reset`, `ath_state_bytes`, `ath_model_forward` (argument checks, positions, scratch memory, `n_past`).
+- [ ] **4.3 `src/models/qwen35/forward.c`.** Embedding, Gated DeltaNet and attention mixers, MLP, final norm and fp32 logits (every token or the last), composed from the step 3 ops in the order of the contract; state specs declared at load; activations in the state's dtype (bf16 as the reference, or f32); MoE layers rejected until step 12.
+- [ ] **4.4 `tests/golden/dump.py`, forward records.** Two fixed prompts (the op prompt and a chat-formatted one), each followed by 8 greedy decode steps of the bf16 reference; the same tokens through the reference loaded in fp32; per position, the residual stream entering every layer and the final norm, and the logits, of both runs.
+- [ ] **4.5 `tests/test_forward.c`.** On a tiny random checkpoint (builder shared with `test_model.c` in `tests/tiny.h`): argument checks, state specs and sizes, hooks, and prefill all at once = in pieces = token by token, bit for bit, in bf16 and f32. On the real checkpoint, against the forward records: the KL gate, greedy agreement, the fp32 forward against the fp32 reference.
+- [ ] **4.6 Documentation.** Contract docs (`docs/ARCHITECTURE.md`, `src/model/README.md`), family README, `tests/README.md`, `tests/golden/README.md`, `docs/contract/qwen35-0.8b.md` (logits measured), `docs/program/PROGRAM.md`, this file and `status_extended.md`.
+
+### Acceptance criteria
+
+1. `forward`, the state specs, `ath_state`, `ath_batch` and `ath_hooks` are in `model.h`, documented, and the tests reach the forward pass only through the contract (no family header).
+2. On both fixed prompts, prefill and decode, athanor with bf16 activations has a mean KL against the fp32 reference no larger than the bf16 reference's mean KL against the same run (the gate); the maximum is reported.
+3. athanor's greedy token equals the fp32 reference's at every position where the fp32 reference's top-2 margin is larger than the bf16 noise: the largest change of that margin between the fp32 and the bf16 reference over the same positions.
+4. athanor with f32 activations: the residual stream entering every layer and the logits are within a justified tolerance of the fp32 reference (`tests/README.md`).
+5. Prefill all at once, in pieces and token by token give bit-identical logits and states.
+6. `make test` green with zero warnings, also with `DEBUG=1`; no model names in `src/` outside `src/models/`.
+7. Documentation listed in 4.6 updated.
+
+## Completed steps
+
+### Step 3
+
+**Step 3: CPU reference ops and golden harness** (see `docs/PLAN.md` §4). Started 2026-11-24 on branch `step3-ops-golden`. **Done 2026-11-24** (pushed, to be merged into `main`); step 4 is next. Merged into `main` (fast-forward) on 2026-11-24.
 
 Goal: every op of the Qwen3.5-0.8B forward pass as a scalar CPU reference in `src/ops/`, and evidence on the real weights that each one computes what the pinned reference implementation computes.
 
-### Tasks
+#### Tasks
 
 - [x] **3.1 Golden environment, f32 question.** Pin the Python environment of the golden harness (`tests/golden/requirements.in` and the uv lock `requirements.txt`: transformers 5.24.0, torch 2.15.0 CPU build, Python 3.14) and settle the open question on the f32 checkpoint tensors.
 - [x] **3.2 `src/core/tensor.h`.** bf16 conversion (round to nearest, ties to even, NaN as torch does), element load and store for f32 and bf16, `ath_tensor_same_shape`.
@@ -20,7 +47,7 @@ Goal: every op of the Qwen3.5-0.8B forward pass as a scalar CPU reference in `sr
 - [x] **3.6 `tests/test_golden.c`.** Replay every record through the `_ref` functions on the real weights, native and exact, with a tolerance per op and output justified in `tests/README.md`.
 - [x] **3.7 Documentation.** Contract, READMEs of `src/ops`, `src/core`, `src/backend`, `tests`, `tests/golden`, `docs/ARCHITECTURE.md` tree, AGENTS op checklist, `docs/program/PROGRAM.md`.
 
-### Acceptance criteria
+#### Acceptance criteria
 
 1. Every op of the Qwen3.5-0.8B contract has a `_ref` function in `src/ops/`, documented in `ops.h` (shapes, dtypes, math).
 2. `make golden` regenerates the golden data from the pinned reference and refuses any other version.
@@ -41,8 +68,6 @@ Result (2026-11-24, Qwen3.5-0.8B revision `2fc0636`, transformers 5.24.0, torch 
 | 6 | documentation | contract (attention scores, checkpoint dtypes, reference now run by the golden harness), `docs/MODELS.md` status, READMEs of `src/ops`, `src/core`, `src/backend`, `tests`, `tests/golden`, `docs/ARCHITECTURE.md` tree, AGENTS op checklist, `docs/program/PROGRAM.md` rows 3 and 4 |
 
 `ldd build/athanor` now lists `libm` too (the ops call `expf`, `sqrtf`, `powf`), which the step 1 criterion allows.
-
-## Completed steps
 
 ### Step 2
 
@@ -126,7 +151,9 @@ Result (2026-11-23, Qwen3.5-0.8B revision `2fc0636`, gcc 15.2, glibc 2.43):
 
 ## Next step (preview)
 
-**Step 4: CPU forward.** `src/models/qwen35/forward.c` composes the step 3 ops into the decoder layers and the logits; `forward` and the state specs (KV cache, recurrent and conv state) join `model.h` with this first user; a minimal CPU state for one sequence; `tests/golden/dump.py` extends to per-layer hidden states and logits on fixed prompts. Gate: logits match the reference implementation on fixed prompts (metric to settle first: see Open questions).
+**Step 5: tokenizer, sampling, CPU chat.** `src/text/bpe.c` and the generated `unicode.h` (byte-level BPE from `tokenizer.json`), the family's pre-tokenization split and chat template in `src/models/qwen35/text.c` (`pretokenize` and `chat` join the contract), `src/ops/sample.c`, and a first `athanor chat` on the CPU forward of step 4. Gate: exact token round-trip on a corpus against the reference tokenizer; a first chat, slow and correct.
+
+Superseded preview (written in step 3): **Step 4: CPU forward.** `src/models/qwen35/forward.c` composes the step 3 ops into the decoder layers and the logits; `forward` and the state specs (KV cache, recurrent and conv state) join `model.h` with this first user; a minimal CPU state for one sequence; `tests/golden/dump.py` extends to per-layer hidden states and logits on fixed prompts. Gate: logits match the reference implementation on fixed prompts (metric to settle first: see Open questions).
 
 Superseded preview (written in step 2): **Step 3: CPU reference ops and golden harness.** `src/ops/*.c` references (scalar, fp32 accumulation) for every op in the contract, `src/backend/cpu.c`, `tests/golden/dump.py` against the pinned reference, `tests/test_ops.c`. Gate: every op within tolerance of golden tensors on real weights.
 
@@ -139,7 +166,7 @@ Superseded preview (written in step 1): **Step 2: contract and family loading.**
 - **Hardware assumptions in `docs/PLAN.md` §2 can be confirmed:** CPU is an AMD Ryzen 7 9800X3D (Zen 5; `avx512f`, `avx512bw`, `avx512vl` and `avx512_bf16` present); RAM shows 59 GiB usable, consistent with 64 GB installed.
 - **Step 2, weight parameterizations.** The checkpoint suggests zero-centered RMSNorm weights for the decoder-layer norms and `q_norm`/`k_norm`, and plain weights for the Gated DeltaNet output norm (`docs/contract/qwen35-0.8b.md`, observations). To be confirmed against the pinned reference implementation, as the **verify** rule requires. **Resolved 2026-11-24:** confirmed against transformers 5.24.0 (`Qwen3_5RMSNorm` uses `1 + w`, `Qwen3_5RMSNormGated` a plain `w`); see the contract, sections RMSNorm and Gated RMSNorm.
 - **Golden data and f32 checkpoint tensors (step 3).** `A_log` and `linear_attn.norm.weight` are f32 in the checkpoint, and the reference has no `_keep_in_fp32_modules`. If the golden dump loads the model in bf16, the reference rounds them to bf16 and its outputs differ from athanor's (which uses the stored f32 values). Options: load the reference in fp32 for op-level goldens, or check what transformers 5.24.0 does with mixed-dtype checkpoints and record it. To settle before writing `tests/golden/dump.py`. **Resolved 2026-11-24:** transformers 5.24.0 rounds both tensors to bf16 on load (`dtype="auto"` and `dtype=torch.bfloat16` alike). `dump.py` loads in bf16 and puts the stored f32 values back, which the forward code handles unchanged, so the reference and athanor use the same weights; on the golden prompt this brings the bf16 reference closer to an fp32 run of the model (max KL 1.4e-3 instead of 2.9e-3). Recorded in the contract (Checkpoint dtypes) and `tests/golden/README.md`.
-- **End-to-end reference and metric for step 4.** The reference differs from athanor by design in a few roundings: the eager attention rounds `q·kᵀ` to bf16 (up to 9.8% of an attention output element of Qwen3.5-0.8B, relative to its magnitude plus the tensor RMS, `tests/README.md`), the reference computes the logits in bf16 where `docs/MODELS.md` asks for fp32, and every elementwise op rounds more often in the reference than in athanor. Logits will therefore not match to the bit. Options for the step 4 gate: (a) per-layer hidden states and logits within a tolerance derived like the op tolerances; (b) KL of athanor against an fp32 run of the reference, no larger than the KL of the bf16 reference against the same fp32 run (athanor at least as close to the exact model as transformers in bf16), plus greedy tokens identical where the reference's top-2 margin is above the bf16 noise. Recommended: (b), with (a) as a diagnostic. To settle at the start of step 4.
+- **End-to-end reference and metric for step 4.** The reference differs from athanor by design in a few roundings: the eager attention rounds `q·kᵀ` to bf16 (up to 9.8% of an attention output element of Qwen3.5-0.8B, relative to its magnitude plus the tensor RMS, `tests/README.md`), the reference computes the logits in bf16 where `docs/MODELS.md` asks for fp32, and every elementwise op rounds more often in the reference than in athanor. Logits will therefore not match to the bit. Options for the step 4 gate: (a) per-layer hidden states and logits within a tolerance derived like the op tolerances; (b) KL of athanor against an fp32 run of the reference, no larger than the KL of the bf16 reference against the same fp32 run (athanor at least as close to the exact model as transformers in bf16), plus greedy tokens identical where the reference's top-2 margin is above the bf16 noise. Recommended: (b), with (a) as a diagnostic. To settle at the start of step 4. **Resolved 2026-11-24 (step 4, task 4.1):** (b) is the gate: mean KL over every position of the fixed prompts (prefill and decode) against an fp32 run of the reference, no larger than the bf16 reference's mean KL against the same run; the maximum is reported, not gated. Greedy agreement is required where the fp32 reference's top-2 margin exceeds the bf16 noise, measured as the largest change of that margin between the fp32 and the bf16 reference. (a) is reported as a diagnostic (the residual stream entering every layer, against both runs). In addition athanor runs its forward pass with f32 activations against the fp32 reference, within a tolerance justified like the op tolerances: this checks the composition tightly, without the bf16 noise that the KL gate tolerates.
 
 ## Log
 
@@ -154,3 +181,4 @@ Superseded preview (written in step 1): **Step 2: contract and family loading.**
 - 2026-11-24: step 3 implemented on branch `step3-ops-golden`: `src/ops/{ops.h,check.h}` and `src/ops/{embed,matmul,norm,rope,act,attn,conv,gdn}.c`, bf16 helpers in `src/core/tensor.h`, `tests/golden/{dump.py,requirements.in,requirements.txt,README.md}`, `tests/test_ops.c`, `tests/test_golden.c`, `make golden`. All acceptance criteria met (table above).
 - 2026-11-24: decisions taken within step 3 (`PLAN.md` unchanged; the first one departs from its file list for step 3): `src/backend/cpu.c` is not written yet: the reference ops need no runtime (no allocation, one thread, host memory from arenas), so it arrives with its first user (the GPU runtime of step 6 or the thread pool of the first `_fast` path); the device-dispatching entry points of `ops.h` join with the second implementation of an op (step 7); ops take `ath_tensor` descriptors, f32 or bf16, contiguous, and round once to the output dtype, with intermediate roundings only where the contract records them (`rmsnorm_gated`, `rope` tables); attention keeps scores and probabilities in fp32 (the eager reference rounds both); the L2 norm is a separate op composed before the recurrence (the reference fuses it into its Gated DeltaNet function); the conv state is the last K − 1 inputs (the reference keeps K, the oldest never used: `dump.py` checks it); golden data covers every op of all 24 layers in prefill and decode, matmuls on rows 0 and T − 1 only (each output row depends on its input row only), with eager attention, one CPU thread and the f32 tensors restored; it is not committed (434 MiB, regenerated in seconds) and athanor reads it with its own safetensors reader; each comparison is one score, max |got − want| / (|want| + rms(want)), against the reference's own output (native) and its fp32 rerun (exact).
 - 2026-11-24: `docs/status_extended.md` added: for every task of steps 1 to 3, the files created or changed, what each is for and what was implemented; kept up to date with every task from now on (AGENTS.md workflow, step 4).
+- 2026-11-24: `step3-ops-golden` merged into `main` (fast-forward); step 4 started on `step4-cpu-forward`. End-to-end metric settled (open questions): KL gate against an fp32 run of the reference, greedy agreement above the bf16 noise, residual-stream diagnostic, and an fp32 forward of athanor checked tightly.
