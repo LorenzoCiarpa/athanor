@@ -16,7 +16,7 @@ The bottom layer: memory, tensors, files, parsing, threads. No GPU code and no k
 
 ## Conventions
 
-- Headers that GPU code includes (`base.h`, `arena.h` so far) wrap their declarations in `extern "C"`, because nvcc compiles `.cu` files as C++ (`src/backend/README.md`).
+- Headers that GPU code includes (`base.h`, `arena.h`; `tensor.h` and `threads.h` since step 7, through `ops.h`) wrap their declarations in `extern "C"`, because nvcc compiles `.cu` files as C++ (`src/backend/README.md`).
 
 - Every fallible function returns `ath_status`; `ATH_OK` is 0. Propagate with `ATH_CHECK(expr)`; with `ATH_LOG=debug` each hop is logged, which reads like a backtrace.
 - Allocation functions (`ath_arena_alloc`, `ath_arena_zalloc`, `ath_arena_strndup`) return `NULL` on failure; callers map it to `ATH_ERR_NOMEM`.

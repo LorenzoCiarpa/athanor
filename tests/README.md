@@ -6,7 +6,7 @@ Correctness is what lets everything else be fast.
 | --- | --- | --- |
 | Unit | core modules; each op's `_ref` on hand-computed cases | every commit |
 | Golden | each op of each layer vs tensors dumped from the reference implementation on real weights; the whole forward pass (residual stream at every layer, logits, KL) on fixed prompts | every commit (requires `tests/golden/data`) |
-| Cross-backend | GPU kernels and `_fast` paths vs `_ref` | every commit on GPU machines |
+| Cross-backend | GPU kernels and `_fast` paths vs `_ref`, on random and on real inputs | every commit on GPU machines |
 | End-to-end | greedy generation identical to reference for N tokens; KL on a fixed corpus | nightly |
 | Gradient | each backward vs finite differences and reference autograd | phase 4 |
 | Performance | bench subset; fails on regressions beyond a threshold | nightly, self-hosted |
@@ -46,6 +46,42 @@ athanor computes in fp32 and rounds each output once. A native tolerance follows
 | `attn` | out | 0.2 | 9.8e-2 | 5e-5 | 9.7e-6 | the eager reference rounds `q·kᵀ` to bf16 before the softmax: up to 2^-8 of a score, 0.06 at the largest score of the prompt (16.3), up to 6% on a probability; athanor keeps scores in fp32 |
 
 A score above its tolerance fails the test and names the record and the element. `ATH_GOLDEN_WORST=1 ./build/test_golden` also prints the worst record of every row. Quantized formats (phase 2) will be compared through dequantized values, and with KL at model level.
+
+## GPU kernels
+
+Every GPU kernel (`ath_<op>_gpu`, step 7) is compared with its CPU reference twice: on random inputs in `test_gpu_ops`, and on the real inputs of every golden record in `test_golden`, which replays each record through the kernel as well as through `_ref` when the build has a GPU. The comparison is GPU against `_ref` on the same inputs, not against the reference implementation: the references are already held to that (Tolerances), and what is measured here is the kernel alone.
+
+The measure is the score of the golden comparisons. f32 outputs are held to a tolerance per op, at least four times the worst error measured; bf16 outputs to one bf16 ulp (score at most 2^-7), two where the op rounds an intermediate value (rope's cos and sin tables, rmsnorm_gated's normalized value), since a flip there moves the output by up to 2^-8. The bf16 distance in ulps is reported too: near zero, a distance of many ulps is a tiny error relative to the tensor, which is why the score decides.
+
+The kernels do not give the reference's bits, and are not meant to: they sum in another order (a warp's 32 partial sums, cuBLASLt's tiles), fuse multiply-adds, and the device's `expf`, `log1pf`, `cosf`, `sinf` round differently from libm. Copies are exact: `embed`, the conv state, and the residual `add` (one rounding of the same fp32 sum).
+
+| Op | Output | Tolerance (f32) | Random inputs, worst (f32) | Real inputs, worst (exact) | Real inputs, worst (native, bf16) |
+| --- | --- | --- | --- | --- | --- |
+| `embed` | out | 0 | 0 | 0 | 0 |
+| `add` | out | 0 | 0 | 0 | 0 |
+| `conv` | state_out | 0 | 0 | 0 | 0 |
+| `matmul` | out | 2e-5 | 1.9e-6 | 4.1e-6 | 7.4e-3 (1 ulp) |
+| `rmsnorm` | out | 1.5e-5 (5e-6 random) | 1.2e-6 | 2.6e-6 | 5.5e-3 (1 ulp) |
+| `rmsnorm_gated` | out | 1e-5 (5e-6 random) | 2.8e-7 | 7.8e-7 | 5.1e-3 (2 ulps) |
+| `l2norm` | out | 1e-5 (5e-6 random) | 1.3e-7 | 6.1e-7 | f32 |
+| `rope` | out | 1e-5 (1e-6 random) | 1.4e-7 | 3.2e-7 | 0 |
+| `swiglu`, `sigmoid_mul` | out | 1e-5 (1e-6 random) | 1.1e-7 | 2.1e-7 | 0 |
+| `conv` | out | 1e-5 (1e-6 random) | 1.7e-7 | 1.7e-7 | 4.3e-3 (1 ulp) |
+| `gdn_gates` | g, beta | 1e-5 (1e-6 random) | 1.3e-7 | 1.9e-7 | 0 |
+| `gdn` | out | 3e-5 (1e-5 random) | 8.8e-7 | 5.9e-6 | 4.7e-3 (1 ulp) |
+| `gdn` | state_out | 5e-5 (1e-5 random) | 4.1e-7 | 1.2e-5 | f32 |
+| `attn` | out | 5e-5 (1e-5 random) | 1.0e-6 | 1.1e-5 | 3.7e-3 (1 ulp) |
+
+Measured 2026-11-25 on the RTX 5080 (CUDA 13.5, cuBLASLt 13.10), golden data of 2026-11-24. The real inputs are larger than the random ones where it matters: matmuls with K up to 3584, the recurrent state over 75 tokens, attention over 75 keys.
+
+`test_gpu_ops` also checks, bit for bit, the properties the engine relies on: the convolution and the recurrence fed in pieces (4 + 1 + 5 and 5 + 1 + 6 tokens) equal the same tokens at once, and attention for the last token alone equals the last row of the prompt. The kernels sum in an order fixed by the shapes, so these hold on the GPU as on the CPU. The matmul is the exception: cuBLASLt chooses its algorithm from the number of rows, so a row of a prompt and the same row decoded alone may differ in the last bits (step 8 measures what this does to a whole forward pass).
+
+Also covered: three dtype configurations per op (f32 throughout, bf16 throughout, bf16 in with f32 out), shapes that are not multiples of a warp or a block, a matmul operand at an address cuBLASLt cannot assume aligned, every matmul dtype combination (cuBLASLt for bf16·bf16 and f32·f32, athanor's own kernel for the rest), an embedding id outside the table (a row of NaN), the in-place residual add, and the argument checks: tensors on the wrong side, shapes, dtypes, and the kernels' own limits (`ATH_ATTN_MAX_DV` for the head dim, `ATH_GDN_MAX_DK`, `ATH_ROPE_MAX_DIM`). compute-sanitizer finds nothing in `test_gpu_ops`: memcheck with leak check, racecheck and initcheck report 0 errors.
+
+```
+ATH_GPU_OPS_DETAIL=1 ./build/cuda/test_gpu_ops     # every comparison with its measured error
+CUDA_HOME=<toolkit> $CUDA_HOME/bin/compute-sanitizer --tool memcheck --leak-check full ./build/cuda/test_gpu_ops
+```
 
 ## Forward pass
 
@@ -95,7 +131,8 @@ A minimal C runner: `ATH_TEST(name) { ... }`, `ATH_EXPECT_*` assertions, a summa
 ```
 make test                          # all suites, smoke runs of athanor inspect (with and without --roles), and make check-alloc; about 17 s
 make DEBUG=1 test                  # same suites with ASan and UBSan, in build/debug; about 4 minutes
-make cuda test                     # every suite of the CUDA build (build/cuda); test_backend runs on the GPU
+make cuda test                     # every suite of the CUDA build (build/cuda); test_backend and test_gpu_ops run
+                                   # on the GPU, test_golden replays every record on it too
 make cuda DEBUG=1 test             # the same with ASan and UBSan (build/cuda-debug)
                                    # (test_golden 2.6 minutes there, 5 s in release; test_forward 34 s on 4 positions, 11 s on all;
                                    # test_text 3 s in release, its generation 4 steps instead of 32 there)
@@ -110,7 +147,8 @@ Synthetic files (safetensors shards, indexes, broken headers) are written by the
 | `test_core.c` | status and logging, arenas, files, JSON (synthetic and real `config.json`, `tokenizer_config.json`, `tokenizer.json`), dtypes and tensor views, safetensors (single file, sharded, 20 malformed headers, inconsistent indexes, the real checkpoint), the thread pool (every task once, with fewer, as many and more tasks than threads; runs from four threads at once on one pool) |
 | `test_model.c` | role names and the registry; qwen35 config parsing (dense, MoE, text-only, schedule fallback, 20 rejected configs); binding of tiny synthetic checkpoints (dense, MoE with fused experts, text-only) and every failure mode (missing, unexpected, misshaped, integer dtype, tie mismatches); the real checkpoint (coverage, schedule against `layer_types`, residual writers) |
 | `test_ops.c` | every `_ref` function of `src/ops/` on hand-computed cases (bf16 rounding, norms, RoPE pairing and relative positions, attention averaging and head grouping, conv taps, the delta rule step by step, gates around the softplus threshold) and on exact properties: streaming equals all at once for conv and Gated DeltaNet, decode equals the last prefill row for attention, causality, argument checks; `ath_matmul_fast` bit for bit against `ath_matmul_ref` (7 shapes × 8 dtype combinations, without and with threads) |
-| `test_golden.c` | every op the reference computes on Qwen3.5-0.8B (24 layers, prefill and decode, 906 records), replayed through the `_ref` functions on the real weights, native and exact (above); every matmul record also through `ath_matmul_fast` on 8 threads, required bit-identical to `ath_matmul_ref` |
+| `test_golden.c` | every op the reference computes on Qwen3.5-0.8B (24 layers, prefill and decode, 906 records), replayed through the `_ref` functions on the real weights, native and exact (above); every matmul record also through `ath_matmul_fast` on 8 threads, required bit-identical to `ath_matmul_ref`; with a GPU, every record also through the GPU kernel, against `_ref` (GPU kernels) |
 | `test_forward.c` | the forward pass through the contract: state specs and sizes, argument checks, hooks, all at once = in pieces = token by token on tiny random checkpoints; the real checkpoint against the forward records (above) |
+| `test_gpu_ops.c` | every GPU kernel against its `_ref` on random inputs (GPU kernels, above): three dtype configurations, odd shapes, a misaligned matmul operand, the matmul's two paths, pieces equal all at once bit for bit, argument checks and the kernels' limits. In the CPU build only the argument checks run |
 | `test_backend.c` | the GPU runtime (`src/backend/backend.h`). In the CPU build: the stub refuses everything cleanly, the GPU tests are skipped. In the CUDA build, on device 0: properties, copies in every direction at odd sizes and offsets from pinned and ordinary memory, memset, three streams ordered only by events (8 rounds overwriting each other's buffers), event timing with a sanity range, an allocation larger than the device, the device arena; every byte checked |
 | `test_text.c` | text, through the contract only: UTF-8, character classes, NFC, the Python-style JSON writer, pre-tokenization pieces, the output parser (17 fixtures, each also split at every byte and fed byte by byte), template errors, sampling (hand-computed cases and a distribution with a fixed seed); against the text golden data (below): the corpus, the templates, the greedy chat generation |

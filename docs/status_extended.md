@@ -18,6 +18,7 @@ How to read it:
   - [Step 4: CPU forward](#step-4-cpu-forward)
   - [Step 5: tokenizer, sampling, CPU chat](#step-5-tokenizer-sampling-cpu-chat)
   - [Step 6: GPU backend](#step-6-gpu-backend)
+  - [Step 7: GPU ops, one by one](#step-7-gpu-ops-one-by-one)
 - [Files by step](#files-by-step)
 
 ---
@@ -867,65 +868,163 @@ What was found while testing:
 
 ---
 
+### Step 7: GPU ops, one by one
+
+Branch `step7-gpu-ops`, from `main` after step 6 was merged. The gate of `docs/PLAN.md`: every kernel matches its CPU reference. Correct and simple kernels; the fast ones are steps 9 and 10.
+
+#### 7.1 The matmul library in the backend
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `src/backend/backend.h` | Changed | `ath_device.blas`, `blas_ws`, `blas_ws_bytes`; `ATH_BLAS_WORKSPACE` (32 MiB); the compute stream named as the stream of every op |
+| `src/backend/gpu.cu` | Changed | Creates the cuBLASLt handle and the workspace in `ath_device_open`, frees them in `ath_device_close`; uses `gpu.h` |
+| `src/backend/gpu.h` | New | Private to GPU code: `ath_gpu_fail`, `ATH_GPU_CHECK`, `ath_gpu_use`, `ath_gpu_stream`, `ath_gpu_launched` |
+| `src/backend/compat.h` | Changed | `cublasLt.h`; the hipBLASLt names; `ath_shfl_xor` |
+| `Makefile` | Changed | `-lcublasLt` with `-rpath` to the toolkit; `-fno-threadsafe-statics` for device code; `src/ops/*.cu` built as `.cu.o`; `src/ops/gpu_none.c` in the CPU build; `test_gpu_ops` among the suites |
+| `tools/dev/check_nvcc.sh` | Changed | Fails when the toolkit has no `libcublasLt.so` |
+
+What was implemented:
+
+- **Linking.** cuBLASLt is linked as a shared library. Statically, a program that makes one bf16 matmul is 585 MB (measured with CUDA 13.5): the static archive carries the kernels for every architecture.
+- **Launches without libstdc++.** The launch stubs that nvcc generates keep the kernel's address in a function-local static. C++ guards its initialization with `__cxa_guard_acquire`, which lives in libstdc++, and the binaries are linked as C. `-fno-threadsafe-statics` drops the guard; the value is a constant.
+
+Commit `0e12354` (the build flags for kernels landed with them, in `71ccfff`).
+
+#### 7.2 The GPU entry points
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `src/ops/ops.h` | Changed | `ath_<op>_gpu` for the 13 ops of the forward pass, the GPU conventions, `ATH_ROPE_MAX_DIM`, `ATH_GDN_MAX_DK`; includes `backend/backend.h`; `extern "C"` guards |
+| `src/ops/check.h` | Changed | `ops_tensor` no longer checks the tier; `ops_place` / `OPS_PLACE` do, for the host (`_ref`, `_fast`) or the device (`_gpu`) |
+| `src/ops/{embed,matmul,norm,rope,act,attn,conv,gdn}.c` | Changed | One argument check per op shared by `_ref` and `_gpu`; `ath_<op>_gpu`, which checks and calls the launcher; `rope.c` computes the frequencies for both |
+| `src/ops/sample.c` | Changed | `OPS_PLACE` (the tier check moved out of `ops_tensor`) |
+| `src/ops/launch.h` | New | Private: the launchers, one per op (one for the three norms, one for the three elementwise ops) |
+| `src/ops/gpu_none.c` | New | The launchers in a build without a GPU: `ATH_ERR_UNSUPPORTED` |
+| `src/core/tensor.h`, `src/core/threads.h` | Changed | `extern "C"` guards (GPU code includes them through `ops.h`) |
+
+Commit `71ccfff`, with 7.3.
+
+#### 7.3 The kernels
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `src/ops/kernel.cuh` | New | Device code shared by the kernels: `k_ld`, `k_st`, `k_round` (bf16 rounded as the host does), `k_warp_sum`, `k_block_sum`, `k_silu`, `K_FOR`, `k_blocks`, `k_stream` |
+| `src/ops/embed.cu` | New | One thread per element; an id outside the table gives NaN |
+| `src/ops/matmul.cu` | New | cuBLASLt ("TN" on the checkpoint layout, fp32 accumulation, alignment preferences from the operands' addresses and pitches); `matmul_kernel`, one warp per output, for the other dtype combinations |
+| `src/ops/norm.cu` | New | One kernel for RMSNorm, gated RMSNorm and the L2 norm: a block per row |
+| `src/ops/rope.cu` | New | One thread per pair or copied element; the frequencies in the kernel's arguments |
+| `src/ops/act.cu` | New | One kernel for SwiGLU, the sigmoid gate and the add |
+| `src/ops/attn.cu` | New | A block per query and head; tiles of 32 keys with an online softmax |
+| `src/ops/conv.cu` | New | Outputs, then the state (a thread per channel), two kernels on one stream |
+| `src/ops/gdn.cu` | New | The gates; the recurrence, a warp per column of the state with the column in registers |
+
+What was implemented:
+
+- **The same expressions as the references**, in the same order where the order is not a reduction: the RMSNorm product, the gated norm's rounding, SiLU and the sigmoid, softplus with torch's threshold.
+- **Reductions are deterministic.** The order of a sum depends on the launch shape only: a warp's butterfly (every lane gets the same bits), then the warps in order.
+- **RoPE.** The frequencies come from the host, so that long positions do not amplify a difference between the device's `powf` and libm's.
+
+Commit `71ccfff`.
+
+#### 7.4 `tests/test_gpu_ops.c`
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `tests/test_gpu_ops.c` | New | 10 tests: argument checks and limits (both builds); embed, matmul, the norms, rope, the elementwise ops, attention, conv, the gates and the recurrence against `_ref` on random inputs, plus the bit-for-bit properties (pieces equal all at once) |
+
+What was found while testing:
+
+- **Comparing bf16 outputs in ulps** fails near zero, where a distance of several ulps is a tiny error. The comparison uses the golden score, against n ulps (n · 2^-7), and prints the ulp distance as information.
+
+Commit `4dcf563`, with 7.5.
+
+#### 7.5 GPU replay of the golden records
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `tests/test_golden.c` | Changed | With a GPU, every record also runs through the GPU kernel on device copies of the same inputs, outputs pre-filled with NaN; `gpu_tolerances`; a second table of statistics, printed and checked |
+
+What was found while testing:
+
+- **Three tolerances were too tight** on real inputs: the attention output (1.1e-5) and the state of the recurrence after 75 tokens (1.2e-5) went over the first guess of 1e-5. The tolerances now follow the rule of the step 3 tolerances, at least four times the worst error measured.
+
+Commit `4dcf563`.
+
+#### 7.6 Documentation
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `docs/STATUS.md` | Changed | Step 7 current and done, step 6 completed and merged, step 8 preview, the open question on invariant 7 and the two devices, log |
+| `src/ops/README.md` | Changed | GPU kernels: files, kernels, how they are checked |
+| `src/backend/README.md` | Changed | `gpu.h`, the matmul library, linking cuBLASLt, launches without libstdc++, `.cu.o` |
+| `tests/README.md` | Changed | GPU kernels: the measure, the tolerances, the measured errors, the properties; `test_gpu_ops` |
+| `src/core/README.md`, `docs/ARCHITECTURE.md`, `docs/program/PROGRAM.md` | Changed | The `extern "C"` guards; the tree; rows 7, 8 and 10 |
+
+---
+
 ## Files by step
 
 Every file of the repository and the steps that created or changed it (documentation-only edits included).
 
-| File | Step 1 | Step 2 | Step 3 | Step 4 | Step 5 | Step 6 |
-| --- | --- | --- | --- | --- | --- | --- |
-| `Makefile` | 1.1, 1.8 | 2.3, 2.6 | 3.3, 3.4, 3.5, 3.6 | 4.5 | 5.1, 5.3, 5.8 | 6.1 |
-| `src/core/base.{h,c}` | 1.2 | | | | | 6.2 |
-| `src/core/arena.{h,c}` | 1.3 | | | | | 6.2 (`arena.h`) |
-| `src/core/file.{h,c}` | 1.4, 1.7 | | | | | |
-| `src/core/json.{h,c}` | 1.5 | | | | 5.4 | |
-| `src/core/tensor.{h,c}` | 1.6 | | 3.2 | | | |
-| `src/core/safetensors.{h,c}` | 1.7 | | | | | |
-| `src/core/threads.{h,c}` | | | | 4.7 | | |
-| `src/model/model.h` | | 2.2 | | 4.2, 4.7, 4.8 | 5.4 | |
-| `src/model/registry.c` | | 2.3 | | 4.8 | | |
-| `src/model/state.c` | | | | 4.2, 4.7 | 5.4 | |
-| `src/models/qwen35/qwen35.h`, `config.c` | | 2.4 | | 4.3, 4.7, 4.8 (`qwen35.h`) | 5.5 (`qwen35.h`) | |
-| `src/models/qwen35/weights.c`, `family.c` | | 2.5 | | 4.3, 4.8 (`weights.c`) | 5.5 (`family.c`) | |
-| `src/models/qwen35/forward.c` | | | | 4.3, 4.7 | | |
-| `src/ops/ops.h`, `check.h`, `embed.c`, `matmul.c`, `norm.c`, `rope.c`, `act.c`, `attn.c`, `conv.c`, `gdn.c` | | | 3.3 | 4.7 (`ops.h`, `matmul.c`) | 5.6 (`ops.h`) | |
-| `tools/athanor.c`, `commands.h` | 1.8 | | | | 5.7 | 6.6 |
-| `tools/inspect.c` | 1.8 | 2.6 | | 4.8 | | |
-| `tools/dev/alloc_trace.c` | 1.8 | | | | | |
-| `tools/dev/check_alloc.sh` | 1.8 | 2.6 | | | | |
-| `tests/test.h` | 1.9 | | | | | |
-| `tests/test_core.c` | 1.9 | 2.7 | | 4.7 | | |
-| `tests/util.h`, `tests/test_model.c` | | 2.7 | | 4.5, 4.8 (`test_model.c`) | | |
-| `tests/test_ops.c` | | | 3.5 | 4.7 | | |
-| `tests/test_golden.c` | | | 3.6 | 4.7 | | |
-| `tests/tiny.h`, `tests/test_forward.c` | | | | 4.5, 4.7 (`test_forward.c`) | | |
-| `tests/golden/dump.py`, `README.md` | | | 3.4 | 4.4, 4.8 | 5.9 (`README.md`) | |
-| `tests/golden/requirements.in`, `requirements.txt` | | | 3.1 | | | |
-| `src/core/buf.{h,c}`, `src/core/rng.{h,c}` | | | | | 5.4 | |
-| `src/text/unicode.{h,c}`, `unicode_tables.h` | | | | | 5.2 | |
-| `src/text/bpe.{h,c}` | | | | | 5.3 | |
-| `src/model/text.c` | | | | | 5.4 | |
-| `src/models/qwen35/text.c` | | | | | 5.5 | |
-| `src/ops/sample.c` | | | | | 5.6 | |
-| `tools/chat.c` | | | | | 5.7 | |
-| `tools/dev/gen_unicode.py` | | | | | 5.2 | |
-| `tests/test_text.c` | | | | | 5.8 | |
-| `tests/golden/text.py` | | | | | 5.1 | |
-| `src/backend/backend.h`, `gpu.cu`, `gpu_none.c`, `compat.h`, `devarena.c` | | | | | | 6.2 to 6.5 |
-| `tools/devices.c` | | | | | | 6.6 |
-| `tools/dev/check_nvcc.sh` | | | | | | 6.1 |
-| `tests/test_backend.c` | | | | | | 6.7 |
-| `docs/proposals/chat-state-at-last-query.md`, `chat-shadow-sequence.md` | | | | | | 6.8 |
-| `CLAUDE.md` | | | | | | 6.8 |
-| `docs/contract/qwen35-0.8b.md` | closing | 2.1 | 3.1, 3.7 | 4.6, 4.8 | 5.9 | |
-| `docs/contract/qwen35-35b-a3b.md` | | 2.1 | | 4.8 | | |
-| `docs/MODELS.md` | | 2.1 | 3.7 | 4.6, 4.8 | | |
-| `docs/ARCHITECTURE.md` | closing | 2.2 | 3.7 | 4.6, 4.7, 4.8 | 5.9 | 6.8 |
-| `docs/PLAN.md` | | | | 4.8 | | |
-| `docs/STATUS.md` | closing | 2.1 to 2.7, closing | 3.1, closing | 4.1, closing, 4.7, 4.8 | 5.1 to 5.9, closing | 6.1 to 6.8 |
-| `docs/program/PROGRAM.md` | closing | closing | 3.7 | 4.6, 4.7, 4.8 | 5.9 | 6.8 |
-| `docs/proposals/cpu-matmul-avx512.md` | | | | 4.7 | | |
-| `docs/CHANGE-001-scope-tools-cache.md` | | | | 4.8 | | |
-| `docs/status_extended.md` | | | closing | 4.6, 4.7, 4.8 | 5.9 | 6.8 |
-| `AGENTS.md` | | 2.3 | 3.7 | 4.8 | | |
-| `README.md` | closing | | | 4.8 | 5.9 | |
-| module READMEs | closing (`src/core`, `tests`, `tools`) | 2.2, 2.5, 2.6, 2.7 (`src/model`, `src/models/qwen35`, `tools`, `tests`) | 3.2, 3.3, 3.6, 3.7 (`src/core`, `src/ops`, `tests`, `tests/golden`, `src/backend`) | 4.6 (`src/model`, `src/models/qwen35`, `tests`, `tests/golden`); 4.7 (`src/core`, `src/ops`, `src/backend`, `src/model`, `src/models/qwen35`, `tests`); 4.8 (`src/model`, `src/models/qwen35`, `src/net`, `src/infer`, `src/text`, `tools`) | 5.9 (`src/core`, `src/text`, `src/ops`, `src/model`, `src/models/qwen35`, `tools`, `tests`) | 6.8 (`src/backend`, `src/core`, `tools`, `tests`) |
+| File | Step 1 | Step 2 | Step 3 | Step 4 | Step 5 | Step 6 | Step 7 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `Makefile` | 1.1, 1.8 | 2.3, 2.6 | 3.3, 3.4, 3.5, 3.6 | 4.5 | 5.1, 5.3, 5.8 | 6.1 | 7.1 |
+| `src/core/base.{h,c}` | 1.2 | | | | | 6.2 |  |
+| `src/core/arena.{h,c}` | 1.3 | | | | | 6.2 (`arena.h`) |  |
+| `src/core/file.{h,c}` | 1.4, 1.7 | | | | | |  |
+| `src/core/json.{h,c}` | 1.5 | | | | 5.4 | |  |
+| `src/core/tensor.{h,c}` | 1.6 | | 3.2 | | | | 7.2 (`tensor.h`) |
+| `src/core/safetensors.{h,c}` | 1.7 | | | | | |  |
+| `src/core/threads.{h,c}` | | | | 4.7 | | | 7.2 (`threads.h`) |
+| `src/model/model.h` | | 2.2 | | 4.2, 4.7, 4.8 | 5.4 | |  |
+| `src/model/registry.c` | | 2.3 | | 4.8 | | |  |
+| `src/model/state.c` | | | | 4.2, 4.7 | 5.4 | |  |
+| `src/models/qwen35/qwen35.h`, `config.c` | | 2.4 | | 4.3, 4.7, 4.8 (`qwen35.h`) | 5.5 (`qwen35.h`) | |  |
+| `src/models/qwen35/weights.c`, `family.c` | | 2.5 | | 4.3, 4.8 (`weights.c`) | 5.5 (`family.c`) | |  |
+| `src/models/qwen35/forward.c` | | | | 4.3, 4.7 | | |  |
+| `src/ops/ops.h`, `check.h`, `embed.c`, `matmul.c`, `norm.c`, `rope.c`, `act.c`, `attn.c`, `conv.c`, `gdn.c` | | | 3.3 | 4.7 (`ops.h`, `matmul.c`) | 5.6 (`ops.h`) | | 7.2 |
+| `tools/athanor.c`, `commands.h` | 1.8 | | | | 5.7 | 6.6 |  |
+| `tools/inspect.c` | 1.8 | 2.6 | | 4.8 | | |  |
+| `tools/dev/alloc_trace.c` | 1.8 | | | | | |  |
+| `tools/dev/check_alloc.sh` | 1.8 | 2.6 | | | | |  |
+| `tests/test.h` | 1.9 | | | | | |  |
+| `tests/test_core.c` | 1.9 | 2.7 | | 4.7 | | |  |
+| `tests/util.h`, `tests/test_model.c` | | 2.7 | | 4.5, 4.8 (`test_model.c`) | | |  |
+| `tests/test_ops.c` | | | 3.5 | 4.7 | | |  |
+| `tests/test_golden.c` | | | 3.6 | 4.7 | | | 7.5 |
+| `tests/tiny.h`, `tests/test_forward.c` | | | | 4.5, 4.7 (`test_forward.c`) | | |  |
+| `tests/golden/dump.py`, `README.md` | | | 3.4 | 4.4, 4.8 | 5.9 (`README.md`) | |  |
+| `tests/golden/requirements.in`, `requirements.txt` | | | 3.1 | | | |  |
+| `src/core/buf.{h,c}`, `src/core/rng.{h,c}` | | | | | 5.4 | |  |
+| `src/text/unicode.{h,c}`, `unicode_tables.h` | | | | | 5.2 | |  |
+| `src/text/bpe.{h,c}` | | | | | 5.3 | |  |
+| `src/model/text.c` | | | | | 5.4 | |  |
+| `src/models/qwen35/text.c` | | | | | 5.5 | |  |
+| `src/ops/sample.c` | | | | | 5.6 | | 7.2 |
+| `tools/chat.c` | | | | | 5.7 | |  |
+| `tools/dev/gen_unicode.py` | | | | | 5.2 | |  |
+| `tests/test_text.c` | | | | | 5.8 | |  |
+| `tests/golden/text.py` | | | | | 5.1 | |  |
+| `src/backend/backend.h`, `gpu.cu`, `gpu_none.c`, `compat.h`, `devarena.c` | | | | | | 6.2 to 6.5 | 7.1 (`backend.h`, `gpu.cu`, `compat.h`) |
+| `tools/devices.c` | | | | | | 6.6 |  |
+| `tools/dev/check_nvcc.sh` | | | | | | 6.1 | 7.1 |
+| `tests/test_backend.c` | | | | | | 6.7 |  |
+| `src/backend/gpu.h` | | | | | | | 7.1 |
+| `src/ops/launch.h`, `gpu_none.c` | | | | | | | 7.2 |
+| `src/ops/kernel.cuh`, `embed.cu`, `matmul.cu`, `norm.cu`, `rope.cu`, `act.cu`, `attn.cu`, `conv.cu`, `gdn.cu` | | | | | | | 7.3 |
+| `tests/test_gpu_ops.c` | | | | | | | 7.4 |
+| `docs/proposals/chat-state-at-last-query.md`, `chat-shadow-sequence.md` | | | | | | 6.8 |  |
+| `CLAUDE.md` | | | | | | 6.8 |  |
+| `docs/contract/qwen35-0.8b.md` | closing | 2.1 | 3.1, 3.7 | 4.6, 4.8 | 5.9 | |  |
+| `docs/contract/qwen35-35b-a3b.md` | | 2.1 | | 4.8 | | |  |
+| `docs/MODELS.md` | | 2.1 | 3.7 | 4.6, 4.8 | | |  |
+| `docs/ARCHITECTURE.md` | closing | 2.2 | 3.7 | 4.6, 4.7, 4.8 | 5.9 | 6.8 | 7.6 |
+| `docs/PLAN.md` | | | | 4.8 | | |  |
+| `docs/STATUS.md` | closing | 2.1 to 2.7, closing | 3.1, closing | 4.1, closing, 4.7, 4.8 | 5.1 to 5.9, closing | 6.1 to 6.8 | 7.1 to 7.6 |
+| `docs/program/PROGRAM.md` | closing | closing | 3.7 | 4.6, 4.7, 4.8 | 5.9 | 6.8 | 7.6 |
+| `docs/proposals/cpu-matmul-avx512.md` | | | | 4.7 | | |  |
+| `docs/CHANGE-001-scope-tools-cache.md` | | | | 4.8 | | |  |
+| `docs/status_extended.md` | | | closing | 4.6, 4.7, 4.8 | 5.9 | 6.8 | 7.6 |
+| `AGENTS.md` | | 2.3 | 3.7 | 4.8 | | |  |
+| `README.md` | closing | | | 4.8 | 5.9 | |  |
+| module READMEs | closing (`src/core`, `tests`, `tools`) | 2.2, 2.5, 2.6, 2.7 (`src/model`, `src/models/qwen35`, `tools`, `tests`) | 3.2, 3.3, 3.6, 3.7 (`src/core`, `src/ops`, `tests`, `tests/golden`, `src/backend`) | 4.6 (`src/model`, `src/models/qwen35`, `tests`, `tests/golden`); 4.7 (`src/core`, `src/ops`, `src/backend`, `src/model`, `src/models/qwen35`, `tests`); 4.8 (`src/model`, `src/models/qwen35`, `src/net`, `src/infer`, `src/text`, `tools`) | 5.9 (`src/core`, `src/text`, `src/ops`, `src/model`, `src/models/qwen35`, `tools`, `tests`) | 6.8 (`src/backend`, `src/core`, `tools`, `tests`) | 7.6 (`src/ops`, `src/backend`, `tests`, `src/core`) |

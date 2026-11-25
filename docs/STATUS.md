@@ -6,11 +6,48 @@ This file is the overview. [`status_extended.md`](status_extended.md) goes one l
 
 ## Current step
 
-**Step 6: GPU backend** (see `docs/PLAN.md` §4). Started 2026-11-24 on branch `step6-gpu-backend`. **Done 2026-11-24** (pushed, to be merged into `main`); step 7 is next.
+**Step 7: GPU ops, one by one** (see `docs/PLAN.md` §4). Started 2026-11-25 on branch `step7-gpu-ops`. **Done 2026-11-25** (pushed, to be merged into `main`); step 8 is next.
+
+Goal: a GPU kernel for every op of the forward pass, each checked against its CPU reference on random and on real inputs, as AGENTS.md's op checklist asks. Correct and simple first: fast decode is step 9, fast prefill step 10.
+
+### Tasks
+
+- [x] **7.1 The matmul library in the backend.** A cuBLASLt handle and a 32 MiB workspace per device, created by `ath_device_open` (`ath_device.blas`, `blas_ws`); cuBLASLt linked as a shared library through the toolkit's path, `tools/dev/check_nvcc.sh` checks it is there; hipBLASLt names in `compat.h`. `src/backend/gpu.h`: what GPU code shares (errors, device, streams, the check after a launch).
+- [x] **7.2 The GPU entry points.** `ath_<op>_gpu(const ath_device *d, ...)` in `src/ops/ops.h` for every op of the forward pass, asynchronous on the compute stream. The argument checks are the reference's (one `args` function per op; `ops_place` says on which side the tensors must be); the launchers (`src/ops/launch.h`) are in the `.cu` files, stubbed by `src/ops/gpu_none.c` without a GPU. `make cuda` builds `src/ops/*.cu`.
+- [x] **7.3 The kernels.** `embed`, `matmul` (cuBLASLt; athanor's own kernel for the dtype combinations cuBLASLt lacks), `rmsnorm`, `rmsnorm_gated`, `l2norm` (one kernel), `rope` (frequencies from the host), `swiglu`, `sigmoid_mul`, `add` (one kernel), `attn` (online softmax per query), `conv` (outputs, then the state), `gdn_gates`, `gdn` (a warp per column of the state); shared device code in `src/ops/kernel.cuh`.
+- [x] **7.4 `tests/test_gpu_ops.c`.** Every kernel against its `_ref` on random inputs: three dtype configurations, odd shapes, a misaligned matmul operand, both matmul paths, pieces equal all at once bit for bit (conv, gdn, attention), an embedding id outside the table, argument checks and the kernels' limits.
+- [x] **7.5 GPU replay of the golden records.** `tests/test_golden.c` runs every record through the GPU kernel too, when the build has a GPU, and compares it with `_ref` on the same inputs, native and exact.
+- [x] **7.6 Documentation.**
+
+### Acceptance criteria
+
+1. Every op of the forward pass has a GPU kernel: `embed`, `matmul`, `rmsnorm`, `rmsnorm_gated`, `l2norm`, `rope`, `swiglu`, `sigmoid_mul`, `add`, `attn`, `conv`, `gdn_gates`, `gdn`.
+2. Every kernel matches its CPU reference within the tolerances of `tests/README.md` (GPU kernels), on random inputs and on the real inputs of every golden record; copies, the residual add and the conv state bit for bit.
+3. On the GPU, the convolution and the recurrence fed in pieces, and attention for the last token alone, give the bits of the same tokens at once.
+4. `make cuda test` green, also with `DEBUG=1`; `make test` green (the GPU tests skipped, the argument checks run); compute-sanitizer (memcheck with leak check, racecheck, initcheck) clean on `test_gpu_ops`.
+5. No warnings; `ldd`: the CPU build unchanged, the CUDA build adds `libcublasLt.so.13` only (invariant 3 allows cuBLASLt).
+6. Documentation updated.
+
+Result (2026-11-25, RTX 5080 `sm_120`, driver 580.178.04 (CUDA 13.0), CUDA toolkit 13.5.0, cuBLASLt 13.10, gcc 15.2):
+
+| # | Criterion | Result |
+| --- | --- | --- |
+| 1 | kernels | 13 ops in `src/ops/{embed,matmul,norm,rope,act,attn,conv,gdn}.cu`, 11 kernels plus cuBLASLt |
+| 2 | against the references | random inputs (`test_gpu_ops`, 10 tests): worst f32 score 1.9e-6 (matmul), 1.0e-6 (attention), under 1e-6 for the rest; bf16 outputs within one ulp. Real inputs (`test_golden`, 906 records, prefill and decode): worst exact score 4.1e-6 (matmul), 1.1e-5 (attention), 5.9e-6 (gdn out), 1.2e-5 (gdn state after 75 tokens), under 3e-6 for the rest; native within one ulp (two for rope and rmsnorm_gated, measured: two). `embed`, `add` and the conv state: 0 |
+| 3 | pieces | conv 4 + 1 + 5 tokens, gdn 5 + 1 + 6, attention decode against the last prefill row: identical bits |
+| 4 | tests | `make cuda test`: 24 + 11 + 17 + 1 + 7 + 12 + 6 (1 skipped) + 10 pass; `make cuda DEBUG=1 test` the same; `make test` and `make DEBUG=1 test`: the same suites with the GPU tests skipped (`test_gpu_ops` 1 pass, 9 skipped); compute-sanitizer on `test_gpu_ops`: memcheck 0 errors and 0 bytes leaked, racecheck 0 hazards, initcheck 0 errors |
+| 5 | build | no warnings (host and device); `ldd build/athanor`: libm, libc; `ldd build/cuda/athanor`: libm, libc, `libcublasLt.so.13` (with the librt, libpthread and libdl it loads) |
+| 6 | documentation | `src/ops/README.md` (GPU kernels), `src/backend/README.md` (cuBLASLt, `gpu.h`, linking), `tests/README.md` (GPU kernels), `src/core/README.md`, `docs/ARCHITECTURE.md`, `docs/program/PROGRAM.md` rows 7, 8 and 10, this file and `status_extended.md` |
+
+## Completed steps
+
+### Step 6
+
+**Step 6: GPU backend** (see `docs/PLAN.md` §4). Started 2026-11-24 on branch `step6-gpu-backend`. **Done 2026-11-24** (pushed, to be merged into `main`); step 7 is next. Merged into `main` (fast-forward) on 2026-11-25, at the maintainer's request.
 
 Goal: the GPU runtime athanor's kernels will run on, behind one C interface: devices, device and pinned host memory, copies, streams, events and timing, on CUDA, written once for CUDA and HIP. No kernel yet (step 7).
 
-### Tasks
+#### Tasks
 
 - [x] **6.1 Build.** `make cuda`: device code compiled by nvcc (CUDA 12.8 or newer for `sm_120`, checked by `tools/dev/check_nvcc.sh`; `CUDA_HOME`, `CUDA_ARCH`), output in `build/cuda` (`build/cuda-debug` with `DEBUG=1`), CUDA runtime linked statically; `make cuda test` runs every suite of that build. `make` stays CPU-only and needs no toolkit.
 - [x] **6.2 `src/backend/backend.h`.** Devices and their properties, device and pinned memory, copies (any direction, asynchronous), memset, three streams per device (compute, host to device, device to host), events for ordering and timing; runtime errors mapped to `ATH_ERR_DEVICE` (new) and `ATH_ERR_NOMEM`.
@@ -21,7 +58,7 @@ Goal: the GPU runtime athanor's kernels will run on, behind one C interface: dev
 - [x] **6.7 `tests/test_backend.c`.** The stub in the CPU build; on the GPU: properties, copies in every direction at odd sizes and offsets from pinned and ordinary memory, memset, three streams ordered by events, timing, an impossible allocation, the device arena.
 - [x] **6.8 Documentation.**
 
-### Acceptance criteria
+#### Acceptance criteria
 
 1. `make cuda` builds with CUDA 12.8 or newer for `sm_120` with zero warnings (host and device code), and refuses an older nvcc with a clear message; `make` is unchanged and needs no CUDA toolkit.
 2. On the RTX 5080: device and pinned allocation, copies in every direction (synchronous to the host and asynchronous), memset, three streams ordered only by events, and event timing, all checked byte for byte by `test_backend`.
@@ -42,8 +79,6 @@ Result (2026-11-24, RTX 5080 `sm_120`, driver 580.178.04 (CUDA 13.0), CUDA toolk
 | 6 | documentation | `src/backend/README.md` rewritten; READMEs of `src/core`, `tools`, `tests`; `docs/ARCHITECTURE.md` tree; `CLAUDE.md` quick reference; `docs/program/PROGRAM.md` row 7; this file and `status_extended.md` |
 
 For the record (no performance claim), `athanor devices --bench`, 256 MiB copies, best of 5: pinned host to device 55.8 GB/s, device to pinned host 58.1 GB/s, pageable 22 to 24 GB/s both ways, device to device 821 GB/s (read + write).
-
-## Completed steps
 
 ### Step 5
 
@@ -261,7 +296,9 @@ Result (2026-11-23, Qwen3.5-0.8B revision `2fc0636`, gcc 15.2, glibc 2.43):
 
 ## Next step (preview)
 
-**Step 7: GPU ops, one by one.** A CUDA kernel in `src/ops/<op>.cu` for every op of the forward pass (embed, matmul through cuBLASLt with its handle in the backend, the norms, RoPE, activations, attention, the short convolution, the Gated DeltaNet gates and recurrence), each compared with its CPU reference on random and real inputs, as AGENTS.md's op checklist asks. Gate: every kernel matches its CPU reference.
+**Step 8: sequence state and engine.** The forward pass on the GPU: the weights uploaded once, the state of a sequence (KV cache, conv and recurrent state) in device memory, the ops chosen by where the tensors live (the dispatching entry point per op joins `ops.h` with this first caller), and an engine in `src/infer/` that runs prompts and decodes with the GPU forward pass; `athanor chat` on the GPU in bf16. Gate (`docs/PLAN.md`): GPU chat in bf16; greedy output identical to the reference for 256 tokens on 50 prompts.
+
+Superseded preview (written in step 6): **Step 7: GPU ops, one by one.** A CUDA kernel in `src/ops/<op>.cu` for every op of the forward pass (embed, matmul through cuBLASLt with its handle in the backend, the norms, RoPE, activations, attention, the short convolution, the Gated DeltaNet gates and recurrence), each compared with its CPU reference on random and real inputs, as AGENTS.md's op checklist asks. Gate: every kernel matches its CPU reference.
 
 Superseded preview (written in step 5): **Step 6: GPU backend.** `src/backend/gpu.cu` and `compat.h`: device memory, copies, streams, events and timing on CUDA, written once for CUDA and HIP. Gate: allocation, copies, streams, events, timing on CUDA. Blocked until the CUDA toolkit is upgraded (open questions: nvcc 12.4 cannot target `sm_120`).
 
@@ -276,6 +313,8 @@ Superseded preview (written in step 2): **Step 3: CPU reference ops and golden h
 Superseded preview (written in step 1): **Step 2: contract and family loading.** Write `src/model/model.h` as in `docs/ARCHITECTURE.md`, `registry.c`, and `src/models/qwen35/{config.c,weights.c}`: parse `config.json` into the layer schedule (which layers are Gated DeltaNet, which are full attention, MLP or MoE), bind every tensor to an `ath_param` with role, layer, expert and flags, and fail loudly on any unbound or missing tensor. `athanor inspect --roles` prints the result.
 
 ## Open questions
+
+- **Invariant 7 and the two devices (step 7).** "Placement never changes results." The GPU kernels match the CPU references within tolerances, not to the bit: other summation orders, fused multiply-adds, the device's `expf`. On one device, where a tensor is stored never changes a result (the engine moves data before launching kernels). The question comes back at step 12, where an expert may run on the CPU (`_fast`) or on the GPU depending on where its weights are: then placement would change the last bits. Options: (a) read the invariant as "storage never changes results on a given compute device" and hold the CPU and GPU expert paths to a tolerance; (b) require the CPU expert path to give the GPU's bits, which ties both to one summation order without fused multiply-adds and costs speed on both. Recommended: (a), decided at step 12. Nothing in steps 7 to 11 depends on it.
 
 - **Qwen3.6-27B and Qwen3.8-27B declare `output_gate_type: "swish"`** (their `config.json`, read 2026-11-24). Qwen3.5 has no such key and gates the attention output with a sigmoid (contract, Full-attention layer). `config.c` does not read the key, so athanor would load those checkpoints with the sigmoid gate and no error. Before they are supported: check the reference for what "swish" means there, record it in a contract file, and reject any value the code does not implement. Until then nothing depends on it (only Qwen3.5-0.8B runs).
 
@@ -351,3 +390,17 @@ Superseded preview (written in step 1): **Step 2: contract and family loading.**
   - ASan and the NVIDIA driver need `ASAN_OPTIONS=protect_shadow_gap=0`; the Makefile sets it for the CUDA debug tests.
   - Not in the plan's file list: `athanor devices`, the visible part of the step and a check of the timing path. Deferred to their first users: graph capture (step 9), the cuBLASLt handle (step 7), `src/backend/cpu.c` (CPU feature detection).
   - The HIP half of `compat.h` is written but not compiled until step 11.
+- 2026-11-25: `step6-gpu-backend` merged into `main` (fast-forward) at the maintainer's request; step 7 started on `step7-gpu-ops`.
+- 2026-11-25: step 7 implemented on branch `step7-gpu-ops`: the cuBLASLt handle and workspace in `ath_device` and `src/backend/gpu.h`; `ath_<op>_gpu` in `src/ops/ops.h`, the shared argument checks (`ops_place` in `check.h`), `src/ops/{launch.h,kernel.cuh,gpu_none.c}` and the kernels `src/ops/{embed,matmul,norm,rope,act,attn,conv,gdn}.cu`; `tests/test_gpu_ops.c` and the GPU replay in `tests/test_golden.c`. All acceptance criteria met (table above).
+- 2026-11-25: decisions taken within step 7 (`PLAN.md` unchanged):
+  - The GPU entry points are explicit, `ath_<op>_gpu(const ath_device *d, ...)`, beside `_ref` and `_fast`. The entry point that chooses among them from where the tensors live waits for its first caller, the GPU forward pass of step 8 (AGENTS.md rule 9), instead of landing with the kernels as the step 3 notes planned.
+  - A `_gpu` function checks its arguments with the same code as `_ref`, then calls a launcher in the `.cu` file. Without a GPU, `src/ops/gpu_none.c` stubs the launchers, so the checks run and are tested in both builds.
+  - Ops run on the device's compute stream, asynchronously; one cuBLASLt workspace per device follows from that.
+  - cuBLASLt is linked as a shared library through the toolkit's path (`-rpath`): statically it adds about 560 MB to every binary (measured). The CUDA build's `ldd` gains `libcublasLt.so.13`, which invariant 3 allows; the CPU build is unchanged.
+  - cuBLASLt serves bf16·bf16 (into bf16 or f32) and f32 throughout, with fp32 accumulation and never TF32; athanor's own kernel serves the other dtype combinations, which only the exact f32-activation forward pass uses.
+  - Kernels take dtypes as arguments and branch on them (uniform across a launch); per-dtype and per-shape specializations come with the fast paths of steps 9 and 10. No templates: the C subset of CUDA C++, as `gpu.cu`.
+  - RoPE frequencies are computed on the host by the reference's expression and passed to the kernel, so long positions do not amplify a difference between the device's `powf` and libm's.
+  - The embedding kernel cannot check ids on the device: an id outside the table writes NaN instead of reading outside it, and `ath_model_forward` keeps checking token ids on the host.
+  - Kernels are compiled with `-fno-threadsafe-statics`, because the launch stubs nvcc writes would otherwise need libstdc++; `.cu` files compile to `.cu.o`, since a kernel file shares its op's name.
+  - The GPU kernels are compared with `_ref` on the same inputs, in `test_gpu_ops` (random) and in `test_golden` (every record), with tolerances at least four times the worst error measured; bf16 outputs within one ulp (two where the op rounds an intermediate value). The step 3 tolerances against the reference implementation are unchanged.
+  - Core headers that GPU code includes through `ops.h` (`tensor.h`, `threads.h`) carry `extern "C"` guards, like `base.h` and `arena.h`.
