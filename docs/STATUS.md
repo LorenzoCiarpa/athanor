@@ -6,11 +6,100 @@ This file is the overview. [`status_extended.md`](status_extended.md) goes one l
 
 ## Current step
 
+**Step 12: MoE and tiering** (see `docs/PLAN.md` §4). Started 2026-11-25 on branch `step12-moe-tiering`, from `main` (steps 1–10). Step 11 is postponed (log).
+
+Goal: a model larger than the GPU. Qwen3.6-35B-A3B has 35B parameters, of which 3B are active per token. Each of its 40 layers routes a token to 8 of 256 experts plus a shared expert. In Q8_0 it weighs 37.8 GB: 2.6 GB of attention, Gated DeltaNet, shared experts, embeddings and output head, and 34.2 GB of routed experts (3.34 MB each). The GPU has 16 GB and the machine has 59 GiB of RAM. So the experts live in RAM, the GPU keeps the most-used ones, and the CPU computes the others where they are, in parallel with the GPU. At batch 1 a token reads about 320 experts, about 1.07 GB. The gate of `docs/PLAN.md` is Qwen3.6-35B-A3B decode at least Strata's on the same machine and quantization.
+
+### Decisions (2026-11-25, at the maintainer's request)
+
+- **Weights: Q8_0, from Unsloth's GGUF.** Strata reads GGUF only (UD-Q4_K_XL, UD-Q6_K_XL, Q8_0; no bf16), and the bf16 checkpoint (71.9 GB) does not fit on the disk beside it. Both engines read one file:
+  - weights: `unsloth/Qwen3.6-35B-A3B-MTP-GGUF`, revision `5bc3e238d916f48a861bac2f8a1990a0e9b7e98d`, `Qwen3.6-35B-A3B-Q8_0.gguf`, 37,801,097,504 bytes, sha256 `c1283d8b80c3e38b2735ddbc9766d3b3126f44d6c484be419d4e101d09a76131`. It contains 753 tensors: 443 in Q8_0, 308 in f32 (norms, router, convolution, decay), 2 in bf16 (the MTP router), plus the MTP layer as `blk.40`.
+  - `config.json` and the tokenizer: `Qwen/Qwen3.6-35B-A3B`, revision `345d467b117d1fd5eda9b879a5988de9ae5f47a7`.
+  
+  Consequences: athanor gets a GGUF reader, the second weight source, which brings in the checkpoint abstraction `docs/ARCHITECTURE.md` deferred until a second user existed. Q8_0 becomes the first quantized block format of `ath_dtype`. Steps 1–9 allowed "one simple 8-bit format at most" (`docs/PLAN.md` §4), and Q8_0 is that format: blocks of 32 weights, each with an f16 scale and 32 int8 values. Q1 (more formats) and Q6 (GGUF import and export) stay in phase 2.
+- **Invariant 7, option (b): the CPU and GPU expert paths give the same bits** (the open question of step 7, resolved). A routed expert is computed in one canonical arithmetic order, written once in the reference and followed by the CPU fast path and the GPU kernels:
+  - the dot product of a Q8_0 row with an activation vector: blocks taken in turn by 16 partial sums, an FMA chain inside each block, the scale applied with one FMA per block, and a fixed tree over the 16 partials;
+  - SiLU through an exponential that athanor computes itself, with the same operations on both sides;
+  - the selected experts' outputs combined on the GPU in a fixed order.
+  
+  Where an expert sits, and what the cache holds, never changes a result.
+- **The gate's measure.** Strata at a recorded commit, built from source for `sm_120`, on the same GGUF, measured at batch 1. The gate compares against Strata with MTP off: athanor has no speculative decoding until step 13, so this compares the same algorithm. Strata with MTP on is reported beside it. llama.cpp is reported too, with its experts on the CPU and as many in VRAM as fit.
+
+### Tasks
+
+- [ ] **12.1 The Strata baseline.**
+  - Strata at a recorded commit, built in `~/opt` with CUDA 13.5 for `sm_120`, pointed at the same GGUF (no second copy: 44 GB of disk are free).
+  - Decode tokens/s at batch 1 at contexts 0 and 4096, with MTP off and on, as its documentation recommends; raw logs kept.
+  - llama.cpp on the same file, with experts on the CPU and the rest of VRAM filled.
+- [ ] **12.2 The GGUF reader and the checkpoint abstraction.**
+  - `src/core/gguf.{h,c}`: header, metadata, tensor table, mmap, validation as strict as the safetensors reader's. Types F32, F16, BF16 and Q8_0; any other type is `ATH_ERR_UNSUPPORTED`.
+  - A model directory holds `config.json`, the tokenizer and either safetensors or one `.gguf`; `ath_model_open` reads whichever is there.
+  - `athanor inspect` on the GGUF.
+- [ ] **12.3 Q8_0.**
+  - `ATH_DTYPE_Q8_0` (blocks of 32: an f16 scale and 32 int8, GGML's layout).
+  - The matmul with Q8_0 weights in the canonical order: the reference, the CPU fast path, a GPU GEMV for decode and a GPU path for prompts.
+  - The embedding lookup on a Q8_0 table.
+  - Tests against the reference, bit for bit where the order is the canonical one.
+- [ ] **12.4 The family on the GGUF.**
+  - llama.cpp's tensor names, and the transforms of its converter, read from `conversion/qwen.py` at llama.cpp `5220a2d`:
+    - norm weights stored as 1 + w;
+    - `ssm_a` holding −exp(A_log);
+    - the Gated DeltaNet's value heads reordered from grouped to tiled;
+    - the convolution kernel squeezed;
+    - gate and up split into two tensors;
+    - the MTP layer `blk.40`, bound as `unused` until step 13.
+  - `docs/contract/qwen36-35b-a3b.md`.
+  - Checked on Qwen3.5-0.8B, whose bf16 GGUF (step 9) must give the safetensors' results within the tolerances.
+- [ ] **12.5 The MoE ops.**
+  - The router's selection: softmax in fp32 over the experts, top-k, renormalized.
+  - The routed experts: gate and up, SiLU, down, each output weighted; the canonical order.
+  - The combination with the gated shared expert.
+  - Each with its reference in `src/ops/moe.c`, its kernels in `src/ops/cuda/moe.cu` and a CPU fast path (AVX-512, with a portable fallback) for the experts. The expert path is the same bit for bit in all three.
+- [ ] **12.6 Tiering.**
+  - `src/infer/tier.c`:
+    - non-expert params in VRAM;
+    - every expert in RAM, read once from the file;
+    - a VRAM cache of experts chosen by observed use, updated between tokens.
+  - In decode, per MoE layer the GPU computes the cached experts while the CPU computes the others from RAM. In a prompt, the experts that are not cached are streamed to the GPU.
+  - The contract gains what a pass needs to find each expert's copy (`docs/ARCHITECTURE.md`). Pipelines stay free of GPU code (invariant 11).
+- [ ] **12.7 Decode on the MoE model.** The decoder of step 9 (one replay per token) with the CPU's share inside the step; `athanor chat` and `athanor bench` on Qwen3.6-35B-A3B.
+- [ ] **12.8 Tests and numerics.**
+  - A tiny Qwen3.5-MoE written as a Q8_0 GGUF by `tests/golden/`, with the reference's outputs in fp32 and bf16.
+  - The forward records of Qwen3.6-35B-A3B from a reference that streams the GGUF's dequantized layers through transformers' modules: fp32 and bf16, the step 4 gate.
+  - Placement invariance bit for bit: all experts in VRAM, none, and the cache in several states.
+  - Qwen3.5-0.8B unchanged.
+  - compute-sanitizer.
+- [ ] **12.9 Report and documentation.** The report under `docs/results/` with the raw logs; READMEs, ARCHITECTURE, PROGRAM.md, the contract, this file and `status_extended.md`.
+
+### Acceptance criteria
+
+1. **The gate.** athanor decodes Qwen3.6-35B-A3B in Q8_0 at batch 1, context 0, at least as many tokens/s as Strata with MTP off, on the same GGUF, the RTX 5080 and the Ryzen 7 9800X3D with 59 GiB of RAM.
+   - Context 4096 is reported for both.
+   - Strata with MTP on, and llama.cpp, are reported beside.
+   - A report under `docs/results/` following `docs/BENCHMARKS.md`, with the raw logs of every tool.
+2. **Numerics (invariant 6).**
+   - The forward records of Qwen3.6-35B-A3B, GPU with bf16 activations: the pooled KL against the reference in fp32 on the same Q8_0 weights is no larger than the bf16 reference's, with greedy agreement above the noise.
+   - The tiny MoE model: in f32, within the step 4 tolerances; in bf16, the same KL rule.
+3. **Invariant 7.** A pass gives the same logits bit for bit whatever the placement of the experts: all in VRAM, none, or the cache in any state. Tested on the tiny model and on Qwen3.6-35B-A3B.
+4. **Kernels against references.**
+   - The routed expert path is the same bit for bit in the reference, the CPU fast path and the GPU.
+   - The Q8_0 matmuls and the router match their references within tolerances justified in `tests/README.md`, on random inputs and the golden records.
+5. **Qwen3.5-0.8B unchanged.**
+   - Decode and prefill keep step 10's speed (tg128 at depth 0 at least llama.cpp's; pp4096 within the noise of step 10's report).
+   - The step 8 gate and the forward records as before.
+   - The CPU numbers of `test_forward` and `test_text` as before.
+6. **Build and tests.** `make cuda test` green, also with `DEBUG=1`; `make test` green; compute-sanitizer clean on the new kernels and on `test_engine`; no warnings; `ldd` as in step 10.
+7. **Documentation updated.**
+
+## Completed steps
+
+### Step 10
+
 **Step 10: fast prefill** (see `docs/PLAN.md` §4). Started 2026-11-25 on branch `step10-fast-prefill`, from `step9-fast-decode` (not merged into `main` yet: the maintainer's call). **Done 2026-11-25** (pushed; merging into `main` is the maintainer's call); step 11 is next. Merged into `main` (fast-forward) on 2026-11-25, at the maintainer's request; step 11 postponed, step 12 next.
 
 Goal: a prompt as matrix products. Step 9 left prefill slower than step 8: pp4096 at 8.6k tokens/s against llama.cpp's 45.4k. A profile of pp4096 (477 ms) gave attention 60% (each query walks its keys alone, on the CUDA cores), the Gated DeltaNet 28% (the recurrence, token by token), cuBLASLt's matrix products 8% (37 ms, about 110 TFLOPS, near the GPU's bf16 peak with fp32 accumulation) and the rest 3%. The gate of `docs/PLAN.md`: prefill tokens/s within 15% of vLLM's for a single request.
 
-### Tasks
+#### Tasks
 
 - [x] **10.1 The vLLM baseline.** vLLM at a recorded version in a virtual environment outside the repository (`~/opt`), on the same checkpoint in bf16, with the configuration its documentation recommends (its FlashInfer kernels downloaded, as it asks); single requests of 512, 4096 and 32768 tokens and one output token with `vllm bench latency` (prefix caching off), and the forward pass alone with `vllm bench forward`. Raw logs kept for the report.
 - [x] **10.2 Tiled attention on the tensor cores.** For prompts in bf16: a block of 64 queries of one head walks tiles of 64 keys, scores and the weighted sum with `mma` (bf16 products, fp32 sums), the online softmax in fp32, keys past a query's position masked; positions as in step 9 (the whole cache, positions on the device).
@@ -19,7 +108,7 @@ Goal: a prompt as matrix products. Step 9 left prefill slower than step 8: pp409
 - [x] **10.5 Tests.** The new kernels against their references on random inputs and on the golden records, with tolerances justified in `tests/README.md`; pieces of a prompt against the prompt at once; the gates of step 8 on the new path; compute-sanitizer.
 - [x] **10.6 Report and documentation.** The report under `docs/results/` with the raw logs of the three tools; READMEs, ARCHITECTURE, PROGRAM.md, this file and `status_extended.md`.
 
-### Acceptance criteria
+#### Acceptance criteria
 
 1. The gate: prefill tokens/s of a single request at 512, 4096 and 32768 tokens at least 85% of vLLM's, on the same checkpoint in bf16 on the RTX 5080; llama.cpp reported beside them; a report under `docs/results/` following `docs/BENCHMARKS.md`, with the raw logs of every tool.
 2. Numerics (invariant 6): the gates of step 8 still pass (50 prompts × 256 teacher-forced steps, 0 differences above each prompt's bf16 noise; the GPU forward records: pooled KL no larger than the bf16 reference's, greedy agreement above the noise, f32 within the step 4 tolerances), and the KL before and after is reported.
@@ -40,8 +129,6 @@ Result (2026-11-25, RTX 5080 `sm_120`, driver 580.178.04 (CUDA 13.0), CUDA toolk
 | 5 | CPU unchanged | every CPU number of `test_forward` as before (bf16 KL 3.018e-4, ratio 0.60; the f32 run's residual stream within 4.7e-5 and logits within 2.7e-5); `test_text` as before |
 | 6 | tests | `make cuda test`: 26 + 11 + 18 + 1 + 7 + 12 + 6 (1 skipped) + 18 + 5 (1 skipped) pass, and the same with `DEBUG=1`; `make test` and `make DEBUG=1 test` green (the GPU tests skipped). compute-sanitizer: memcheck with leak check on the new kernels' tests, on `test_engine` (weights, state, pieces, decoder) and on a 512-token prompt of the real model with 8 decoded tokens, 0 errors and 0 bytes leaked; racecheck on attention, the chunked recurrence and the norms, 0 hazards; initcheck on attention and the chunked recurrence, 0 errors. No warnings; `ldd`: the CPU build libm and libc, the CUDA build adds `libcublasLt.so.13`, as in step 9 |
 | 7 | documentation | READMEs of `src/ops` (Prompt kernels), `src/models/qwen35`, `tests`; `docs/program/gdn-gpu-kernel.md` (the chunked form), `docs/program/PROGRAM.md` rows 10 and 10b, `docs/PLAN.md` (Dense GEMM decided), `docs/contract/qwen35-0.8b.md` (the chunked form implemented), `README.md`; the report; this file and `status_extended.md` |
-
-## Completed steps
 
 ### Step 9
 
@@ -418,7 +505,7 @@ Result (2026-11-23, Qwen3.5-0.8B revision `2fc0636`, gcc 15.2, glibc 2.43):
 
 ## Next step (preview)
 
-**Step 12: MoE and tiering** (`docs/PLAN.md` §4), next after step 10: step 11 is postponed (log, 2026-11-25). Experts routed per token, the expert weights placed across VRAM, RAM and disk, a fast CPU path for the experts that stay in RAM. Gate (`docs/PLAN.md`): Qwen3.6-35B-A3B decode at least Strata's on the same machine and quantization.
+Superseded preview (written in step 10; step 12 is current): **Step 12: MoE and tiering** (`docs/PLAN.md` §4), next after step 10: step 11 is postponed (log, 2026-11-25). Experts routed per token, the expert weights placed across VRAM, RAM and disk, a fast CPU path for the experts that stay in RAM. Gate (`docs/PLAN.md`): Qwen3.6-35B-A3B decode at least Strata's on the same machine and quantization.
 
 Postponed preview (written in step 10; the step waits for AMD hardware): **Step 11: HIP build.** The same sources compiled by hipcc for AMD GPUs through `compat.h`: a Makefile target, hipBLASLt behind the matmul, the kernels written with NVIDIA's warp-level matrix instructions (`attn_mma.cu`) given an AMD form or left to their CUDA-core twins. Gate (`docs/PLAN.md`): all tests green on AMD, performance report published.
 
@@ -455,7 +542,7 @@ The numbers: `docs/results/2026-11-25-step10-prefill/` and the vLLM profile in t
 
 ## Open questions
 
-- **Invariant 7 and the two devices (step 7).** "Placement never changes results." The GPU kernels match the CPU references within tolerances, not to the bit: other summation orders, fused multiply-adds, the device's `expf`. On one device, where a tensor is stored never changes a result (the engine moves data before launching kernels). The question comes back at step 12, where an expert may run on the CPU (`_fast`) or on the GPU depending on where its weights are: then placement would change the last bits. Options: (a) read the invariant as "storage never changes results on a given compute device" and hold the CPU and GPU expert paths to a tolerance; (b) require the CPU expert path to give the GPU's bits, which ties both to one summation order without fused multiply-adds and costs speed on both. Recommended: (a), decided at step 12. Nothing in steps 7 to 11 depends on it.
+- **Invariant 7 and the two devices (step 7).** "Placement never changes results." The GPU kernels match the CPU references within tolerances, not to the bit: other summation orders, fused multiply-adds, the device's `expf`. On one device, where a tensor is stored never changes a result (the engine moves data before launching kernels). The question comes back at step 12, where an expert may run on the CPU (`_fast`) or on the GPU depending on where its weights are: then placement would change the last bits. Options: (a) read the invariant as "storage never changes results on a given compute device" and hold the CPU and GPU expert paths to a tolerance; (b) require the CPU expert path to give the GPU's bits, which ties both to one summation order without fused multiply-adds and costs speed on both. Recommended: (a), decided at step 12. Nothing in steps 7 to 11 depends on it. **Resolved 2026-11-25 (step 12), at the maintainer's request: (b).** The routed experts follow one canonical arithmetic order in the reference, the CPU fast path and the GPU kernels (Q8_0 dot products, athanor's own exponential in SiLU, a fixed combination order), so where an expert sits and what the VRAM cache holds never change a bit. Measured against (a): (a) frees the kernels but makes a pass's bits depend on the cache's history; both expert kernels are bound by memory bandwidth, so the fixed order costs little (step 12 section, Decisions).
 
 - **Qwen3.6-27B and Qwen3.8-27B declare `output_gate_type: "swish"`** (their `config.json`, read 2026-11-24). Qwen3.5 has no such key and gates the attention output with a sigmoid (contract, Full-attention layer). `config.c` does not read the key, so athanor would load those checkpoints with the sigmoid gate and no error. Before they are supported: check the reference for what "swish" means there, record it in a contract file, and reject any value the code does not implement. Until then nothing depends on it (only Qwen3.5-0.8B runs).
 
@@ -593,4 +680,4 @@ The numbers: `docs/results/2026-11-25-step10-prefill/` and the vLLM profile in t
 - 2026-11-25: vLLM profiled on the 4096-token request (Nsight Systems, `--cuda-graph-trace=node`, `VLLM_ENABLE_V1_MULTIPROCESSING=0`), one forward pass: 57.3 ms of kernels in 60.2. Matrix products 39.0 ms (athanor 38.5), Gated DeltaNet 5.6 ms (FlashInfer `CPDeltaRule*Sm120`: T and MN precompute, prefill, fixup; athanor 16.9), attention 5.0 ms (FlashAttention split-KV; athanor 6.2), convolution 2.0 + fused post-convolution 1.9 ms (athanor 3.1), SwiGLU 1.3 ms, norms 1.4 ms (`fused_add_rmsnorm` 12 µs per call against athanor's 48: vectorized stores). The distance and what would close it: Possible later work.
 - 2026-11-25: step 11 (HIP build) postponed at the maintainer's request: there is no AMD GPU to run it on (`docs/PLAN.md` §2, AMD GPU: none yet). Step 12 comes next; step 11 returns when AMD hardware is available. Until then the HIP half of `compat.h` stays uncompiled, and the tensor-core kernels of step 10 have no AMD form (`docs/PLAN.md`, step table).
 - 2026-11-25: `step10-fast-prefill`, which carries step 9, merged into `main` (fast-forward) at the maintainer's request; step 12 starts on `step12-moe-tiering` from there.
-
+- 2026-11-25: step 12 started on `step12-moe-tiering`. Decisions at the maintainer's request: (1) the gate runs on Q8_0 weights read from Unsloth's GGUF with the MTP layer (`unsloth/Qwen3.6-35B-A3B-MTP-GGUF` `5bc3e238`, 37.8 GB). It is the file Strata uses, so both engines read the same weights. The bf16 checkpoint (71.9 GB) would not fit on the disk beside it, and Strata reads GGUF only. athanor therefore gets a GGUF reader and Q8_0, the "one simple 8-bit format" `docs/PLAN.md` §4 allows. (2) Invariant 7 read as option (b): the CPU and GPU expert paths give the same bits (Open questions). (3) Strata is compared with MTP off, athanor's algorithm until step 13; MTP on is reported beside it. Checked before deciding: Strata (github.com/Niko1221/Strata, MIT, C++ with parts of ggml) keeps attention, routers and shared experts on the GPU, fills the rest of VRAM with the most-used experts, and computes the others on the CPU from RAM. Its published Qwen3.6 numbers are self-reported, on other GPUs, and do not say whether MTP was on. The checkpoint's math is that of the Qwen3.5-35B-A3B contract (step 2): the token mixers are the dense model's classes (diffed in transformers 5.24.0) and only the MLP is the MoE block.
