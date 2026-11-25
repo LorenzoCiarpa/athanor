@@ -35,7 +35,13 @@ ath_status ath_gen_open(ath_gen *g, const char *dir, const ath_gen_opts *o, ath_
         st = ath_pool_init(&g->pool, o->threads > 0 ? o->threads : ath_pool_default_threads(), a);
     if (st == ATH_OK && !o->cpu && ath_gpu_count() > 0) {
         g->engine = ath_arena_zalloc(a, sizeof *g->engine, _Alignof(ath_engine));
-        const ath_place_opts po = {.slots = o->experts};
+        /* the experts leave room for the state and its snapshot, besides
+         * the working memory */
+        size_t sb = 0;
+        ath_state_bytes(&g->m, ATH_DTYPE_BF16, g->ctx, &sb);
+        const ath_place_opts po = {.slots = o->experts, .vram_reserve = ATH_PLACE_RESERVE + 2 * (uint64_t)sb};
+        ath_log(ATH_LOG_INFO, "serve: a state of %d tokens takes %.2f GiB; two are kept", g->ctx,
+                (double)sb / 1073741824.0);
         st = g->engine ? ath_engine_open_tier(g->engine, &g->m, 0, &po, a) : ATH_ERR_NOMEM;
         if (st != ATH_OK) {
             ath_log(ATH_LOG_WARN, "serve: no GPU (%s); running on the CPU", ath_status_str(st));
@@ -44,10 +50,17 @@ ath_status ath_gen_open(ath_gen *g, const char *dir, const ath_gen_opts *o, ath_
         }
     }
     if (st == ATH_OK && g->engine) {
+        uint64_t fr0 = 0, tot0 = 0;
+        ath_device_mem(&g->engine->dev, &fr0, &tot0);
+        ath_log(ATH_LOG_INFO, "serve: engine open; %.2f GiB of device memory free", (double)fr0 / 1073741824.0);
         g->exec = g->engine->exec;
         st = ath_engine_state(g->engine, &g->state, ATH_DTYPE_BF16, g->ctx, a);
         if (st == ATH_OK)
             st = ath_engine_state(g->engine, &g->snap, ATH_DTYPE_BF16, g->ctx, a);
+        uint64_t fr = 0, tot = 0;
+        ath_device_mem(&g->engine->dev, &fr, &tot);
+        ath_log(ATH_LOG_INFO, "serve: states %s; %.2f GiB of device memory free", st == ATH_OK ? "allocated" : "failed",
+                (double)fr / 1073741824.0);
     } else if (st == ATH_OK) {
         g->exec = (ath_exec){.pool = &g->pool};
         st = ath_state_init(&g->state, &g->m, ATH_DTYPE_BF16, g->ctx, a);

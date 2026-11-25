@@ -80,17 +80,38 @@ static ath_status init(ath_state *s, const ath_model *m, ath_dtype act, int32_t 
     s->buf = ath_arena_alloc(a, (m->n_states ? m->n_states : 1) * sizeof *s->buf, _Alignof(void *));
     if (!s->buf)
         return ATH_ERR_NOMEM;
-    for (uint32_t i = 0; i < m->n_states; i++) {
-        size_t b;
-        ath_status st = spec_bytes(&m->states[i], act, capacity, &b);
-        if (st != ATH_OK) {
-            ath_log(ATH_LOG_ERROR, "state: %s state of layer %d does not fit in memory for %d tokens",
-                    ath_state_kind_name(m->states[i].kind), m->states[i].layer, capacity);
-            return st;
-        }
-        s->buf[i] = mem ? ath_dev_arena_alloc(mem, b ? b : 1, 0) : ath_arena_alloc(a, b ? b : 1, STATE_ALIGN);
-        if (!s->buf[i])
+    /* In device memory the buffers are carved from one allocation: one by
+     * one, a KV buffer of a long context would leave most of an arena
+     * block unused each time (128 MiB buffers in 256 MiB blocks). */
+    size_t total = 0;
+    for (int pass = mem ? 0 : 1; pass < 2; pass++) {
+        char *base = NULL;
+        if (mem && pass == 1 && !(base = ath_dev_arena_alloc(mem, total ? total : 1, 0)))
             return ATH_ERR_NOMEM;
+        size_t off = 0;
+        for (uint32_t i = 0; i < m->n_states; i++) {
+            size_t b;
+            ath_status st = spec_bytes(&m->states[i], act, capacity, &b);
+            if (st != ATH_OK) {
+                ath_log(ATH_LOG_ERROR, "state: %s state of layer %d does not fit in memory for %d tokens",
+                        ath_state_kind_name(m->states[i].kind), m->states[i].layer, capacity);
+                return st;
+            }
+            b = b ? b : 1;
+            if (!mem) {
+                if (!(s->buf[i] = ath_arena_alloc(a, b, STATE_ALIGN)))
+                    return ATH_ERR_NOMEM;
+                continue;
+            }
+            const size_t sz = (b + ATH_DEV_ALIGN - 1) / ATH_DEV_ALIGN * ATH_DEV_ALIGN;
+            if (pass == 0 && sz > SIZE_MAX - total)
+                return ATH_ERR_RANGE;
+            if (pass == 0)
+                total += sz;
+            else
+                s->buf[i] = base + off;
+            off += sz;
+        }
     }
     return ath_state_reset(s, m);
 }
