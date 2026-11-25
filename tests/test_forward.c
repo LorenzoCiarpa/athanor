@@ -845,6 +845,101 @@ out:
     ath_arena_free(&a);
 }
 
+/* ---- the same weights from a GGUF file (step 12) ------------------------------------ */
+
+/* The logits of tokens for the model in dir, on the CPU (eng NULL) or the GPU. */
+static float *gguf_logits(ath_test *t_, const char *dir, ath_dtype act, ath_engine *eng_mem, bool gpu, ath_pool *pool,
+                          ath_arena *a, const int32_t *tok, int32_t T)
+{
+    ath_model *m = ath_arena_zalloc(a, sizeof *m, _Alignof(ath_model));
+    if (!m || ath_model_open(m, a, dir) != ATH_OK)
+        return NULL;
+    ath_state s;
+    ath_exec x = {.pool = pool};
+    if (gpu) {
+        if (ath_engine_open(eng_mem, m, 0, a) != ATH_OK || ath_engine_state(eng_mem, &s, act, 64, a) != ATH_OK)
+            return NULL;
+        x = eng_mem->exec;
+    } else if (ath_state_init(&s, m, act, 64, a) != ATH_OK) {
+        return NULL;
+    }
+    ath_tensor lg;
+    ATH_EXPECT_OK(ath_tensor_init(&lg, ATH_DTYPE_F32, 2, (const int64_t[]){T, m->vocab_size}, NULL, ATH_TIER_RAM));
+    lg.data = ath_arena_alloc(a, ath_tensor_nbytes(&lg), 64);
+    ath_arena scratch;
+    ath_arena_init(&scratch, 0);
+    const ath_batch b = {.tokens = tok, .n_tokens = T, .logits = &lg};
+    const ath_status st = lg.data ? ath_model_forward(m, &b, &s, NULL, &scratch, &x) : ATH_ERR_NOMEM;
+    ath_arena_free(&scratch);
+    if (gpu)
+        ath_engine_close(eng_mem);
+    return st == ATH_OK ? lg.data : NULL;
+}
+
+/* Qwen3.5-0.8B from llama.cpp's bf16 GGUF (step 9; tests/README.md, GGUF)
+ * against its safetensors: the same weights under other names, merged
+ * projections bound as slices, norm weights stored as 1 + w. The one value
+ * that differs is A = −exp(A_log), which the converter computed with torch's
+ * exp where athanor computes it with the device's expf (one or two ulps in
+ * some decays). On the CPU, with bf16 activations, that changes no bit of
+ * the logits; with f32 the logits stay within 1e-4. On the GPU CUDA's expf
+ * moves more decays and bf16 roundings follow: the greedy token is the same
+ * wherever the top-2 margin exceeds 0.5, and f32 stays within 1e-4. */
+ATH_TEST(gguf_matches_safetensors)
+{
+    const char *gd = getenv("ATH_GGUF_DIR") ? getenv("ATH_GGUF_DIR") : "models/Qwen3.5-0.8B-gguf";
+    char path[1024];
+    if (ath_path_join(path, sizeof path, gd, "config.json") != ATH_OK || !ath_file_exists(path))
+        ATH_SKIP("no GGUF directory (tests/README.md, GGUF: models/Qwen3.5-0.8B-gguf or $ATH_GGUF_DIR)");
+    if (ath_path_join(path, sizeof path, model_dir(), "config.json") != ATH_OK || !ath_file_exists(path))
+        ATH_SKIP("no checkpoint in $ATH_MODEL_DIR");
+    static const int32_t tok[12] = {9707, 11, 1246, 525, 498, 30, 220, 16, 10, 16, 28, 33};
+    ath_arena a;
+    ath_arena_init(&a, 0);
+    ath_pool pool;
+    ATH_REQUIRE_OK(ath_pool_init(&pool, ath_pool_default_threads(), &a));
+    ath_engine *eng = ath_arena_zalloc(&a, sizeof *eng, _Alignof(ath_engine));
+    ATH_REQUIRE(eng);
+    const int64_t n = 12 * 248320;
+    for (int dev = 0; dev < (ath_gpu_count() > 0 ? 2 : 1); dev++)
+        for (int f32 = 0; f32 < 2; f32++) {
+            const ath_dtype act = f32 ? ATH_DTYPE_F32 : ATH_DTYPE_BF16;
+            const float *ls = gguf_logits(t_, model_dir(), act, eng, dev, &pool, &a, tok, 12);
+            const float *lg = gguf_logits(t_, gd, act, eng, dev, &pool, &a, tok, 12);
+            ATH_REQUIRE(ls && lg);
+            double worst = 0;
+            int64_t differ = 0;
+            for (int64_t i = 0; i < n; i++) {
+                const double d = fabs((double)ls[i] - (double)lg[i]);
+                worst = d > worst ? d : worst;
+                differ += ls[i] != lg[i];
+            }
+            int flips = 0;   /* positions with a clear greedy token that changed */
+            for (int t = 0; t < 12; t++) {
+                const float *a0 = ls + (int64_t)t * 248320, *b0 = lg + (int64_t)t * 248320;
+                int ia = 0, ib = 0;
+                for (int v = 1; v < 248320; v++) {
+                    ia = a0[v] > a0[ia] ? v : ia;
+                    ib = b0[v] > b0[ib] ? v : ib;
+                }
+                float second = -INFINITY;
+                for (int v = 0; v < 248320; v++)
+                    if (v != ia && a0[v] > second)
+                        second = a0[v];
+                flips += ia != ib && a0[ia] - second > 0.5f;
+            }
+            printf("  %s %s: GGUF against safetensors, %lld of %lld logits differ, worst %.3g, %d greedy flips\n",
+                   dev ? "GPU" : "CPU", f32 ? "f32" : "bf16", (long long)differ, (long long)n, worst, flips);
+            if (f32)
+                ATH_EXPECT(worst <= 1e-4);
+            else if (!dev)
+                ATH_EXPECT(differ == 0);
+            ATH_EXPECT(flips == 0);
+        }
+    ath_pool_free(&pool);
+    ath_arena_free(&a);
+}
+
 static const ath_test_case tests[] = {
     ATH_TEST_ENTRY(state_specs),
     ATH_TEST_ENTRY(forward_rejects),
@@ -853,6 +948,7 @@ static const ath_test_case tests[] = {
     ATH_TEST_ENTRY(forward_hooks),
     ATH_TEST_ENTRY(real_state_specs),
     ATH_TEST_ENTRY(forward_golden),
+    ATH_TEST_ENTRY(gguf_matches_safetensors),
 };
 
 int main(int argc, char **argv)

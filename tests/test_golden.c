@@ -644,13 +644,13 @@ static void run_gdn_gates(ctx *c)
     const ath_tensor *a_log = weight(c, "a_log"), *dt_bias = weight(c, "dt_bias");
     ath_tensor *g = out(c, "g"), *beta = out(c, "beta");
     NEED(a, b, a_log, dt_bias, g, beta);
-    RUN(ath_gdn_gates_ref(a, b, a_log, dt_bias, g, beta));
+    RUN(ath_gdn_gates_ref(a, b, a_log, false, dt_bias, g, beta));
     compare(c, "g", g);
     compare(c, "beta", beta);
     if (c->gpu) {
         ath_tensor *gg = dev_out(c, g), *bg = dev_out(c, beta);
         NEED(gg, bg);
-        GPU_RUN(ath_gdn_gates_gpu(&c->gpu->d, dev(c, a), dev(c, b), dev(c, a_log), dev(c, dt_bias), gg, bg));
+        GPU_RUN(ath_gdn_gates_gpu(&c->gpu->d, dev(c, a), dev(c, b), dev(c, a_log), false, dev(c, dt_bias), gg, bg));
         gpu_compare(c, "g", gg, g);
         gpu_compare(c, "beta", bg, beta);
     }
@@ -668,13 +668,13 @@ static void run_gdn(ctx *c)
     ath_tensor *state = s_in ? copy_as(c, s_in, ATH_DTYPE_F32) : new_tensor(c, ATH_DTYPE_F32, s_out);
     ath_tensor *sg = c->gpu ? dev(c, state) : NULL;                                 /* before the update */
     /* the op normalizes q and k itself (step 10), as l2norm does with eps */
-    RUN(ath_gdn_ref(q, k, v, g, beta, q_scale, eps, state, y));
+    RUN(ath_gdn_ref(q, k, v, g, beta, q_scale, eps, false, state, y));
     compare(c, "out", y);
     compare(c, "state_out", state);
     if (c->gpu) {
         ath_tensor *yg = dev_out(c, y);
         NEED(sg, yg);
-        GPU_RUN(ath_gdn_gpu(&c->gpu->d, dev(c, q), dev(c, k), dev(c, v), dev(c, g), dev(c, beta), q_scale, eps, sg,
+        GPU_RUN(ath_gdn_gpu(&c->gpu->d, dev(c, q), dev(c, k), dev(c, v), dev(c, g), dev(c, beta), q_scale, eps, false, sg,
                             &c->gpu->mem, yg));
         gpu_compare(c, "out", yg, y);
         gpu_compare(c, "state_out", sg, state);

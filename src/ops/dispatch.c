@@ -86,15 +86,16 @@ ath_status ath_conv(const ath_device *d, const ath_tensor *x, const ath_tensor *
 }
 
 ath_status ath_gdn_gates(const ath_device *d, const ath_tensor *a, const ath_tensor *b, const ath_tensor *a_log,
-                         const ath_tensor *dt_bias, ath_tensor *g, ath_tensor *beta)
+                         bool a_given, const ath_tensor *dt_bias, ath_tensor *g, ath_tensor *beta)
 {
-    return d ? ath_gdn_gates_gpu(d, a, b, a_log, dt_bias, g, beta) : ath_gdn_gates_ref(a, b, a_log, dt_bias, g, beta);
+    return d ? ath_gdn_gates_gpu(d, a, b, a_log, a_given, dt_bias, g, beta)
+             : ath_gdn_gates_ref(a, b, a_log, a_given, dt_bias, g, beta);
 }
 
 ath_status ath_gdn(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
-                   const ath_tensor *g, const ath_tensor *beta, float q_scale, float l2_eps, ath_tensor *state,
-                   ath_dev_arena *scratch, ath_tensor *out)
+                   const ath_tensor *g, const ath_tensor *beta, float q_scale, float l2_eps, bool tiled,
+                   ath_tensor *state, ath_dev_arena *scratch, ath_tensor *out)
 {
-    return d ? ath_gdn_gpu(d, q, k, v, g, beta, q_scale, l2_eps, state, scratch, out)
-             : ath_gdn_ref(q, k, v, g, beta, q_scale, l2_eps, state, out);
+    return d ? ath_gdn_gpu(d, q, k, v, g, beta, q_scale, l2_eps, tiled, state, scratch, out)
+             : ath_gdn_ref(q, k, v, g, beta, q_scale, l2_eps, tiled, state, out);
 }

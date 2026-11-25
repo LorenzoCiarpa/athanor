@@ -57,6 +57,9 @@ typedef struct {
     int64_t                  T;     /* tokens in this call            */
     int64_t                  P;     /* tokens before them (n_past)    */
     float                    eps;   /* rms_norm_eps                   */
+    float                    noff;  /* the zero-centered norms' weight offset: 1, or
+                                     * 0 for a GGUF file, which stores 1 + w (step 12) */
+    bool                     gguf;  /* GGUF: A given, value heads tiled (step 12)  */
     ath_tensor               pos;   /* i32 [T]: P, P + 1, ...         */
     /* GPU, a prompt (step 10): an output projection waits in pend until
      * the next norm adds it to the residual stream in the same launch */
@@ -133,10 +136,10 @@ static ath_status norm_matmuls(fwd *f, ath_tensor *x, const ath_param *norm, int
     if (f->pending) {
         ath_tensor y;
         ATH_CHECK(ath_tensor_slice(&f->pend, 0, f->T - x->shape[0], x->shape[0], &y));
-        ATH_CHECK(ath_add_rmsnorm_gpu(f->dev, x, &y, W(f, norm), 1.0f, f->eps, &xn));
+        ATH_CHECK(ath_add_rmsnorm_gpu(f->dev, x, &y, W(f, norm), f->noff, f->eps, &xn));
         f->pending = false;
     } else {
-        ATH_CHECK(ath_rmsnorm(f->dev, x, W(f, norm), 1.0f, f->eps, &xn));
+        ATH_CHECK(ath_rmsnorm(f->dev, x, W(f, norm), f->noff, f->eps, &xn));
     }
     return ath_matmul_n(f->dev, f->pool, &xn, n, w, out);
 }
@@ -215,8 +218,8 @@ static ath_status attention(fwd *f, const ath_qwen35_layer *L, ath_tensor *x)
         ATH_CHECK(tmp(f, &qkn, act, 2, nh + nkv, hd, 0));
         ATH_CHECK(wrap(f, &qn, act, qkn.data, 2, nh, hd, 0));
         ATH_CHECK(wrap(f, &kn, act, (char *)qkn.data + (size_t)(nh * hd) * es, 2, nkv, hd, 0));
-        ATH_CHECK(ath_rmsnorm(f->dev, &q_rows, W(f, L->q_norm), 1.0f, f->eps, &qn));
-        ATH_CHECK(ath_rmsnorm(f->dev, &k_rows, W(f, L->k_norm), 1.0f, f->eps, &kn));
+        ATH_CHECK(ath_rmsnorm(f->dev, &q_rows, W(f, L->q_norm), f->noff, f->eps, &qn));
+        ATH_CHECK(ath_rmsnorm(f->dev, &k_rows, W(f, L->k_norm), f->noff, f->eps, &kn));
         ATH_CHECK(view(&qkn, &qkn3, 3, 1, nh + nkv, hd));
         ATH_CHECK(tmp(f, &qkr, act, 3, 1, nh + nkv, hd));
         ATH_CHECK(ath_rope(f->dev, &qkn3, &f->pos, c->rope_dim, (float)c->rope_theta, &qkr));
@@ -225,8 +228,8 @@ static ath_status attention(fwd *f, const ath_qwen35_layer *L, ath_tensor *x)
     } else {
         ATH_CHECK(tmp(f, &qn, act, 2, T * nh, hd, 0));
         ATH_CHECK(tmp(f, &kn, act, 2, T * nkv, hd, 0));
-        ATH_CHECK(ath_rmsnorm(f->dev, &q_rows, W(f, L->q_norm), 1.0f, f->eps, &qn));
-        ATH_CHECK(ath_rmsnorm(f->dev, &k_rows, W(f, L->k_norm), 1.0f, f->eps, &kn));
+        ATH_CHECK(ath_rmsnorm(f->dev, &q_rows, W(f, L->q_norm), f->noff, f->eps, &qn));
+        ATH_CHECK(ath_rmsnorm(f->dev, &k_rows, W(f, L->k_norm), f->noff, f->eps, &kn));
         ATH_CHECK(view(&qn, &qn3, 3, T, nh, hd));
         ATH_CHECK(view(&kn, &kn3, 3, T, nkv, hd));
         ATH_CHECK(tmp(f, &qr, act, 3, T, nh, hd));
@@ -288,10 +291,11 @@ static ath_status gated_deltanet(fwd *f, const ath_qwen35_layer *L, ath_tensor *
      * computes it on the bf16 projection; g is fp32 */
     ATH_CHECK(tmp(f, &g, ATH_DTYPE_F32, 2, T, nv, 0));
     ATH_CHECK(tmp(f, &beta, act, 2, T, nv, 0));
-    ATH_CHECK(ath_gdn_gates(f->dev, &a, &b, W(f, L->a_log), W(f, L->dt_bias), &g, &beta));
+    ATH_CHECK(ath_gdn_gates(f->dev, &a, &b, W(f, L->a_log), f->gguf, W(f, L->dt_bias), &g, &beta));
     ATH_CHECK(wrap(f, &rec, ATH_DTYPE_F32, f->s->buf[L->recurrent], 3, nv, dk, dv));
     ATH_CHECK(tmp(f, &o, act, 3, T, nv, dv));
-    ATH_CHECK(ath_gdn(f->dev, &q, &k, &v, &g, &beta, (float)(1.0 / sqrt((double)dk)), L2NORM_EPS, &rec, f->da, &o));
+    ATH_CHECK(ath_gdn(f->dev, &q, &k, &v, &g, &beta, (float)(1.0 / sqrt((double)dk)), L2NORM_EPS, f->gguf, &rec, f->da,
+                      &o));
 
     /* gated RMSNorm per value head, then the output projection */
     ath_tensor o_rows, z_rows, on, on_flat;
@@ -316,7 +320,7 @@ static ath_status mlp(fwd *f, const ath_qwen35_layer *L, ath_tensor *x)
         /* one token on a GPU: gate, up and SwiGLU in one launch (step 9) */
         ath_tensor xn;
         ATH_CHECK(tmp(f, &xn, f->act, 2, T, f->c->hidden, 0));
-        ATH_CHECK(ath_rmsnorm(f->dev, x, W(f, L->post_norm), 1.0f, f->eps, &xn));
+        ATH_CHECK(ath_rmsnorm(f->dev, x, W(f, L->post_norm), f->noff, f->eps, &xn));
         ATH_CHECK(ath_matmul_swiglu_gpu(f->dev, &xn, pw[0], pw[1], &h));
         return matmul_add(f, &h, W(f, L->down_proj), x);
     }
@@ -354,7 +358,7 @@ ath_status ath_qwen35_forward(const ath_model *m, const ath_batch *b, ath_state 
     fwd f = {
         .m = m, .c = c, .s = s, .a = scratch, .pool = x_->pool, .dev = x_->dev, .da = x_->scratch,
         .w = x_->dev ? x_->weights : NULL, .act = s->act, .T = b->n_tokens, .P = s->n_past,
-        .eps = (float)c->rms_eps,
+        .eps = (float)c->rms_eps, .noff = q->norm_offset, .gguf = q->gguf,
     };
     const int64_t T = f.T, H = c->hidden;
     const bool on_dev = b->flags & ATH_BATCH_DEVICE;

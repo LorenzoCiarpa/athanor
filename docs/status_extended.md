@@ -1241,6 +1241,18 @@ No file of the repository yet. Strata `2af30cc` (2026-11-24, version 0.1.68 in i
 
 Measured with a throwaway harness (no claim: `docs/BENCHMARKS.md`): the decode kernel reads the output head (248,320 × 2048, 509 MB in Q8_0) at 897 GB/s, the bf16 GEMV's 907; the prompt kernel runs a 4096 × 2048 × 8192 product in 14.7 ms, about 9 TFLOPS against cuBLASLt's 113 in bf16.
 
+#### 12.4 The family on the GGUF
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `src/models/qwen35/weights.c` | Changed | Both naming schemes (`NM`): llama.cpp's names in a GGUF file, merged qkv/z and beta/alpha as row slices (`bind_split`), the squeezed convolution and shared-expert gate as views of the reference's shapes (`bind_as`), Q8_0 allowed for matmul and embedding roles; per expert separate gate and up views in both formats (`bind_experts`); the MoE params recorded in the layer table; the MTP block `blk.<n_layers>.` as the ignored group of a GGUF; `check_gguf` (architecture and dimensions against `config.json`) |
+| `src/models/qwen35/qwen35.h` | Changed | The MoE params of a layer (router, experts' gate, up, down, shared expert and its gate); `gguf` and `norm_offset` in the family data |
+| `src/models/qwen35/forward.c` | Changed | The zero-centered norms with `norm_offset`; the gates with `a_given` and the gated delta rule with `tiled` for a GGUF |
+| `src/ops/gdn.c`, `ops.h`, `dispatch.c`, `launch.h`, `gpu_none.c`, `cuda/gdn.cu`, `cuda/gdn_chunk.cu` | Changed | `ath_gdn_gates(…, a_given, …)`: A given instead of A_log; `ath_gdn(…, tiled, …)`: value head h reads key head h mod nk (in the reference, the recurrent kernel and both bodies of the chunked kernel) |
+| `docs/contract/qwen36-35b-a3b.md` | New | The checkpoint (configuration and tokenizer revision, the GGUF's revision and hash), the converter's transforms read from its source, how athanor reads each, the verification |
+| `tests/test_model.c`, `tests/test_forward.c`, `tests/test_ops.c`, `tests/test_gpu_ops.c`, `tests/test_golden.c` | Changed | `qwen36_gguf_binds`; `gguf_matches_safetensors`; the MoE binding test with gate and up apart; the new arguments |
+| `src/models/qwen35/README.md`, `tests/README.md` | Changed | The GGUF layout; the GGUF tests and the directory they need |
+
 ---
 
 ## Files by step

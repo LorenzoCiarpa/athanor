@@ -153,7 +153,7 @@ static __device__ __forceinline__ void prep_rows(float (*tile)[XP], float *inv, 
 static __device__ __forceinline__ void
 prep_body(unsigned char *smem, int bx, int by, const void *q, int qdt, const void *k, int kdt, const void *v, int vdt,
           const float *g, const void *beta, int bdt, float q_scale, float l2_eps, int64_t T, int64_t c0, int64_t nk,
-          int dk, int64_t nv, int dv, int64_t qs, int64_t ks, int64_t vs, float *Qp, float *W, float *U, float *OU,
+          bool tiled, int dk, int64_t nv, int dv, int64_t qs, int64_t ks, int64_t vs, float *Qp, float *W, float *U, float *OU,
           float *gam, float *ikg)
 {
     float *pm = (float *)smem;
@@ -166,7 +166,7 @@ prep_body(unsigned char *smem, int bx, int by, const void *q, int qdt, const voi
     float *iq = be + GC, *ik = iq + GC;                               /* 1 / |q|, 1 / |k| per row  */
     float (*xt)[16][16] = (float (*)[16][16])(ik + GC);               /* blocks of T being built   */
     const int tid = threadIdx.x, lane = tid % ATH_WARP, w = tid / ATH_WARP;
-    const int64_t c = c0 + bx, h = by, kh = h / (nv / nk), t0 = c * GC;
+    const int64_t c = c0 + bx, h = by, kh = tiled ? h % nk : h / (nv / nk), t0 = c * GC;
     const int n = (int)(T - t0 < GC ? T - t0 : GC);
     const int64_t out = ((int64_t)bx * nv + h) * GC;              /* this chunk's rows in the round's scratch */
 
@@ -447,14 +447,14 @@ static __device__ __forceinline__ void scan_keys(float *x, const void *k, int es
 static __device__ __forceinline__ void
 scan_body(unsigned char *scan_smem, int bx, int by, const void *k, int kdt, const float *Qp, const float *W,
           const float *U, const float *OU, const float *gam, const float *ikg, float *state, void *out, int odt,
-          int64_t T, int64_t c0, int64_t nc, int64_t nk, int dk, int64_t nv, int dv, int64_t ks)
+          int64_t T, int64_t c0, int64_t nc, int64_t nk, bool tiled, int dk, int64_t nv, int dv, int64_t ks)
 {
     float *const xb0 = (float *)scan_smem;                              /* two operand tiles, */
 #define XB(i) (xb0 + (i) * TILE)                                        /* so the compiler sees shared memory */
     float (*sm)[GV] = (float (*)[GV])(xb0 + 2 * TILE);                   /* S [GD][GV]        */
     float (*dl)[GV] = sm + GD;                                           /* e^(γ_last − γ) Δ [GC][GV] */
     const int lane = threadIdx.x % ATH_WARP, w = threadIdx.x / ATH_WARP, lr = lane / 8, lc = lane % 8;
-    const int64_t h = bx, kh = h / (nv / nk), j0 = (int64_t)by * GV;
+    const int64_t h = bx, kh = tiled ? h % nk : h / (nv / nk), j0 = (int64_t)by * GV;
     const int jn = (int)(dv - j0 < GV ? dv - j0 : GV);            /* live columns of this block */
     float *S = state + h * dk * dv;
 
@@ -619,6 +619,7 @@ typedef struct {
     void *out;
     int qdt, kdt, vdt, bdt, odt, dk, dv;
     float q_scale, l2_eps;
+    bool tiled;
     int64_t T, nk, nv, qs, ks, vs;
 } gdn_ops;
 
@@ -638,11 +639,11 @@ gdn_round(gdn_ops a, gdn_round_buf s, int nscan, gdn_round_buf p)
     const int b = blockIdx.x;
     if (b < nscan)
         scan_body(gsm, (int)(b % a.nv), (int)(b / a.nv), a.k, a.kdt, s.Qp, s.W, s.U, s.OU, s.gam, s.ik, a.state, a.out,
-                  a.odt, a.T, s.c0, s.n, a.nk, a.dk, a.nv, a.dv, a.ks);
+                  a.odt, a.T, s.c0, s.n, a.nk, a.tiled, a.dk, a.nv, a.dv, a.ks);
     else {
         const int pb = b - nscan;
         prep_body(gsm, (int)(pb % p.n), (int)(pb / p.n), a.q, a.qdt, a.k, a.kdt, a.v, a.vdt, a.g, a.beta, a.bdt,
-                  a.q_scale, a.l2_eps, a.T, p.c0, a.nk, a.dk, a.nv, a.dv, a.qs, a.ks, a.vs, p.Qp, p.W, p.U, p.OU,
+                  a.q_scale, a.l2_eps, a.T, p.c0, a.nk, a.tiled, a.dk, a.nv, a.dv, a.qs, a.ks, a.vs, p.Qp, p.W, p.U, p.OU,
                   p.gam, p.ik);
     }
 }
@@ -683,7 +684,7 @@ extern "C" size_t ath_gdn_chunk_bytes(const ath_device *d, const ath_tensor *q, 
 
 extern "C" ath_status ath_gdn_chunk_launch(const ath_device *d, const ath_tensor *q, const ath_tensor *k,
                                            const ath_tensor *v, const ath_tensor *g, const ath_tensor *beta,
-                                           float q_scale, float l2_eps, ath_tensor *state, void *work,
+                                           float q_scale, float l2_eps, bool tiled, ath_tensor *state, void *work,
                                            ath_tensor *out)
 {
     const int64_t T = q->shape[0], nk = q->shape[1], dk = q->shape[2], nv = v->shape[1], dv = v->shape[2];
@@ -701,7 +702,7 @@ extern "C" ath_status ath_gdn_chunk_launch(const ath_device *d, const ath_tensor
         .q = q->data, .k = k->data, .v = v->data, .beta = beta->data, .g = (const float *)g->data,
         .state = (float *)state->data, .out = out->data, .qdt = q->dtype, .kdt = k->dtype, .vdt = v->dtype,
         .bdt = beta->dtype, .odt = out->dtype, .dk = (int)dk, .dv = (int)dv, .q_scale = q_scale, .l2_eps = l2_eps,
-        .T = T, .nk = nk, .nv = nv, .qs = q->stride[0], .ks = k->stride[0], .vs = v->stride[0],
+        .tiled = tiled, .T = T, .nk = nk, .nv = nv, .qs = q->stride[0], .ks = k->stride[0], .vs = v->stride[0],
     };
     /* rounds of rc chunks; round r in buffer r % 2 */
     const int64_t rc = round_chunks(d, nc, nv), rounds = (nc + rc - 1) / rc;

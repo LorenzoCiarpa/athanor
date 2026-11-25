@@ -282,8 +282,9 @@ ATH_TEST(qwen35_bind_moe)
     ath_model m;
     ATH_REQUIRE_OK(open_tiny(&a, &m, &d, &MOE, (ckpt){.skip = NULL}, NULL));
 
-    /* per layer: 2 norms, mixer, router, 2 views per expert, 3 shared + gate */
-    uint32_t moe = 1 + 2 * E + 4;
+    /* per layer: 2 norms, mixer, router, 3 views per expert (gate and up
+     * halves of gate_up_proj, down: step 12), 3 shared + gate */
+    uint32_t moe = 1 + 3 * E + 4;
     const uint32_t used = 3 + 3 * (2 + 9 + moe) + (2 + 6 + moe);
     ATH_EXPECT_EQ_INT(m.n_params, used + count_flag(&m, ATH_P_UNUSED));
     ATH_EXPECT_EQ_INT(m.n_bound, m.ckpt.n_tensors);
@@ -296,26 +297,34 @@ ATH_TEST(qwen35_bind_moe)
     ATH_EXPECT_EQ_INT(m.params[used - 1].role, ATH_ROLE_LM_HEAD);
     ATH_EXPECT_EQ_INT(m.params[0].flags, ATH_P_WRITES_RESIDUAL);   /* untied: not sensitive */
     ATH_EXPECT_EQ_INT(count_role(&m, ATH_ROLE_ROUTER), 4);
-    ATH_EXPECT_EQ_INT(count_role(&m, ATH_ROLE_EXPERT_IN), 4 * E);
+    ATH_EXPECT_EQ_INT(count_role(&m, ATH_ROLE_EXPERT_IN), 4 * 2 * E);
     ATH_EXPECT_EQ_INT(count_role(&m, ATH_ROLE_EXPERT_OUT), 4 * E);
     ATH_EXPECT_EQ_INT(count_flag(&m, ATH_P_SHARED_EXPERT), 4 * 4);
     /* residual writers: embedding, mixer output, expert downs, shared down */
     ATH_EXPECT_EQ_INT(count_flag(&m, ATH_P_WRITES_RESIDUAL), 1 + 4 * (1 + E + 1));
 
-    /* fused experts: one contiguous [rows, cols] view per expert, in place */
+    /* fused experts: per expert two contiguous [IE, H] views, the gate rows
+     * then the up rows of its slice, in place */
     const char *gu = "model.language_model.layers.2.mlp.experts.gate_up_proj";
     const ath_ckpt_tensor *full = ath_ckpt_find(&m.ckpt, gu);
     ATH_REQUIRE(full);
     for (int32_t x = 0; x < E; x++) {
-        const ath_param *p = find_param(&m, gu, x);
-        ATH_REQUIRE(p);
-        ATH_EXPECT_EQ_INT(p->role, ATH_ROLE_EXPERT_IN);
-        ATH_EXPECT_EQ_INT(p->layer, 2);
-        ATH_EXPECT_EQ_INT(p->t.ndim, 2);
-        ATH_EXPECT_EQ_INT(p->t.shape[0], 2 * IE);
-        ATH_EXPECT_EQ_INT(p->t.shape[1], H);
-        ATH_EXPECT(ath_tensor_is_contiguous(&p->t));
-        ATH_EXPECT((const char *)p->t.data == (const char *)full->t.data + (size_t)x * 2 * IE * H * 2);
+        int seen = 0;
+        for (uint32_t i = 0; i < m.n_params; i++) {
+            const ath_param *p = &m.params[i];
+            if (strcmp(p->name, gu) != 0 || p->expert != x)
+                continue;
+            ATH_EXPECT_EQ_INT(p->role, ATH_ROLE_EXPERT_IN);
+            ATH_EXPECT_EQ_INT(p->layer, 2);
+            ATH_EXPECT_EQ_INT(p->t.ndim, 2);
+            ATH_EXPECT_EQ_INT(p->t.shape[0], IE);
+            ATH_EXPECT_EQ_INT(p->t.shape[1], H);
+            ATH_EXPECT(ath_tensor_is_contiguous(&p->t));
+            ATH_EXPECT((const char *)p->t.data ==
+                       (const char *)full->t.data + ((size_t)x * 2 + (size_t)seen) * IE * H * 2);
+            seen++;
+        }
+        ATH_EXPECT_EQ_INT(seen, 2);
     }
     const ath_param *down = find_param(&m, "model.language_model.layers.0.mlp.experts.down_proj", E - 1);
     ATH_REQUIRE(down);
@@ -474,6 +483,41 @@ ATH_TEST(qwen35_real_model)
 
 /* ---- runner -------------------------------------------------------------------- */
 
+/* Qwen3.6-35B-A3B from its Q8_0 GGUF (step 12), when the file is there
+ * (ATH_MOE_DIR, default models/Qwen3.6-35B-A3B): every tensor bound, the
+ * per-expert views of the fused GGUF tensors, the MTP block ignored. */
+ATH_TEST(qwen36_gguf_binds)
+{
+    const char *dir = getenv("ATH_MOE_DIR") ? getenv("ATH_MOE_DIR") : "models/Qwen3.6-35B-A3B";
+    char p[1024];
+    if (ath_path_join(p, sizeof p, dir, "Qwen3.6-35B-A3B-Q8_0.gguf") != ATH_OK || !ath_file_exists(p))
+        ATH_SKIP("no Qwen3.6-35B-A3B GGUF");
+    ath_arena a;
+    ath_arena_init(&a, 0);
+    ath_model m;
+    ATH_REQUIRE_OK(ath_model_open(&m, &a, dir));
+    ATH_EXPECT(m.ckpt.format == ATH_CKPT_GGUF);
+    ATH_EXPECT_EQ_INT(m.n_bound, m.ckpt.n_tensors);
+    ATH_EXPECT_EQ_INT(m.n_experts, 256);
+    ATH_EXPECT_EQ_INT(m.n_experts_active, 8);
+    ATH_EXPECT_EQ_INT(count_role(&m, ATH_ROLE_EXPERT_IN), 40 * 2 * 256);
+    ATH_EXPECT_EQ_INT(count_role(&m, ATH_ROLE_EXPERT_OUT), 40 * 256);
+    ATH_EXPECT_EQ_INT(count_role(&m, ATH_ROLE_ROUTER), 40);
+    ATH_EXPECT_EQ_INT(count_flag(&m, ATH_P_UNUSED), 20);
+    ATH_REQUIRE(m.n_ignored == 1);
+    ATH_EXPECT_STR_EQ(m.ignored[0].prefix, "blk.40.");
+    const ath_param *e = find_param(&m, "blk.7.ffn_down_exps.weight", 255);
+    ATH_REQUIRE(e);
+    ATH_EXPECT(e->t.dtype == ATH_DTYPE_Q8_0 && e->t.shape[0] == 2048 && e->t.shape[1] == 512);
+    const ath_ckpt_tensor *full = ath_ckpt_find(&m.ckpt, "blk.7.ffn_down_exps.weight");
+    ATH_REQUIRE(full);
+    ATH_EXPECT((const char *)e->t.data == (const char *)full->t.data + (size_t)255 * 2048 * 512 / 32 * 34);
+    const ath_param *conv = find_param(&m, "blk.0.ssm_conv1d.weight", -1);
+    ATH_EXPECT(conv && conv->t.ndim == 3 && conv->t.shape[1] == 1 && conv->t.shape[2] == 4);
+    ath_model_close(&m);
+    ath_arena_free(&a);
+}
+
 static const ath_test_case tests[] = {
     ATH_TEST_ENTRY(role_names),
     ATH_TEST_ENTRY(registry_lists_families),
@@ -486,6 +530,7 @@ static const ath_test_case tests[] = {
     ATH_TEST_ENTRY(qwen35_bind_rejects),
     ATH_TEST_ENTRY(model_open_errors),
     ATH_TEST_ENTRY(qwen35_real_model),
+    ATH_TEST_ENTRY(qwen36_gguf_binds),
 };
 
 int main(int argc, char **argv)

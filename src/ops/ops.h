@@ -261,11 +261,14 @@ ath_status ath_conv_gpu(const ath_device *d, const ath_tensor *x, const ath_tens
  *   g    = −exp(a_log) · softplus(a + dt_bias)     (α = exp(g) is the decay, in (0, 1])
  *   beta = sigmoid(b)                              (the write strength)
  * softplus(x) = log(1 + exp(x)), and x itself above 20 (torch's threshold).
- * a, b, g, beta [T, nv]; a_log, dt_bias [nv]. */
-ath_status ath_gdn_gates_ref(const ath_tensor *a, const ath_tensor *b, const ath_tensor *a_log,
+ * a, b, g, beta [T, nv]; a_log, dt_bias [nv]. With a_given (step 12) a_log
+ * holds A = −exp(A_log) itself, as llama.cpp's converter stores it in a
+ * GGUF file (ssm_a), and g = A · softplus(a + dt_bias). */
+ath_status ath_gdn_gates_ref(const ath_tensor *a, const ath_tensor *b, const ath_tensor *a_log, bool a_given,
                              const ath_tensor *dt_bias, ath_tensor *g, ath_tensor *beta);
 ath_status ath_gdn_gates_gpu(const ath_device *d, const ath_tensor *a, const ath_tensor *b,
-                             const ath_tensor *a_log, const ath_tensor *dt_bias, ath_tensor *g, ath_tensor *beta);
+                             const ath_tensor *a_log, bool a_given, const ath_tensor *dt_bias, ath_tensor *g,
+                             ath_tensor *beta);
 
 /* Gated delta rule, recurrent form. For every token t and value head h, with
  * the state S [dk, dv] of that head:
@@ -278,9 +281,11 @@ ath_status ath_gdn_gates_gpu(const ath_device *d, const ath_tensor *a, const ath
  * that the normalized values are never stored; l2_eps 0 leaves a unit
  * vector as it is). q, k [T, nk, dk]; v, out [T, nv, dv]; g, beta [T, nv];
  * state [nv, dk, dv] f32, read and updated in place (zero it at the start of
- * a sequence). Value head h reads query/key head h / (nv / nk). */
+ * a sequence). Value head h reads query/key head h / (nv / nk) (the
+ * reference's grouped order), or h mod nk with tiled (step 12: llama.cpp's
+ * converter stores the value heads of a GGUF file in that order). */
 ath_status ath_gdn_ref(const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
-                       const ath_tensor *g, const ath_tensor *beta, float q_scale, float l2_eps,
+                       const ath_tensor *g, const ath_tensor *beta, float q_scale, float l2_eps, bool tiled,
                        ath_tensor *state, ath_tensor *out);
 /* GPU: dk <= ATH_GDN_MAX_DK. The recurrent form, as the reference: one step
  * per token. With a scratch arena, from ATH_GDN_CHUNK_MIN_T tokens on, f32 g,
@@ -293,8 +298,8 @@ ath_status ath_gdn_ref(const ath_tensor *q, const ath_tensor *k, const ath_tenso
 #define ATH_GDN_MAX_DK 256
 #define ATH_GDN_CHUNK_MIN_T 64
 ath_status ath_gdn_gpu(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
-                       const ath_tensor *g, const ath_tensor *beta, float q_scale, float l2_eps, ath_tensor *state,
-                       ath_dev_arena *scratch, ath_tensor *out);
+                       const ath_tensor *g, const ath_tensor *beta, float q_scale, float l2_eps, bool tiled,
+                       ath_tensor *state, ath_dev_arena *scratch, ath_tensor *out);
 
 /* ---- dispatch.c (step 8): one entry point per op ------------------------------
  *
@@ -320,10 +325,10 @@ ath_status ath_conv(const ath_device *d, const ath_tensor *x, const ath_tensor *
                     ath_tensor *out);
 ath_status ath_scatter_rows(const ath_device *d, const ath_tensor *src, const ath_tensor *idx, ath_tensor *dst);
 ath_status ath_gdn_gates(const ath_device *d, const ath_tensor *a, const ath_tensor *b, const ath_tensor *a_log,
-                         const ath_tensor *dt_bias, ath_tensor *g, ath_tensor *beta);
+                         bool a_given, const ath_tensor *dt_bias, ath_tensor *g, ath_tensor *beta);
 ath_status ath_gdn(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
-                   const ath_tensor *g, const ath_tensor *beta, float q_scale, float l2_eps, ath_tensor *state,
-                   ath_dev_arena *scratch, ath_tensor *out);
+                   const ath_tensor *g, const ath_tensor *beta, float q_scale, float l2_eps, bool tiled,
+                   ath_tensor *state, ath_dev_arena *scratch, ath_tensor *out);
 
 /* ---- sample.c (step 5) ----------------------------------------------------- */
 

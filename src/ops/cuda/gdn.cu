@@ -31,26 +31,27 @@ static __device__ __forceinline__ float k_softplus(float x)
 }
 
 static __global__ void gates_kernel(const void *a, int adt, const void *b, int bdt, const void *a_log, int ldt,
-                                    const void *dt_bias, int ddt, void *g, int gdt, void *beta, int betadt, int64_t T,
-                                    int64_t nv)
+                                    bool a_given, const void *dt_bias, int ddt, void *g, int gdt, void *beta,
+                                    int betadt, int64_t T, int64_t nv)
 {
     K_FOR(e, T * nv) {
         const int64_t h = e % nv;
-        k_st(g, gdt, e, -expf(k_ld(a_log, ldt, h)) * k_softplus(k_ld(a, adt, e) + k_ld(dt_bias, ddt, h)));
+        const float A = a_given ? k_ld(a_log, ldt, h) : -expf(k_ld(a_log, ldt, h));
+        k_st(g, gdt, e, A * k_softplus(k_ld(a, adt, e) + k_ld(dt_bias, ddt, h)));
         k_st(beta, betadt, e, 1.0f / (1.0f + expf(-k_ld(b, bdt, e))));
     }
 }
 
 extern "C" ath_status ath_gdn_gates_launch(const ath_device *d, const ath_tensor *a, const ath_tensor *b,
-                                           const ath_tensor *a_log, const ath_tensor *dt_bias, ath_tensor *g,
-                                           ath_tensor *beta)
+                                           const ath_tensor *a_log, bool a_given, const ath_tensor *dt_bias,
+                                           ath_tensor *g, ath_tensor *beta)
 {
     const int64_t T = a->shape[0], nv = a->shape[1];
     if (T * nv == 0)
         return ATH_OK;
     ATH_CHECK(ath_gpu_use(d));
     gates_kernel<<<k_blocks(T * nv, 256), 256, 0, k_stream(d)>>>(a->data, a->dtype, b->data, b->dtype, a_log->data,
-                                                                 a_log->dtype, dt_bias->data, dt_bias->dtype, g->data,
+                                                                 a_log->dtype, a_given, dt_bias->data, dt_bias->dtype, g->data,
                                                                  g->dtype, beta->data, beta->dtype, T, nv);
     return ath_gpu_launched("gates_kernel");
 }
@@ -58,7 +59,7 @@ extern "C" ath_status ath_gdn_gates_launch(const ath_device *d, const ath_tensor
 static __device__ __forceinline__ void
 gdn_body(int rows_max, const void *q, int qdt, const void *k, int kdt, const void *v, int vdt, const void *g, int gdt,
          const void *beta, int bdt, float q_scale, float l2_eps, float *state, void *out, int odt, int64_t T,
-         int64_t nk, int64_t dk, int64_t nv, int64_t dv, int64_t qs, int64_t ks, int64_t vs)
+         int64_t nk, bool tiled, int64_t dk, int64_t nv, int64_t dv, int64_t qs, int64_t ks, int64_t vs)
 {
     __shared__ float kq[2][ATH_GDN_MAX_DK];         /* the token's k and q, as given  */
     __shared__ float part[GDN_WARPS][ATH_WARP];      /* the warps' partial sums      */
@@ -66,7 +67,7 @@ gdn_body(int rows_max, const void *q, int qdt, const void *k, int kdt, const voi
     const int lane = threadIdx.x % ATH_WARP, warp = threadIdx.x / ATH_WARP;
     const int64_t h = blockIdx.x, j = (int64_t)blockIdx.y * ATH_WARP + lane;   /* this lane's column */
     const bool live = j < dv;
-    const int64_t kh = h / (nv / nk);               /* query/key head of value head h */
+    const int64_t kh = tiled ? h % nk : h / (nv / nk);   /* query/key head of value head h */
     float *S = state + h * dk * dv;
 
     /* rows warp, warp + GDN_WARPS, ... of the column, in registers for the
@@ -159,24 +160,24 @@ gdn_body(int rows_max, const void *q, int qdt, const void *k, int kdt, const voi
 static __global__ void __launch_bounds__(GDN_WARPS *ATH_WARP)
 gdn_kernel(const void *q, int qdt, const void *k, int kdt, const void *v, int vdt, const void *g, int gdt,
            const void *beta, int bdt, float q_scale, float l2_eps, float *state, void *out, int odt, int64_t T,
-           int64_t nk, int64_t dk, int64_t nv, int64_t dv, int64_t qs, int64_t ks, int64_t vs)
+           int64_t nk, bool tiled, int64_t dk, int64_t nv, int64_t dv, int64_t qs, int64_t ks, int64_t vs)
 {
-    gdn_body(GDN_ROWS, q, qdt, k, kdt, v, vdt, g, gdt, beta, bdt, q_scale, l2_eps, state, out, odt, T, nk, dk, nv, dv,
-             qs, ks, vs);
+    gdn_body(GDN_ROWS, q, qdt, k, kdt, v, vdt, g, gdt, beta, bdt, q_scale, l2_eps, state, out, odt, T, nk, tiled, dk,
+             nv, dv, qs, ks, vs);
 }
 
 static __global__ void __launch_bounds__(GDN_WARPS *ATH_WARP)
 gdn_kernel_128(const void *q, int qdt, const void *k, int kdt, const void *v, int vdt, const void *g, int gdt,
                const void *beta, int bdt, float q_scale, float l2_eps, float *state, void *out, int odt, int64_t T,
-               int64_t nk, int64_t dk, int64_t nv, int64_t dv, int64_t qs, int64_t ks, int64_t vs)
+               int64_t nk, bool tiled, int64_t dk, int64_t nv, int64_t dv, int64_t qs, int64_t ks, int64_t vs)
 {
-    gdn_body(128 / GDN_WARPS, q, qdt, k, kdt, v, vdt, g, gdt, beta, bdt, q_scale, l2_eps, state, out, odt, T, nk, dk,
-             nv, dv, qs, ks, vs);
+    gdn_body(128 / GDN_WARPS, q, qdt, k, kdt, v, vdt, g, gdt, beta, bdt, q_scale, l2_eps, state, out, odt, T, nk,
+             tiled, dk, nv, dv, qs, ks, vs);
 }
 
 extern "C" ath_status ath_gdn_launch(const ath_device *d, const ath_tensor *q, const ath_tensor *k,
                                      const ath_tensor *v, const ath_tensor *g, const ath_tensor *beta, float q_scale,
-                                     float l2_eps, ath_tensor *state, ath_tensor *out)
+                                     float l2_eps, bool tiled, ath_tensor *state, ath_tensor *out)
 {
     const int64_t T = q->shape[0], nk = q->shape[1], dk = q->shape[2], nv = v->shape[1], dv = v->shape[2];
     if (nv == 0 || dv == 0 || T == 0)
@@ -191,7 +192,7 @@ extern "C" ath_status ath_gdn_launch(const ath_device *d, const ath_tensor *q, c
     const dim3 grid((unsigned)nv, (unsigned)col_blocks);
     (dk <= 128 ? gdn_kernel_128 : gdn_kernel)<<<grid, GDN_WARPS * ATH_WARP, 0, k_stream(d)>>>(
         q->data, q->dtype, k->data, k->dtype, v->data, v->dtype, g->data, g->dtype, beta->data, beta->dtype, q_scale,
-        l2_eps, (float *)state->data, out->data, out->dtype, T, nk, dk, nv, dv, q->stride[0], k->stride[0],
+        l2_eps, (float *)state->data, out->data, out->dtype, T, nk, tiled, dk, nv, dv, q->stride[0], k->stride[0],
         v->stride[0]);
     return ath_gpu_launched("gdn_kernel");
 }

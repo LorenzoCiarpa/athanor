@@ -42,7 +42,7 @@ static ath_status gates_args(const ath_tensor *a, const ath_tensor *b, const ath
     return OPS_PLACE(op, where, a, b, a_log, dt_bias, g, beta);
 }
 
-ath_status ath_gdn_gates_ref(const ath_tensor *a, const ath_tensor *b, const ath_tensor *a_log,
+ath_status ath_gdn_gates_ref(const ath_tensor *a, const ath_tensor *b, const ath_tensor *a_log, bool a_given,
                              const ath_tensor *dt_bias, ath_tensor *g, ath_tensor *beta)
 {
     ATH_CHECK(gates_args(a, b, a_log, dt_bias, g, beta, OPS_HOST));
@@ -50,7 +50,8 @@ ath_status ath_gdn_gates_ref(const ath_tensor *a, const ath_tensor *b, const ath
     for (int64_t t = 0; t < T; t++)
         for (int64_t h = 0; h < nv; h++) {
             int64_t e = t * nv + h;
-            st(g, e, -expf(ld(a_log, h)) * softplus(ld(a, e) + ld(dt_bias, h)));
+            const float A = a_given ? ld(a_log, h) : -expf(ld(a_log, h));
+            st(g, e, A * softplus(ld(a, e) + ld(dt_bias, h)));
             st(beta, e, 1.0f / (1.0f + expf(-ld(b, e))));
         }
     return ATH_OK;
@@ -99,7 +100,7 @@ static float l2_inv(const ath_tensor *x, int64_t base, int64_t n, float eps)
 }
 
 ath_status ath_gdn_ref(const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
-                       const ath_tensor *g, const ath_tensor *beta, float q_scale, float l2_eps,
+                       const ath_tensor *g, const ath_tensor *beta, float q_scale, float l2_eps, bool tiled,
                        ath_tensor *state, ath_tensor *out)
 {
     ATH_CHECK(gdn_args(q, k, v, g, beta, state, out, OPS_HOST));
@@ -110,8 +111,9 @@ ath_status ath_gdn_ref(const ath_tensor *q, const ath_tensor *k, const ath_tenso
     for (int64_t t = 0; t < T; t++)
         for (int64_t h = 0; h < nv; h++) {
             float *S = S0 + h * dk * dv;
-            const int64_t qb = t * q->stride[0] + (h / group) * dk;   /* query/key head of value head h */
-            const int64_t kb = t * k->stride[0] + (h / group) * dk;
+            const int64_t kh = tiled ? h % nk : h / group;          /* query/key head of value head h */
+            const int64_t qb = t * q->stride[0] + kh * dk;
+            const int64_t kb = t * k->stride[0] + kh * dk;
             const int64_t vb = t * v->stride[0] + h * dv, ob = (t * nv + h) * dv;
             const float alpha = expf(ld(g, t * nv + h));
             const float b = ld(beta, t * nv + h);
@@ -135,15 +137,16 @@ ath_status ath_gdn_ref(const ath_tensor *q, const ath_tensor *k, const ath_tenso
 }
 
 ath_status ath_gdn_gates_gpu(const ath_device *d, const ath_tensor *a, const ath_tensor *b,
-                             const ath_tensor *a_log, const ath_tensor *dt_bias, ath_tensor *g, ath_tensor *beta)
+                             const ath_tensor *a_log, bool a_given, const ath_tensor *dt_bias, ath_tensor *g,
+                             ath_tensor *beta)
 {
     ATH_CHECK(gates_args(a, b, a_log, dt_bias, g, beta, OPS_GPU));
-    return ath_gdn_gates_launch(d, a, b, a_log, dt_bias, g, beta);
+    return ath_gdn_gates_launch(d, a, b, a_log, a_given, dt_bias, g, beta);
 }
 
 ath_status ath_gdn_gpu(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
-                       const ath_tensor *g, const ath_tensor *beta, float q_scale, float l2_eps, ath_tensor *state,
-                       ath_dev_arena *scratch, ath_tensor *out)
+                       const ath_tensor *g, const ath_tensor *beta, float q_scale, float l2_eps, bool tiled,
+                       ath_tensor *state, ath_dev_arena *scratch, ath_tensor *out)
 {
     ATH_CHECK(gdn_args(q, k, v, g, beta, state, out, OPS_GPU));
     if (q->shape[2] > ATH_GDN_MAX_DK)
@@ -155,9 +158,9 @@ ath_status ath_gdn_gpu(const ath_device *d, const ath_tensor *q, const ath_tenso
         void *work = ath_dev_arena_alloc(scratch, ath_gdn_chunk_bytes(d, q, v), 0);
         if (!work)
             return ATH_ERR_NOMEM;
-        ath_status st = ath_gdn_chunk_launch(d, q, k, v, g, beta, q_scale, l2_eps, state, work, out);
+        ath_status st = ath_gdn_chunk_launch(d, q, k, v, g, beta, q_scale, l2_eps, tiled, state, work, out);
         ath_dev_arena_reset(scratch, mark);   /* the next work on the stream comes after the kernels */
         return st;
     }
-    return ath_gdn_launch(d, q, k, v, g, beta, q_scale, l2_eps, state, out);
+    return ath_gdn_launch(d, q, k, v, g, beta, q_scale, l2_eps, tiled, state, out);
 }

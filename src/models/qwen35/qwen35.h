@@ -66,12 +66,24 @@ typedef struct {
     const ath_param *qkv_proj, *z_proj, *a_proj, *b_proj, *conv, *a_log, *dt_bias, *norm, *out_proj;
     /* dense MLP */
     const ath_param *gate_proj, *up_proj, *down_proj;
+    /* MoE (step 12): the router, every routed expert's gate, up and down
+     * projections ([n_experts] each, views of the checkpoint's fused
+     * tensors), the shared expert and its gate */
+    const ath_param  *router;
+    const ath_param **exp_gate, **exp_up, **exp_down;
+    const ath_param  *sh_gate, *sh_up, *sh_down, *sh_gate_w;
     int32_t          kv, conv_state, recurrent;
 } ath_qwen35_layer;
 
 /* family_data of a qwen35 model. */
 typedef struct {
     ath_qwen35_config c;
+    /* The checkpoint is a GGUF file (step 12): llama.cpp's converter stored
+     * the zero-centered norm weights as 1 + w (norm_offset 0 instead of 1),
+     * A = −exp(A_log) instead of A_log (a_given), and the Gated DeltaNet's
+     * value heads in tiled order (contract qwen36-35b-a3b.md, GGUF). */
+    bool              gguf;
+    float             norm_offset;
     ath_qwen35_layer *layer;    /* [n_layers]                                        */
     const ath_param  *embed;
     const ath_param  *norm;     /* final norm                                        */
