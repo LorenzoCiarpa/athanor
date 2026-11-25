@@ -1,0 +1,1 @@
+Rename the function get_usr_name to get_user_name everywhere in this project: its definition and every place that uses it. Then run python3 test_shop.py to check that everything works.

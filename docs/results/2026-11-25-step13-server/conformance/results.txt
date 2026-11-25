@@ -1,0 +1,18 @@
+# 2.1.332 (Claude Code); http://127.0.0.1:18080; 2026-11-25T20:57:12Z
+claude csv-stats PASS 95s exit=0 
+claude find-constant PASS 68s exit=0 
+claude fix-bug PASS 73s exit=0 
+claude new-file PASS 76s exit=0 
+claude rename PASS 83s exit=0 
+# codex-cli 0.167.0; http://127.0.0.1:18080; 2026-11-25T21:03:48Z
+codex csv-stats PASS 47s exit=0 
+codex find-constant PASS 52s exit=0 
+codex fix-bug PASS 38s exit=0 
+codex new-file PASS 47s exit=0 
+codex rename PASS 47s exit=0 
+# opencode 1.19.6; http://127.0.0.1:18080; 2026-11-25T21:07:40Z
+opencode csv-stats PASS 115s exit=0 
+opencode find-constant PASS 99s exit=0 
+opencode fix-bug PASS 77s exit=0 
+opencode new-file PASS 88s exit=0 
+opencode rename PASS 99s exit=0 

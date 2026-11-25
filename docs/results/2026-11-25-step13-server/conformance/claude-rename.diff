@@ -1,0 +1,60 @@
+ shop/__pycache__/__init__.cpython-314.pyc | Bin 0 -> 183 bytes
+ shop/__pycache__/orders.cpython-314.pyc   | Bin 0 -> 554 bytes
+ shop/__pycache__/report.cpython-314.pyc   | Bin 0 -> 450 bytes
+ shop/__pycache__/users.cpython-314.pyc    | Bin 0 -> 463 bytes
+ shop/orders.py                            |   4 ++--
+ shop/report.py                            |   2 +-
+ shop/users.py                             |   2 +-
+ 7 files changed, 4 insertions(+), 4 deletions(-)
+diff --git a/shop/__pycache__/__init__.cpython-314.pyc b/shop/__pycache__/__init__.cpython-314.pyc
+new file mode 100644
+index 0000000..6b7f841
+Binary files /dev/null and b/shop/__pycache__/__init__.cpython-314.pyc differ
+diff --git a/shop/__pycache__/orders.cpython-314.pyc b/shop/__pycache__/orders.cpython-314.pyc
+new file mode 100644
+index 0000000..07c62d1
+Binary files /dev/null and b/shop/__pycache__/orders.cpython-314.pyc differ
+diff --git a/shop/__pycache__/report.cpython-314.pyc b/shop/__pycache__/report.cpython-314.pyc
+new file mode 100644
+index 0000000..0e64422
+Binary files /dev/null and b/shop/__pycache__/report.cpython-314.pyc differ
+diff --git a/shop/__pycache__/users.cpython-314.pyc b/shop/__pycache__/users.cpython-314.pyc
+new file mode 100644
+index 0000000..1f39c03
+Binary files /dev/null and b/shop/__pycache__/users.cpython-314.pyc differ
+diff --git a/shop/orders.py b/shop/orders.py
+index d996114..a57131d 100644
+--- a/shop/orders.py
++++ b/shop/orders.py
+@@ -1,7 +1,7 @@
+-from shop.users import get_usr_name
++from shop.users import get_user_name
+ 
+ ORDERS = [(1, "book"), (3, "lamp"), (2, "pen")]
+ 
+ 
+ def order_lines():
+-    return [f"{get_usr_name(uid)}: {item}" for uid, item in ORDERS]
++    return [f"{get_user_name(uid)}: {item}" for uid, item in ORDERS]
+diff --git a/shop/report.py b/shop/report.py
+index d73562e..96be763 100644
+--- a/shop/report.py
++++ b/shop/report.py
+@@ -2,4 +2,4 @@ from shop import users
+ 
+ 
+ def greeting(user_id):
+-    return "Hello, " + users.get_usr_name(user_id) + "!"
++    return "Hello, " + users.get_user_name(user_id) + "!"
+diff --git a/shop/users.py b/shop/users.py
+index 9abc6f8..5c1a2ce 100644
+--- a/shop/users.py
++++ b/shop/users.py
+@@ -1,6 +1,6 @@
+ USERS = {1: "ada", 2: "linus", 3: "grace"}
+ 
+ 
+-def get_usr_name(user_id):
++def get_user_name(user_id):
+     """The name of a user, or "unknown"."""
+     return USERS.get(user_id, "unknown")

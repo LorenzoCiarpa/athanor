@@ -1,0 +1,27 @@
+ result.txt |  1 +
+ stats.py   | 10 ++++++++++
+ 2 files changed, 11 insertions(+)
+diff --git a/result.txt b/result.txt
+new file mode 100644
+index 0000000..06ecd36
+--- /dev/null
++++ b/result.txt
+@@ -0,0 +1 @@
++69.42
+\ No newline at end of file
+diff --git a/stats.py b/stats.py
+new file mode 100644
+index 0000000..5b51a3f
+--- /dev/null
++++ b/stats.py
+@@ -0,0 +1,10 @@
++import csv
++
++scores = []
++with open("data.csv") as f:
++    reader = csv.DictReader(f)
++    for row in reader:
++        scores.append(float(row["score"]))
++
++mean = round(sum(scores) / len(scores), 2)
++print(mean)

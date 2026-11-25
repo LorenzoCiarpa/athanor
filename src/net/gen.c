@@ -31,6 +31,8 @@ ath_status ath_gen_open(ath_gen *g, const char *dir, const ath_gen_opts *o, ath_
         st = ATH_ERR_NOMEM;
     if (st == ATH_OK)
         st = ath_tensor_init(&g->logits, ATH_DTYPE_F32, 2, (int64_t[]){1, g->m.vocab_size}, lg, ATH_TIER_RAM);
+    if (st == ATH_OK && !(g->generated = ath_arena_zalloc(a, (size_t)g->m.vocab_size, 1)))
+        st = ATH_ERR_NOMEM;
     if (st == ATH_OK)
         st = ath_pool_init(&g->pool, o->threads > 0 ? o->threads : ath_pool_default_threads(), a);
     if (st == ATH_OK && !o->cpu && ath_gpu_count() > 0) {
@@ -69,6 +71,7 @@ ath_status ath_gen_open(ath_gen *g, const char *dir, const ath_gen_opts *o, ath_
     }
     if (st == ATH_OK) {
         ath_tokens_init(&g->seen, a);
+        ath_tokens_init(&g->snap_ids, a);
         g->eos[0] = ath_tokenizer_added(&g->tok, "<|im_end|>");
         g->eos[1] = ath_tokenizer_added(&g->tok, "<|endoftext|>");
     }
@@ -134,23 +137,36 @@ static ath_status feed(ath_gen *g, const int32_t *ids, size_t from, size_t to, b
     return ATH_OK;
 }
 
-/* Bring the state to the start of what is new in ids (from the snapshot or
- * the start when the state holds something else): the tokens kept. */
+static size_t common_prefix(const ath_tokens *a, const ath_tokens *b)
+{
+    size_t n = 0;
+    while (n < a->n && n < b->n && a->ids[n] == b->ids[n])
+        n++;
+    return n;
+}
+
+static ath_status set_tokens(ath_tokens *dst, const int32_t *ids, size_t n)
+{
+    dst->n = 0;
+    for (size_t i = 0; i < n; i++)
+        ATH_CHECK(ath_tokens_push(dst, ids[i]));
+    return ATH_OK;
+}
+
+/* Bring the state to the start of what is new in ids: on from the state
+ * when it holds a prefix of ids, else from the snapshot when that is one,
+ * else from the start. The tokens kept in *kept. */
 static ath_status reuse(ath_gen *g, const ath_tokens *ids, size_t *kept)
 {
-    size_t common = 0;
-    while (common < g->seen.n && common < ids->n && g->seen.ids[common] == ids->ids[common])
-        common++;
-    if (common < g->seen.n) {
-        if (g->snap_n && g->snap_n <= common) {
-            ATH_CHECK(ath_state_copy(&g->state, &g->snap, &g->m));
-            g->seen.n = g->snap_n;
-        } else {
-            ATH_CHECK(ath_state_reset(&g->state, &g->m));
-            g->seen.n = 0;
-        }
-    }
-    if (g->seen.n >= ids->n) {   /* nothing new: the last token's logits are needed */
+    const bool snap_fits = g->snap_n && g->snap_n < ids->n && common_prefix(&g->snap_ids, ids) >= g->snap_n;
+    /* requests in a row that could not start from the snapshot */
+    g->snap_misses = g->snap_n && !snap_fits ? g->snap_misses + 1 : 0;
+    if (g->seen.n < ids->n && common_prefix(&g->seen, ids) == g->seen.n) {
+        /* the state goes on */
+    } else if (snap_fits) {
+        ATH_CHECK(ath_state_copy(&g->state, &g->snap, &g->m));
+        ATH_CHECK(set_tokens(&g->seen, g->snap_ids.ids, g->snap_n));
+    } else {
         ATH_CHECK(ath_state_reset(&g->state, &g->m));
         g->seen.n = 0;
     }
@@ -158,16 +174,24 @@ static ath_status reuse(ath_gen *g, const ath_tokens *ids, size_t *kept)
     return ATH_OK;
 }
 
-/* The rest of the prompt, with a snapshot at stable. */
+/* The rest of the prompt, with a snapshot at stable. A much shorter
+ * snapshot (under a quarter) does not replace a longer one: an agent's side
+ * request (a title, a summary) must not cost its conversation the next
+ * prefill. Unless the snapshot has gone unused twice in a row: another
+ * conversation now. */
 static ath_status prefill(ath_gen *g, const ath_tokens *ids, size_t stable, const ath_gen_sink *sink, bool *cancel)
 {
     size_t start = g->seen.n;
+    if (start < stable && 4 * stable < g->snap_n && g->snap_misses < 2)
+        stable = start;   /* no new snapshot */
     if (start < stable) {
         ATH_CHECK(feed(g, ids->ids, start, stable, false, sink, cancel));
         if (*cancel)
             return ATH_OK;
         ATH_CHECK(ath_state_copy(&g->snap, &g->state, &g->m));
+        ATH_CHECK(set_tokens(&g->snap_ids, ids->ids, stable));
         g->snap_n = stable;
+        g->snap_misses = 0;
         if (sink->wait && !sink->wait(sink->u)) {
             *cancel = true;
             return ATH_OK;
@@ -178,7 +202,8 @@ static ath_status prefill(ath_gen *g, const ath_tokens *ids, size_t stable, cons
 
 static bool same_sampler(const ath_sampler *a, const ath_sampler *b)
 {
-    return a->temperature == b->temperature && a->top_k == b->top_k && a->top_p == b->top_p && a->min_p == b->min_p;
+    return a->temperature == b->temperature && a->top_k == b->top_k && a->top_p == b->top_p && a->min_p == b->min_p &&
+           a->presence == b->presence;
 }
 
 /* The decoder for sampler p: a recorded step includes the choice, so
@@ -354,6 +379,9 @@ ath_status ath_gen_run(ath_gen *g, const ath_gen_request *r, const ath_gen_sink 
         return ATH_OK;
     }
     ATH_CHECK(decoder_for(g, &r->sampler));
+    if (g->dec_open)
+        ATH_CHECK(ath_decoder_forget(&g->dec));
+    memset(g->generated, 0, (size_t)g->m.vocab_size);
 
     ath_parse_state ps = {.opts = chat_opts(r, true), .tools = r->tools, .n_tools = r->n_tools, .a = a};
     emitter e = {.r = r, .sink = sink, .stop_hit = -1};
@@ -370,8 +398,12 @@ ath_status ath_gen_run(ath_gen *g, const ath_gen_request *r, const ath_gen_sink 
     if (limit > 0)
         ATH_CHECK(ath_sample_ref(&g->logits, &r->sampler, ath_rng_uniform(&g->rng), &g->scratch, &next));
     for (; n_gen < limit && !e.cancel && e.stop_hit < 0; n_gen++) {
-        if (n_gen > 0 && !g->engine)
+        if (n_gen > 0 && !g->engine) {   /* on the GPU the decoder applies the penalty */
+            if (r->sampler.presence != 0)
+                ATH_CHECK(ath_presence_ref(&g->logits, g->generated, r->sampler.presence));
             ATH_CHECK(ath_sample_ref(&g->logits, &r->sampler, ath_rng_uniform(&g->rng), &g->scratch, &next));
+        }
+        g->generated[next] = 1;
         ath_arena_reset(&g->scratch, (ath_arena_pos){0});
         if (next == g->eos[0] || next == g->eos[1]) {
             ended = true;

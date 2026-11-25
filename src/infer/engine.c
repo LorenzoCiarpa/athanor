@@ -10,6 +10,7 @@
  */
 #include "infer/engine.h"
 
+#include <math.h>
 #include <stddef.h>
 #include <string.h>
 
@@ -108,7 +109,8 @@ ath_status ath_decoder_open(ath_decoder *dc, ath_engine *e, ath_state *s, const 
 {
     if (!dc || !e || !e->m || !s || !p || !a || s->dev != &e->dev)
         return ATH_ERR_INVALID_ARG;
-    if (!(p->temperature >= 0) || p->top_k < 0 || !(p->top_p > 0 && p->top_p <= 1) || !(p->min_p >= 0 && p->min_p <= 1))
+    if (!(p->temperature >= 0) || p->top_k < 0 || !(p->top_p > 0 && p->top_p <= 1) || !(p->min_p >= 0 && p->min_p <= 1) ||
+        !isfinite(p->presence))
         return ATH_ERR_INVALID_ARG;
     memset(dc, 0, sizeof *dc);
     dc->e = e;
@@ -126,6 +128,11 @@ ath_status ath_decoder_open(ath_decoder *dc, ath_engine *e, ath_state *s, const 
         st = ath_dev_alloc(&e->dev, lbytes, &lg);
     if (st == ATH_OK && !dc->gpu_sampling)
         st = ath_pinned_alloc(&e->dev, lbytes, &hlg);
+    void *seen = NULL;
+    if (st == ATH_OK && (st = ath_dev_alloc(&e->dev, (size_t)V, &seen)) == ATH_OK) {
+        dc->seen = seen;
+        st = ath_memset(&e->dev, seen, 0, (size_t)V, ATH_STREAM_COMPUTE);
+    }
     dc->io = io, dc->hio = hio;
     if (st == ATH_OK)
         st = ath_tensor_init(&dc->logits, ATH_DTYPE_F32, 2, (int64_t[]){1, V}, lg, ATH_TIER_VRAM);
@@ -153,6 +160,8 @@ static ath_status queue_step(ath_decoder *dc)
     ath_batch b = {.tokens = &dc->io->token, .n_tokens = 1, .logits = &dc->logits, .pos = &dc->io->pos,
                    .flags = ATH_BATCH_DEVICE};
     ATH_CHECK(ath_model_forward(e->m, &b, dc->s, NULL, &dc->scratch, &e->exec));
+    if (dc->p.presence != 0)
+        ATH_CHECK(ath_presence_gpu(&e->dev, &dc->logits, dc->seen, &dc->io->token, dc->p.presence));
     if (!dc->gpu_sampling)
         return ath_copy(&e->dev, dc->hlogits.data, dc->logits.data, ath_tensor_nbytes(&dc->logits),
                         ATH_STREAM_COMPUTE);
@@ -206,6 +215,13 @@ ath_status ath_decoder_step(ath_decoder *dc, int32_t token, double u, int32_t *n
     return ath_sample_ref(&dc->hlogits, &dc->p, u, &dc->scratch, next);
 }
 
+ath_status ath_decoder_forget(ath_decoder *dc)
+{
+    if (!dc || !dc->e || !dc->seen)
+        return ATH_ERR_INVALID_ARG;
+    return ath_memset(&dc->e->dev, dc->seen, 0, (size_t)dc->e->m->vocab_size, ATH_STREAM_COMPUTE);
+}
+
 void ath_decoder_close(ath_decoder *dc)
 {
     if (!dc || !dc->e)
@@ -221,6 +237,8 @@ void ath_decoder_close(ath_decoder *dc)
         ath_dev_free(&e->dev, dc->logits.data);
     if (dc->hlogits.data)
         ath_pinned_free(&e->dev, dc->hlogits.data);
+    if (dc->seen)
+        ath_dev_free(&e->dev, dc->seen);
     ath_arena_free(&dc->scratch);
     memset(dc, 0, sizeof *dc);
 }

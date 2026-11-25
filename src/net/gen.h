@@ -12,7 +12,9 @@
  * conversation up to its last message, as `athanor chat` does); a request
  * whose prompt extends that part starts from the snapshot and runs only
  * the new tokens. Agents send the whole conversation every turn, so most of
- * a long session's prompt is run once.
+ * a long session's prompt is run once. A much shorter prompt (an agent's
+ * side request: a title, a summary) does not replace a longer snapshot,
+ * unless the snapshot went unused twice in a row.
  */
 #ifndef ATH_NET_GEN_H
 #define ATH_NET_GEN_H
@@ -29,8 +31,7 @@ typedef struct {
     int32_t             n_msgs;
     const ath_tool_def *tools;
     int32_t             n_tools;
-    ath_sampler         sampler;
-    float               presence_penalty;
+    ath_sampler         sampler;            /* its presence penalty included          */
     int32_t             max_tokens;         /* 0: as many as fit                     */
     bool                think;              /* the model thinks before it answers    */
     const char         *stop[ATH_GEN_MAX_STOP];
@@ -89,8 +90,11 @@ typedef struct {
     ath_exec        exec;
     ath_state       state, snap;
     ath_tokens      seen;            /* the tokens the state holds                      */
-    size_t          snap_n;          /* the first snap_n of them are in snap; 0: none   */
+    ath_tokens      snap_ids;        /* the tokens snap holds                           */
+    size_t          snap_n;          /* their number; 0: no snapshot                    */
+    int32_t         snap_misses;     /* requests in a row that could not use snap       */
     ath_tensor      logits;
+    uint8_t        *generated;       /* [vocab]: tokens of the answer, on the CPU       */
     ath_arena       scratch;
     ath_rng         rng;
     int32_t         eos[2];

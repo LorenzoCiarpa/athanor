@@ -1,0 +1,18 @@
+ __pycache__/calc.cpython-314.pyc | Bin 0 -> 406 bytes
+ calc.py                          |   2 +-
+ 2 files changed, 1 insertion(+), 1 deletion(-)
+diff --git a/__pycache__/calc.cpython-314.pyc b/__pycache__/calc.cpython-314.pyc
+new file mode 100644
+index 0000000..8748d6d
+Binary files /dev/null and b/__pycache__/calc.cpython-314.pyc differ
+diff --git a/calc.py b/calc.py
+index f905fb9..717f7ed 100644
+--- a/calc.py
++++ b/calc.py
+@@ -1,5 +1,5 @@
+ def add(a, b):
+-    return a - b
++    return a + b
+ 
+ 
+ def mul(a, b):

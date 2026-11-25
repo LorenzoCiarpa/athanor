@@ -207,3 +207,10 @@ ath_status ath_moe_merge_launch(const ath_device *d, const ath_tensor *ids, cons
     (void)d, (void)ids, (void)tab, (void)n_experts, (void)src, (void)y;
     return none("moe_merge");
 }
+
+ath_status ath_presence_launch(const ath_device *d, ath_tensor *logits, uint8_t *seen, const int32_t *token,
+                               float penalty)
+{
+    (void)d, (void)logits, (void)seen, (void)token, (void)penalty;
+    return none("presence");
+}

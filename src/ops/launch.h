@@ -67,6 +67,8 @@ ath_status ath_scatter_rows_launch(const ath_device *d, const ath_tensor *src, c
 /* Sampling: k candidates (1: greedy); work is ath_sample_launch_bytes of
  * device memory. */
 size_t     ath_sample_launch_bytes(int64_t V, int32_t k);
+ath_status ath_presence_launch(const ath_device *d, ath_tensor *logits, uint8_t *seen, const int32_t *token,
+                               float penalty);
 ath_status ath_sample_launch(const ath_device *d, const ath_tensor *logits, const ath_sampler *p, int32_t k,
                              const double *u, void *work, int32_t *out);
 ath_status ath_conv_launch(const ath_device *d, const ath_tensor *x, const ath_tensor *w, ath_tensor *state,

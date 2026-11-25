@@ -1,0 +1,1 @@
+Which file in this project defines the constant MAX_RETRIES, and what is its value? Write the answer to a new file answer.txt as one line of the form <path relative to the project root>: <value>, for example src/x.py: 3.

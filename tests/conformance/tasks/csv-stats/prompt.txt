@@ -1,0 +1,1 @@
+Write a Python script stats.py that reads data.csv and prints the mean of the score column, rounded to two decimals. Run it, then write the number it prints (only the number) to a new file result.txt.

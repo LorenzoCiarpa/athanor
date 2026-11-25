@@ -265,7 +265,7 @@ ATH_TEST(engine_decoder)
     GPU_OR_SKIP();
     enum { NP = 5, NG = 20, CAP = NP + NG };
     static const int32_t prompt[NP] = {3, 15, 0, 7, 7};
-    static const ath_sampler ps[] = {{0.8f, 0, 1, 0}, {0.8f, 3, 0.9f, 0}, {0, 0, 1, 0}};
+    static const ath_sampler ps[] = {{0.8f, 0, 1, 0, 0}, {0.8f, 3, 0.9f, 0, 0}, {0, 0, 1, 0, 0}};
     static const char *names[] = {"host sampling", "GPU sampling", "greedy"};
     tiny_model t;
     ATH_REQUIRE_OK(tiny_open(&t, 11));
@@ -333,6 +333,74 @@ ATH_TEST(engine_decoder)
     tiny_close(&t);
 }
 
+/* The presence penalty in the decoder (step 13) against its reference: the
+ * same steps run directly, the penalty applied on the host with
+ * ath_presence_ref to the tokens the steps ran, then ath_sample_ref. Greedy,
+ * host and GPU sampling; the same tokens, and with host sampling the same
+ * logits. ath_decoder_forget starts an answer over. */
+ATH_TEST(engine_decoder_presence)
+{
+    GPU_OR_SKIP();
+    enum { NP = 5, NG = 12, CAP = NP + NG };
+    static const int32_t prompt[NP] = {3, 15, 0, 7, 7};
+    static const ath_sampler ps[] = {{0, 0, 1, 0, 2.0f}, {0.8f, 0, 1, 0, 0.7f}, {0.8f, 3, 0.9f, 0, -0.5f}};
+    static const char *names[] = {"greedy", "host sampling", "GPU sampling"};
+    tiny_model t;
+    ATH_REQUIRE_OK(tiny_open(&t, 12));
+    const ath_model *m = &t.m;
+    ath_engine e;
+    ATH_REQUIRE_OK(ath_engine_open(&e, m, 0, &t.a));
+    ath_arena scratch;
+    ath_arena_init(&scratch, 0);
+    double us[NG];
+    ath_rng rng;
+    ath_rng_init(&rng, 9);
+    for (int i = 0; i < NG; i++)
+        us[i] = ath_rng_uniform(&rng);
+    static float want_l[NG][V];
+    for (size_t k = 0; k < ATH_ARRAY_LEN(ps); k++) {
+        ath_state d;
+        ATH_REQUIRE_OK(ath_engine_state(&e, &d, ATH_DTYPE_BF16, CAP, &t.a));
+        ATH_REQUIRE_OK(ath_model_forward(m, &(ath_batch){.tokens = prompt, .n_tokens = NP - 1}, &d, NULL, &scratch, &e.exec));
+        uint8_t seen[V] = {0};
+        int32_t want[NG], tok = prompt[NP - 1];
+        for (int i = 0; i < NG; i++) {
+            ath_tensor l = f32_tensor(want_l[i], 1, V);
+            ATH_REQUIRE_OK(ath_model_forward(m, &(ath_batch){.tokens = &tok, .n_tokens = 1, .logits = &l}, &d, NULL, &scratch, &e.exec));
+            seen[tok] = 1;
+            ATH_REQUIRE_OK(ath_presence_ref(&l, seen, ps[k].presence));
+            ATH_REQUIRE_OK(ath_sample_ref(&l, &ps[k], us[i], &scratch, &tok));
+            want[i] = tok;
+        }
+        ath_state g;
+        ATH_REQUIRE_OK(ath_engine_state(&e, &g, ATH_DTYPE_BF16, CAP, &t.a));
+        ath_decoder dc;
+        ATH_REQUIRE_OK(ath_decoder_open(&dc, &e, &g, &ps[k], &t.a));
+        int same[2] = {0, 0}, same_logits = 0;
+        for (int pass = 0; pass < 2; pass++) {
+            ATH_REQUIRE_OK(ath_state_reset(&g, m));
+            ATH_REQUIRE_OK(ath_decoder_forget(&dc));
+            ATH_REQUIRE_OK(ath_model_forward(m, &(ath_batch){.tokens = prompt, .n_tokens = NP - 1}, &g, NULL, &scratch, &e.exec));
+            tok = prompt[NP - 1];
+            for (int i = 0; i < NG; i++) {
+                ATH_REQUIRE_OK(ath_decoder_step(&dc, tok, us[i], &tok));
+                same[pass] += tok == want[i];
+                if (pass == 0 && !dc.gpu_sampling)
+                    same_logits += memcmp(dc.hlogits.data, want_l[i], sizeof want_l[i]) == 0;
+            }
+        }
+        printf("    presence %-5g %-14s %d and %d of %d tokens as the reference%s\n", (double)ps[k].presence, names[k],
+               same[0], same[1], NG,
+               dc.gpu_sampling ? "" : same_logits == NG ? ", every logit the same bits" : ", logits DIFFER");
+        ATH_EXPECT(same[0] == NG && same[1] == NG);
+        ATH_EXPECT(dc.gpu_sampling || same_logits == NG);
+        ath_decoder_close(&dc);
+    }
+    ath_arena_free(&scratch);
+    ath_engine_close(&e);
+    tiny_close(&t);
+}
+
 /* ---- invariant 7 on Qwen3.6-35B-A3B (step 12) ------------------------------------ */
 
 /* The prompt's logits and those of 12 decoded steps (the decoder: the
@@ -355,7 +423,7 @@ static bool moe_run(ath_test *t_, const ath_model *m, int32_t slots, float *logi
     ath_tensor l = f32_tensor(logits, NP, m->vocab_size);
     ok = ok && ath_model_forward(m, &(ath_batch){.tokens = prompt, .n_tokens = NP, .logits = &l}, &s, NULL, &scratch,
                                  &e.exec) == ATH_OK;
-    static const ath_sampler host_sampled = {0.8f, 0, 1, 0};
+    static const ath_sampler host_sampled = {0.8f, 0, 1, 0, 0};
     ath_decoder dc;
     ok = ok && ath_decoder_open(&dc, &e, &s, &host_sampled, a) == ATH_OK;
     int32_t tok = 42;
@@ -580,7 +648,7 @@ ATH_TEST(generate_golden)
 
 static const ath_test_case tests[] = {
     ATH_TEST_ENTRY(engine_without_gpu), ATH_TEST_ENTRY(engine_weights), ATH_TEST_ENTRY(engine_state),
-    ATH_TEST_ENTRY(engine_pieces),     ATH_TEST_ENTRY(engine_decoder),      ATH_TEST_ENTRY(generate_golden),
+    ATH_TEST_ENTRY(engine_pieces),     ATH_TEST_ENTRY(engine_decoder), ATH_TEST_ENTRY(engine_decoder_presence),      ATH_TEST_ENTRY(generate_golden),
     ATH_TEST_ENTRY(engine_moe_placement),
 };
 

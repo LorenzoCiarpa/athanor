@@ -455,6 +455,11 @@ typedef struct {
                             * reaches top_p (at least one); 1: all                    */
     float   min_p;         /* drop tokens less likely than min_p times the most
                             * likely one; 0: none                                     */
+    float   presence;      /* presence penalty (step 13): subtracted from the logit of
+                            * every token generated so far, before the filters. The
+                            * caller applies it (ath_presence_ref, ath_presence_gpu;
+                            * the decoder does); ath_sample_* read the logits as given.
+                            * 0: none                                                 */
 } ath_sampler;
 
 /* One token id from logits [vocab] or [1, vocab] (f32 or bf16). u is a
@@ -475,6 +480,18 @@ ath_status ath_sample_ref(const ath_tensor *logits, const ath_sampler *p, double
  * maximum) ATH_ERR_UNSUPPORTED, and the caller samples on the host. u
  * cannot be checked: it must be in [0, 1). Working memory comes from the
  * device scratch arena and is released before returning. */
+/* The presence penalty, as vLLM and OpenAI apply it: penalty is subtracted
+ * once from the logit of every token marked in seen (one byte per entry of
+ * the vocabulary; nonzero: generated earlier in this answer), however many
+ * times it came. In place, on f32 logits [vocab] or [1, vocab]. One
+ * subtraction per logit, so the GPU gives the same bits. */
+ath_status ath_presence_ref(ath_tensor *logits, const uint8_t *seen, float penalty);
+/* GPU: logits, seen and token in device memory. *token (the token a decode
+ * step runs: the last one generated) is marked in seen first, then the
+ * penalty applies as above. */
+ath_status ath_presence_gpu(const ath_device *d, ath_tensor *logits, uint8_t *seen, const int32_t *token,
+                            float penalty);
+
 #define ATH_SAMPLE_GPU_MAX_K 64
 bool       ath_sample_gpu_fits(const ath_sampler *p);
 ath_status ath_sample_gpu(const ath_device *d, const ath_tensor *logits, const ath_sampler *p, const double *u,

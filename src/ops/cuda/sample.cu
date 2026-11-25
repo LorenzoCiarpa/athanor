@@ -175,3 +175,32 @@ extern "C" ath_status ath_sample_launch(const ath_device *d, const ath_tensor *l
                                                         p->top_p, p->min_p, u, out);
     return ath_gpu_launched("sample_merge");
 }
+
+/* ---- presence penalty (step 13) ----------------------------------------------
+ *
+ * One thread per logit. The thread of the step's token marks it in seen;
+ * no other thread reads that byte, so marking and penalizing need no
+ * ordering between threads. */
+static __global__ void presence_kernel(float *logits, uint8_t *seen, const int32_t *token, int64_t V, float penalty)
+{
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= V)
+        return;
+    bool s = seen[i] != 0;
+    if (i == *token && !s) {
+        seen[i] = 1;
+        s = true;
+    }
+    if (s)
+        logits[i] -= penalty;
+}
+
+extern "C" ath_status ath_presence_launch(const ath_device *d, ath_tensor *logits, uint8_t *seen, const int32_t *token,
+                                          float penalty)
+{
+    const int64_t V = logits->shape[logits->ndim - 1];
+    ATH_CHECK(ath_gpu_use(d));
+    presence_kernel<<<(unsigned)((V + 255) / 256), 256, 0, k_stream(d)>>>((float *)logits->data, seen, token, V,
+                                                                          penalty);
+    return ath_gpu_launched("presence");
+}

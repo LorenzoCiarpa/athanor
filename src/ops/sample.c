@@ -187,3 +187,40 @@ ath_status ath_sample_gpu(const ath_device *d, const ath_tensor *logits, const a
     ath_dev_arena_reset(scratch, mark);   /* the next work on the stream comes after the kernels */
     return st;
 }
+
+/* ---- presence penalty (step 13) --------------------------------------------- */
+
+static const char op_presence[] = "presence";
+
+static ath_status presence_check(const ath_tensor *logits, const void *seen)
+{
+    ATH_CHECK(ops_tensor(logits, ATH_DTYPE_F32, op_presence, "logits"));
+    if (!seen)
+        return ops_fail(ATH_ERR_INVALID_ARG, op_presence, "missing seen");
+    if (logits->ndim < 1 || logits->ndim > 2 || (logits->ndim == 2 && logits->shape[0] != 1) ||
+        ops_last(logits) < 1 || ops_last(logits) > INT32_MAX)
+        return ops_fail(ATH_ERR_INVALID_ARG, op_presence, "logits must be [vocab] or [1, vocab]");
+    return ATH_OK;
+}
+
+ath_status ath_presence_ref(ath_tensor *logits, const uint8_t *seen, float penalty)
+{
+    ATH_CHECK(presence_check(logits, seen));
+    ATH_CHECK(OPS_PLACE(op_presence, OPS_HOST, logits));
+    float *l = logits->data;
+    const int64_t V = ops_last(logits);
+    for (int64_t i = 0; i < V; i++)
+        if (seen[i])
+            l[i] -= penalty;
+    return ATH_OK;
+}
+
+ath_status ath_presence_gpu(const ath_device *d, ath_tensor *logits, uint8_t *seen, const int32_t *token,
+                            float penalty)
+{
+    ATH_CHECK(presence_check(logits, seen));
+    if (!token)
+        return ops_fail(ATH_ERR_INVALID_ARG, op_presence, "missing token");
+    ATH_CHECK(OPS_PLACE(op_presence, OPS_GPU, logits));
+    return ath_presence_launch(d, logits, seen, token, penalty);
+}

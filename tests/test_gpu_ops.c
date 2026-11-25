@@ -649,8 +649,8 @@ ATH_TEST(gpu_sample)
     GPU_OR_SKIP(g);
     static const int64_t Vs[] = {7, 1000, 248320};
     static const ath_sampler ps[] = {
-        {0, 0, 1, 0},          {1, 1, 1, 0},           {0.7f, 20, 0.8f, 0},
-        {0.6f, 20, 0.95f, 0},  {1, 64, 1, 0.05f},      {1.3f, 5, 0.5f, 0.2f},
+        {0, 0, 1, 0, 0},          {1, 1, 1, 0, 0},           {0.7f, 20, 0.8f, 0, 0},
+        {0.6f, 20, 0.95f, 0, 0},  {1, 64, 1, 0.05f, 0},      {1.3f, 5, 0.5f, 0.2f, 0},
     };
     static const double us[] = {0, 0.05, 0.25, 0.5, 0.75, 0.9, 0.999, 0.3333, 0.6667, 0.123};
     int64_t cases = 0, differ = 0;
@@ -688,9 +688,41 @@ ATH_TEST(gpu_sample)
     ath_tensor lg = rand_t(&g, ATH_DTYPE_F32, -1, 1, SHAPE(1, 100)), ld = up(&g, &lg);
     double *ud = ath_dev_arena_alloc(&g.dev, sizeof(double), 0);
     int32_t *od = ath_dev_arena_alloc(&g.dev, sizeof(int32_t), 0);
-    const ath_sampler all = {0.7f, 0, 0.9f, 0}, big = {0.7f, ATH_SAMPLE_GPU_MAX_K + 1, 1, 0};
+    const ath_sampler all = {0.7f, 0, 0.9f, 0, 0}, big = {0.7f, ATH_SAMPLE_GPU_MAX_K + 1, 1, 0, 0};
     ATH_EXPECT(!ath_sample_gpu_fits(&all) && !ath_sample_gpu_fits(&big));
     ATH_EXPECT_STATUS(ath_sample_gpu(&g.d, &ld, &all, ud, &g.dev, od), ATH_ERR_UNSUPPORTED);
+    gpu_close(&g);
+}
+
+/* The presence penalty (step 13) on the GPU against the reference: the
+ * step's token marked in seen first, then the same bits. */
+ATH_TEST(gpu_presence)
+{
+    gpu g;
+    GPU_OR_SKIP(g);
+    enum { NV = 248320 };
+    const int32_t token = 12345;   /* not marked before */
+    ath_tensor lg = rand_t(&g, ATH_DTYPE_F32, -8, 8, SHAPE(1, NV)), ld = up(&g, &lg);
+    uint8_t *seen = ath_arena_alloc(&g.host, NV, 1), *back = ath_arena_alloc(&g.host, NV, 1);
+    uint8_t *sd = ath_dev_arena_alloc(&g.dev, NV, 0);
+    int32_t *td = ath_dev_arena_alloc(&g.dev, sizeof(int32_t), 0);
+    ATH_REQUIRE(seen && back && sd && td);
+    for (int64_t i = 0; i < NV; i++)
+        seen[i] = i % 7 == 0;
+    ATH_REQUIRE_OK(ath_copy(&g.d, sd, seen, NV, ATH_STREAM_COMPUTE));
+    ATH_REQUIRE_OK(ath_copy(&g.d, td, &token, sizeof token, ATH_STREAM_COMPUTE));
+    ATH_EXPECT_OK(ath_presence_gpu(&g.d, &ld, sd, td, 1.5f));
+    seen[token] = 1;
+    ATH_EXPECT_OK(ath_presence_ref(&lg, seen, 1.5f));
+    ath_tensor got = down(&g, &ld);
+    ATH_REQUIRE_OK(ath_copy(&g.d, back, sd, NV, ATH_STREAM_COMPUTE));
+    ATH_REQUIRE_OK(ath_stream_sync(&g.d, ATH_STREAM_COMPUTE));
+    ATH_EXPECT(memcmp(got.data, lg.data, NV * sizeof(float)) == 0);
+    ATH_EXPECT(memcmp(back, seen, NV) == 0);
+    /* f32 logits only, in device memory */
+    ath_tensor lb = rand_t(&g, ATH_DTYPE_BF16, -1, 1, SHAPE(1, 8)), lbd = up(&g, &lb);
+    ATH_EXPECT_STATUS(ath_presence_gpu(&g.d, &lbd, sd, td, 1.0f), ATH_ERR_TYPE);
+    ATH_EXPECT_STATUS(ath_presence_gpu(&g.d, &lg, sd, td, 1.0f), ATH_ERR_UNSUPPORTED);
     gpu_close(&g);
 }
 
@@ -1285,7 +1317,7 @@ ATH_TEST(gpu_gdn_chunk)
 }
 
 static const ath_test_case tests[] = {
-    ATH_TEST_ENTRY(gpu_argument_checks), ATH_TEST_ENTRY(gpu_embed),       ATH_TEST_ENTRY(gpu_matmul),      ATH_TEST_ENTRY(gpu_gemv), ATH_TEST_ENTRY(gpu_matmul_q8_0), ATH_TEST_ENTRY(gpu_moe), ATH_TEST_ENTRY(gpu_moe_split), ATH_TEST_ENTRY(gpu_matmul_n), ATH_TEST_ENTRY(gpu_matmul_swiglu), ATH_TEST_ENTRY(gpu_scatter_rows), ATH_TEST_ENTRY(gpu_sample),
+    ATH_TEST_ENTRY(gpu_argument_checks), ATH_TEST_ENTRY(gpu_embed),       ATH_TEST_ENTRY(gpu_matmul),      ATH_TEST_ENTRY(gpu_gemv), ATH_TEST_ENTRY(gpu_matmul_q8_0), ATH_TEST_ENTRY(gpu_moe), ATH_TEST_ENTRY(gpu_moe_split), ATH_TEST_ENTRY(gpu_matmul_n), ATH_TEST_ENTRY(gpu_matmul_swiglu), ATH_TEST_ENTRY(gpu_scatter_rows), ATH_TEST_ENTRY(gpu_sample), ATH_TEST_ENTRY(gpu_presence),
     ATH_TEST_ENTRY(gpu_norms),           ATH_TEST_ENTRY(gpu_add_rmsnorm),           ATH_TEST_ENTRY(gpu_rope),        ATH_TEST_ENTRY(gpu_elementwise),
     ATH_TEST_ENTRY(gpu_attn),            ATH_TEST_ENTRY(gpu_attn_mma),    ATH_TEST_ENTRY(gpu_conv),        ATH_TEST_ENTRY(gpu_gdn_gates),
     ATH_TEST_ENTRY(gpu_gdn),             ATH_TEST_ENTRY(gpu_gdn_chunk),

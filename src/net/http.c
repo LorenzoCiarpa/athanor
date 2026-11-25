@@ -144,7 +144,7 @@ ath_status ath_http_parse(const char *buf, size_t n, ath_arena *a, ath_http_req 
         size_t took = 0;
         ath_status s = chunked(buf + he, n - he, &body, &took);
         if (s == ATH_ERR_RANGE) {
-            *used = 0;
+            *used = he;             /* the headers are complete: 100-continue may go */
             return ATH_ERR_RANGE;
         }
         ATH_CHECK(s);
@@ -157,7 +157,7 @@ ath_status ath_http_parse(const char *buf, size_t n, ath_arena *a, ath_http_req 
     if (header(h, hend, "Content-Length", v, sizeof v)) {
         char *endp;
         len = strtoull(v, &endp, 10);
-        if (endp == v || *endp)
+        if (v[0] < '0' || v[0] > '9' || *endp)
             return ATH_ERR_PARSE;
     }
     if (len > ATH_HTTP_MAX_BODY)

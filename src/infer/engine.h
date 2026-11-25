@@ -82,7 +82,9 @@ ath_status ath_engine_state(ath_engine *e, ath_state *s, ath_dtype act, int32_t 
  *
  * A decoder serves one state and one sampler; the state may be reset or
  * copied into (its buffers stay where they are), and other forward calls
- * on it may come between steps. */
+ * on it may come between steps. A sampler with a presence penalty
+ * (step 13) penalizes, at each step, the tokens the steps since the last
+ * ath_decoder_forget have run. */
 typedef struct {
     int32_t token;     /* the token run by the step               */
     int32_t pos;       /* its position: the state's n_past        */
@@ -100,6 +102,8 @@ typedef struct {
     ath_decode_io  *hio;             /* pinned host mirror                            */
     ath_tensor      logits;          /* device f32 [1, vocab]                         */
     ath_tensor      hlogits;         /* pinned f32 [1, vocab], host sampling only     */
+    uint8_t        *seen;            /* device [vocab]: tokens of this answer, for the
+                                      * presence penalty (ath_decoder_forget clears it) */
     ath_arena       scratch;         /* host working memory of the forward calls      */
     ath_graph       g;
     int64_t         steps;           /* steps run so far                              */
@@ -112,6 +116,11 @@ ath_status ath_decoder_open(ath_decoder *dc, ath_engine *e, ath_state *s, const 
  * uniform number u in [0, 1): *next. Advances s->n_past by one;
  * ATH_ERR_RANGE when the state is full. */
 ath_status ath_decoder_step(ath_decoder *dc, int32_t token, double u, int32_t *next);
+/* A new answer: no token generated yet. With a presence penalty in the
+ * sampler, every token a step runs counts as generated (the first step runs
+ * the first token of the answer, chosen from the prompt's logits) until
+ * this is called. */
+ath_status ath_decoder_forget(ath_decoder *dc);
 void       ath_decoder_close(ath_decoder *dc);
 
 #endif /* ATH_ENGINE_H */

@@ -1,0 +1,22 @@
+ result.txt | 1 +
+ stats.py   | 6 ++++++
+ 2 files changed, 7 insertions(+)
+diff --git a/result.txt b/result.txt
+new file mode 100644
+index 0000000..d92cc64
+--- /dev/null
++++ b/result.txt
+@@ -0,0 +1 @@
++69.42
+diff --git a/stats.py b/stats.py
+new file mode 100644
+index 0000000..272d799
+--- /dev/null
++++ b/stats.py
+@@ -0,0 +1,6 @@
++import csv
++
++with open("data.csv") as f:
++    scores = [float(row["score"]) for row in csv.DictReader(f)]
++
++print(round(sum(scores) / len(scores), 2))

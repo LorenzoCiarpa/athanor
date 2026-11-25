@@ -199,7 +199,6 @@ static ath_status sampling(const ath_api *api, const ath_json *body, ath_gen_req
 {
     const ath_api_defaults *d = &api->d;
     g->sampler = g->think ? d->sampler_think : d->sampler_plain;
-    g->presence_penalty = g->think ? d->presence_think : d->presence_plain;
     if (!d->client_sampling)
         return ATH_OK;
     double x;
@@ -226,7 +225,7 @@ static ath_status sampling(const ath_api *api, const ath_json *body, ath_gen_req
     if (ath_json_to_double(ath_json_get(body, "presence_penalty"), &x) == ATH_OK) {
         if (!(x >= -2 && x <= 2))
             return *err = "presence_penalty: must be in [-2, 2]", ATH_ERR_INVALID_ARG;
-        g->presence_penalty = (float)x;
+        g->sampler.presence = (float)x;
     }
     return ATH_OK;
 }

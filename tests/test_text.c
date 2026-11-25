@@ -375,13 +375,13 @@ ATH_TEST(sample_rules)
     ATH_REQUIRE_OK(ath_tensor_init(&t, ATH_DTYPE_F32, 1, (int64_t[]){6}, l, ATH_TIER_RAM));
     int32_t id;
     /* greedy: the largest, the lowest id of equals; u ignored */
-    ATH_EXPECT_OK(ath_sample_ref(&t, &(ath_sampler){0, 0, 1, 0}, 0.99, &a, &id));
+    ATH_EXPECT_OK(ath_sample_ref(&t, &(ath_sampler){0, 0, 1, 0, 0}, 0.99, &a, &id));
     ATH_EXPECT_EQ_INT(id, 1);
-    ATH_EXPECT_OK(ath_sample_ref(&t, &(ath_sampler){1, 1, 1, 0}, 0.99, &a, &id));
+    ATH_EXPECT_OK(ath_sample_ref(&t, &(ath_sampler){1, 1, 1, 0, 0}, 0.99, &a, &id));
     ATH_EXPECT_EQ_INT(id, 1);
     /* T = 1, top-k 3: candidates 1, 3, 2 with weights 1, 1, e^-1 */
     const double w2 = exp(-1.0), tot = 2 + w2;
-    ath_sampler s = {1, 3, 1, 0};
+    ath_sampler s = {1, 3, 1, 0, 0};
     ATH_EXPECT_OK(ath_sample_ref(&t, &s, 0.0, &a, &id));
     ATH_EXPECT_EQ_INT(id, 1);
     ATH_EXPECT_OK(ath_sample_ref(&t, &s, 1.0 / tot + 1e-9, &a, &id));
@@ -396,17 +396,17 @@ ATH_TEST(sample_rules)
     ATH_EXPECT_OK(ath_sample_ref(&t, &s, 0.99, &a, &id));
     ATH_EXPECT_EQ_INT(id, 3);
     /* min-p 0.5 drops e^-1 = 0.37 of the best */
-    s = (ath_sampler){1, 0, 1, 0.5f};
+    s = (ath_sampler){1, 0, 1, 0.5f, 0};
     ATH_EXPECT_OK(ath_sample_ref(&t, &s, 0.99, &a, &id));
     ATH_EXPECT_EQ_INT(id, 3);
     /* no top-k: the whole vocabulary, sorted */
-    s = (ath_sampler){1, 0, 1, 0};
+    s = (ath_sampler){1, 0, 1, 0, 0};
     ATH_EXPECT_OK(ath_sample_ref(&t, &s, 0.999999, &a, &id));
     ATH_EXPECT_EQ_INT(id, 4);
     /* arguments */
-    ATH_EXPECT_STATUS(ath_sample_ref(&t, &(ath_sampler){-1, 0, 1, 0}, 0.5, &a, &id), ATH_ERR_INVALID_ARG);
-    ATH_EXPECT_STATUS(ath_sample_ref(&t, &(ath_sampler){1, 0, 0, 0}, 0.5, &a, &id), ATH_ERR_INVALID_ARG);
-    ATH_EXPECT_STATUS(ath_sample_ref(&t, &(ath_sampler){1, 0, 1, 0}, 1.0, &a, &id), ATH_ERR_INVALID_ARG);
+    ATH_EXPECT_STATUS(ath_sample_ref(&t, &(ath_sampler){-1, 0, 1, 0, 0}, 0.5, &a, &id), ATH_ERR_INVALID_ARG);
+    ATH_EXPECT_STATUS(ath_sample_ref(&t, &(ath_sampler){1, 0, 0, 0, 0}, 0.5, &a, &id), ATH_ERR_INVALID_ARG);
+    ATH_EXPECT_STATUS(ath_sample_ref(&t, &(ath_sampler){1, 0, 1, 0, 0}, 1.0, &a, &id), ATH_ERR_INVALID_ARG);
     ATH_EXPECT_EQ_U64(ath_arena_used(&a), 0);   /* scratch released */
     ath_arena_free(&a);
 }
@@ -422,7 +422,7 @@ ATH_TEST(sample_distribution)
     ath_rng_init(&r, 42);
     int counts[4] = {0};
     const int N = 40000;
-    ath_sampler s = {0.5f, 0, 1, 0};   /* T = 0.5: weights e^0, e^2, e^4 */
+    ath_sampler s = {0.5f, 0, 1, 0, 0};   /* T = 0.5: weights e^0, e^2, e^4 */
     for (int i = 0; i < N; i++) {
         int32_t id;
         ATH_REQUIRE_OK(ath_sample_ref(&t, &s, ath_rng_uniform(&r), &a, &id));
@@ -744,7 +744,7 @@ ATH_TEST(golden_chat_generate)
     ath_buf_init(&text, &a);
     for (int k = 0; k < max_steps && s == ATH_OK; k++) {
         int32_t next;
-        ATH_REQUIRE_OK(ath_sample_ref(&logits, &(ath_sampler){0, 0, 1, 0}, 0, &scratch, &next));
+        ATH_REQUIRE_OK(ath_sample_ref(&logits, &(ath_sampler){0, 0, 1, 0, 0}, 0, &scratch, &next));
         int64_t want = -1;
         double margin = 0;
         ath_json_to_int(ath_json_at(jtokens, (size_t)k), &want);

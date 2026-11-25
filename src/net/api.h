@@ -53,8 +53,7 @@ typedef struct {
     const char *model;               /* the name /v1/models lists                         */
     bool        think;               /* thinking when a request does not say              */
     ath_sampler sampler_think;       /* sampling with and without thinking (the model     */
-    ath_sampler sampler_plain;       /* card's settings)                                  */
-    float       presence_think, presence_plain;
+    ath_sampler sampler_plain;       /* card's settings, presence penalty included)       */
     int32_t     max_tokens;          /* a request without a limit: 0, as many as fit      */
     bool        client_sampling;     /* take the request's temperature, top-p, top-k...   */
 } ath_api_defaults;

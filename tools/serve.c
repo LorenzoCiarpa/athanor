@@ -43,7 +43,8 @@ void ath_cmd_serve_usage(FILE *out)
             "                       (default: as many as fit)\n"
             "  --server-sampling    ignore the sampling settings of requests and use the\n"
             "                       model card's (thinking: temperature 0.6, top-p 0.95,\n"
-            "                       top-k 20; otherwise 0.7, 0.8, 20)\n"
+            "                       top-k 20; otherwise 0.7, 0.8, 20 and presence penalty\n"
+            "                       1.5), which also fill what a request leaves out\n"
             "  --chunk <n>          prompt tokens per forward call (default 4096)\n"
             "  --seed <n>           random seed (default: from the clock)\n"
             "  --dump <dir>         save every request body in dir (for debugging a client)\n"
@@ -154,10 +155,8 @@ int ath_cmd_serve(ath_arena *a, int argc, char **argv)
     const ath_api_defaults d = {
         .model = name,
         .think = think,
-        .sampler_think = {0.6f, 20, 0.95f, 0},
-        .sampler_plain = {0.7f, 20, 0.8f, 0},
-        .presence_think = 0,
-        .presence_plain = 1.5f,
+        .sampler_think = {0.6f, 20, 0.95f, 0, 0},
+        .sampler_plain = {0.7f, 20, 0.8f, 0, 1.5f},
         .max_tokens = max_tokens,
         .client_sampling = !server_sampling,
     };
