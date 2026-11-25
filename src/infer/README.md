@@ -4,10 +4,10 @@ The inference engine. Decode at batch 1 is limited by memory bandwidth, so the g
 
 | File | Content | Step |
 | --- | --- | --- |
-| `engine.h`, `engine.c` | a model on a GPU: the device opened, every param the forward pass reads copied there once, the `ath_exec` a GPU pass needs (device, weights, scratch), sequence states on the device; the decoder, one token at a time in a recorded graph with the choice on the device (step 9); later placement | 8 (load, states, exec), 9 (decoder) |
+| `engine.h`, `engine.c` | a model on a GPU: the device opened, every param the forward pass reads copied there once, the `ath_exec` a GPU pass needs (device, weights, scratch), sequence states on the device; the decoder, one token at a time in a recorded graph with the choice on the device (step 9); the routed experts of a MoE model handed to a placement (`ath_engine_open_tier`, step 12), and the placement updated between decoder steps | 8 (load, states, exec), 9 (decoder), 12 |
 | `state.c` | paged KV cache, snapshots for prefix reuse; on-disk persistence of prefix snapshots (hash of token prefix → KV pages + recurrent and conv state), with a size budget and LRU eviction. The plain state of one sequence on a device is `ath_state_init_gpu` in `src/model/state.c` (step 8), next to the host one | 13, 14 |
 | `sched.c` | request queue, small continuous batching for the server | 13 |
-| `tier.c` | MoE expert placement across VRAM, pinned RAM, RAM and disk; usage statistics; copy-or-compute-on-CPU cost model; router-ahead prefetch | 12 |
+| `tier.h`, `tier.c` | MoE expert placement (`ath_placement`, step 12): every routed expert in pinned RAM, regrouped for the CPU; slots in VRAM for as many as fit; the tables a pass reads (`ath_exec.experts`); the slots follow use between passes. Disk and a copy-or-compute cost model: not yet (below) | 12 |
 | `spec.c` | speculative decoding with the MTP head | 13 |
 
 ## Sequence state
@@ -19,16 +19,19 @@ The inference engine. Decode at batch 1 is limited by memory bandwidth, so the g
 
 Hybrid models make prefix snapshots small: three layers in four keep a fixed-size recurrent and conv state, and only the attention layers keep KV pages that grow with the prefix. A snapshot saved on disk survives a restart, so a harness that resends a long system prompt and tool list resumes it instead of recomputing it (step 14).
 
-## MoE placement
+## MoE placement (step 12)
 
-| Tier | Holds |
+A MoE model larger than the GPU (Qwen3.6-35B-A3B in Q8_0: 2.6 GB of attention, Gated DeltaNet, shared experts, embeddings and head, 34.2 GB of routed experts) keeps its routed experts in RAM and a share of them in VRAM. `tier.c` (`ath_placement`):
+
+| Where | Holds |
 | --- | --- |
-| VRAM | dense part, shared experts, hottest routed experts (budgeted cache: learned pin set + LRU) |
-| Pinned RAM | staging ring for asynchronous copies |
-| RAM / page cache | remaining experts; may be computed on CPU instead of copied |
-| Disk | everything else, read asynchronously |
+| VRAM, the engine's copies | every param but the routed experts |
+| VRAM, slots | as many experts per layer as fit after a reserve (2 GiB by default, for states and working memory), the same number in every layer: 73 to 75 of 256 on the RTX 5080 |
+| Pinned RAM | every routed expert, in Q8_0_R16 (core/tensor.h: the CPU's layout, which the GPU reads too, so that moving an expert into a slot is one asynchronous copy) |
 
-When an expert is not in VRAM, `tier.c` chooses between copying it and computing it on the CPU using measured PCIe bandwidth, RAM bandwidth and CPU throughput: in decode the CPU often wins, in prefill the GPU does. Placement never changes results.
+A pass computes the experts in slots on the GPU and the others on the CPU from pinned RAM, in parallel (`ath_moe_experts_split`, `src/ops/moe.c`), with the same bits whichever computes an expert (AGENTS.md invariant 7, option (b)): the logits do not depend on the number of slots or on what they hold (`tests/test_engine.c`, `engine_moe_placement`). The CPU's share counts how often each expert is chosen; every `period` passes (`ath_place_update`, called by the decoder between steps) the most chosen experts of a layer move into the slots of the least chosen, `moves` at a time, and the counts age by a quarter. A move is a copy on the host-to-device stream and a change of two tables (the device's, which the kernels read, and the host's flags, which the CPU reads); no pass is running then, so a captured decode step simply sees the new places at its next replay.
+
+Not done in step 12: a disk tier (a model whose experts do not fit in RAM), a cost model choosing between copying an expert and computing it on the CPU (prompts compute the experts outside VRAM on the CPU too, which is slow for long prompts), prefetching the next layer's experts from the router's choice.
 
 ## Interfaces
 

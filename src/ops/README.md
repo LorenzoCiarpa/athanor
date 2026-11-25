@@ -139,6 +139,20 @@ Q8_0 weights (`core/tensor.h`, `ATH_DTYPE_Q8_0`: blocks of 32 elements, an f16 s
 
 All of them give `ath_matmul_ref`'s bits for any number of rows (`tests/test_ops.c`, `tests/test_gpu_ops.c`).
 
+## MoE (step 12)
+
+The mixture-of-experts layer (docs/contract/qwen35-35b-a3b.md, MoE op contract) as three ops and the machinery that splits the experts between the GPU and the CPU.
+
+| File | Content |
+| --- | --- |
+| `moe.c` | `ath_moe_route_ref` / `_gpu`: softmax in fp32 over the experts, the top k (ties: the lower index), renormalized, sorted by expert index (the reference's order of addition); `ath_moe_expert_ref`: one expert's SwiGLU MLP, its matmuls in the canonical Q8_0 order, SiLU by `ath_q8_silu`; `ath_moe_combine_ref` / `_gpu`: the weighted sum as a chain of fused multiply-adds by expert index, plus the gated shared expert, one rounding; `ath_moe_experts_gpu` (the experts in device memory); `ath_moe_ws` and `ath_moe_experts_split`: a layer's experts on the GPU and the CPU at once |
+| `moe_cpu.c` | `ath_q8_0_repack` (Q8_0 → Q8_0_R16) and `ath_moe_experts_cpu`: the experts away from the device, the items sorted by expert so that a row of weights is read once for all the tokens that chose it, rows spread over the pool; AVX-512 (16 partial sums in one register, a group's values in one 16-byte load, the tree by shuffles) or the same operations one lane at a time |
+| `cuda/moe.cu` | `route_kernel` (a warp per token), `combine_kernel`, `expert_up` and `expert_down` (a half-warp per row, the canonical dot of `q8_0.cuh` for Q8_0 or Q8_0_R16 weights; an expert absent from the table is skipped, a block whose rows all belong to such experts leaves at once), `merge_kernel` (the CPU's outputs, read from pinned memory over the bus, where the expert is not on the device) |
+
+How a layer runs on a GPU (`ath_moe_experts_split`): the compute stream records an event; the device-to-host stream waits for it, copies the layer's normalized input and the router's choices to pinned memory and queues the CPU's share (`ath_host_call`: `ath_moe_experts_cpu` on the experts whose flag says they are not on the device); meanwhile the compute stream runs the device's experts, then waits for the CPU and merges its outputs. Nothing waits on the host, so a decode step that contains it is captured in a graph and replayed; a replay runs the CPU's share again, for wherever the experts are then. The CPU's jobs of captured passes are kept for the graph's life; the others come from a ring. Tokens go in chunks of the working state's size.
+
+The expert path has one canonical order everywhere, so the bits do not depend on placement: `tests/test_gpu_ops.c` (`gpu_moe_split`) checks the split against the reference, bit for bit, directly and in a graph replayed after experts moved; `tests/test_engine.c` (`engine_moe_placement`) checks whole passes of Qwen3.6-35B-A3B.
+
 ## Op list
 
 | Op | Content | Step |
@@ -152,7 +166,7 @@ All of them give `ath_matmul_ref`'s bits for any number of rows (`tests/test_ops
 | `conv` | short depthwise causal conv1d with state | 3, 7 (GPU) |
 | `scatter` | rows written at given rows (the KV cache by position) | 9 |
 | `gdn` | Gated DeltaNet: gates; recurrent reference (CPU and GPU decode), chunkwise-parallel GPU prefill; L2 norm of q and k inside (step 10) | 3, 7, 10 |
-| `moe` | router top-k, expert dispatch, grouped GEMM, shared expert | 12 |
+| `moe` | router top-k, routed experts (canonical order: the same bits on CPU and GPU), weighted combination with the gated shared expert; the experts split between GPU and CPU | 12 |
 | `sample` | greedy, temperature, top-k, top-p, min-p (step 5); GPU sampling, greedy and top-k up to 64 (step 9); presence and repetition penalties later | 5, 9 |
 | `quant` | (de)quantization per format | Q1 |
 

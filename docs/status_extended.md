@@ -1253,6 +1253,36 @@ Measured with a throwaway harness (no claim: `docs/BENCHMARKS.md`): the decode k
 | `tests/test_model.c`, `tests/test_forward.c`, `tests/test_ops.c`, `tests/test_gpu_ops.c`, `tests/test_golden.c` | Changed | `qwen36_gguf_binds`; `gguf_matches_safetensors`; the MoE binding test with gate and up apart; the new arguments |
 | `src/models/qwen35/README.md`, `tests/README.md` | Changed | The GGUF layout; the GGUF tests and the directory they need |
 
+#### 12.5 The MoE ops
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `src/ops/moe.c` | New | The router's choice (softmax in fp32, top k with the lower index on ties, renormalized, sorted by expert index), one routed expert (the canonical Q8_0 matmuls, `ath_q8_silu`), the combination (fma chain by expert index, the gated shared expert, one rounding), the device's experts (`ath_moe_experts_gpu`), and the split between GPU and CPU (`ath_moe_ws`, `ath_moe_experts_split`: the side stream, the CPU's job by `ath_host_call`, the merge) |
+| `src/ops/moe_cpu.c` | New | `ath_q8_0_repack` (Q8_0 → Q8_0_R16); `ath_moe_experts_cpu`: the experts away from the device, grouped by expert, rows over the pool, AVX-512 or one lane at a time with the same bits (`ATH_CPU_NO_AVX512` selects the latter, for the tests) |
+| `src/ops/cuda/moe.cu` | New | `route_kernel`, `combine_kernel`, `expert_up`, `expert_down`, `merge_kernel` |
+| `src/ops/cuda/q8_0.cuh` | Changed | `k_q8_dot` (any row, staged or not) and `k_r16_dot` (a Q8_0_R16 row) for the expert kernels |
+| `src/core/tensor.h`, `tensor.c` | Changed | `ATH_DTYPE_Q8_0_R16`: Q8_0 regrouped by 16 blocks (the scales, then value i of the 16 blocks in 16 bytes), 512 elements and 544 bytes per group |
+| `src/ops/ops.h`, `launch.h`, `gpu_none.c` | Changed | The MoE declarations; `ath_moe_experts` (the per-layer table of where experts are); the launchers and their stubs |
+| `src/backend/backend.h`, `cuda/gpu.cu`, `cuda/compat.h`, `gpu_none.c` | Changed | `ath_host_call` (`cudaLaunchHostFunc`: host work in a stream, a host node in graphs) and `ath_stream_capturing` |
+| `tests/test_ops.c` | Changed | `moe_route_hand`, `moe_expert_and_combine` (an expert against its definition in double: 3.6e-7 of Σ\|terms\|), `moe_experts_cpu` (the regrouped layout; AVX-512 and one lane both the reference's bits; experts marked on the device left alone; choices counted) |
+| `tests/test_gpu_ops.c` | Changed | `gpu_moe` (router: the same experts; device experts: the reference's bits on the staged and the plain paths, absent experts untouched; combination within 1e-6), `gpu_moe_split` (half the experts on the CPU, in chunks of two tokens; a captured graph replayed with the experts on the other half, all on the CPU, all on the device; device copies in Q8_0_R16: the reference's bits every time) |
+
+#### 12.6 Tiering
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `src/infer/tier.h`, `tier.c` | New | `ath_placement`: the experts' params found by role, layer and expert; every expert copied once into pinned host memory in Q8_0_R16 (one task per share of the layers); device slots for as many per layer as fit after the reserve, filled with the first experts; the device table and the host flags; `ath_place_update` (every `period` passes, up to `moves` per layer: the most chosen expert away from the device takes the slot of the least chosen; the counts age by a quarter); `ath_moe_ws` for the CPU's share |
+| `src/infer/engine.h`, `engine.c` | Changed | `ath_engine_open_tier`; the routed experts left to the placement, its tables in `exec.experts` and `exec.moe_ws`; `ath_place_update` after every decoder step |
+| `src/model/model.h` | Changed | `ath_exec.experts`, `ath_exec.moe_ws`; the order of a routed expert's params (gate, up, down) stated in the contract; `model.h` includes `ops/ops.h` |
+| `src/models/qwen35/forward.c` | Changed | `moe()`: the router, the shared expert and its gate in one `ath_matmul_n`, the choice, the shared SwiGLU, the routed experts (`ath_moe_expert_ref` per token and choice on the CPU, `ath_moe_experts_split` on a GPU), the combination into the residual stream or into `pend` for the next norm; `norm_into` |
+| `tools/bench.c`, `tools/chat.c` | Changed | `--experts <n>`: routed experts per layer in device memory |
+| `tests/test_engine.c` | Changed | `engine_moe_placement`: Qwen3.6-35B-A3B, a 40-token prompt and 12 decoder steps (host sampling, so the logits are compared) with as many experts as fit (73 per layer), none, and 24, the slots updated after every step (1,367 and 841 moves): 0 of 12,912,640 logits differ |
+| `tests/test_forward.c` | Changed | the MoE tiny model runs on the CPU (it used to be refused) |
+
+#### 12.7 Decode on the MoE model
+
+No file of its own: the decoder of step 9 runs a MoE model unchanged, since the CPU's share is part of the recorded step (`ath_host_call` on the side stream) and the experts move only between steps (`ath_place_update` in `ath_decoder_step`). `athanor chat` and `athanor bench` run Qwen3.6-35B-A3B with `--experts`; first answer of the chat: coherent Italian on a hash table, 100 tokens at 59 tokens/s.
+
 ---
 
 ## Files by step

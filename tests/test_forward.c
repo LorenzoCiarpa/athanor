@@ -475,6 +475,8 @@ static double now(void)
 static void *run_job(void *arg)
 {
     job *j = arg;
+    if (j->n_run == 0)   /* a CPU run left out (ATH_FORWARD_GPU_ONLY) */
+        return NULL;
     const int64_t V = j->m->vocab_size;
     ath_arena a, scratch;
     ath_arena_init(&a, 0);
@@ -666,25 +668,27 @@ ATH_TEST(forward_golden)
         const int kc = k % n_cpu;
         prompt *p = &P[kc / 2];
         job *j = &J[k];
-        int32_t n_run = positions_to_run(p->n_tokens);
+        /* ATH_FORWARD_GPU_ONLY: the GPU runs only, for a model the CPU's
+         * reference ops would take hours on (Qwen3.6-35B-A3B, step 12) */
+        int32_t n_run = k < n_cpu && getenv("ATH_FORWARD_GPU_ONLY") && eng ? 0 : positions_to_run(p->n_tokens);
         *j = (job){
             .m = &m, .g = &g, .pool = &pool, .eng = k >= n_cpu ? eng : NULL, .name = p->name,
             .act = kc % 2 ? ATH_DTYPE_F32 : ATH_DTYPE_BF16,
             .tokens = p->tokens, .n_prompt = p->n_prompt, .n_tokens = p->n_tokens, .n_run = n_run,
             .res = p->res, .res32 = p->res32, .rms = p->rms, .rms32 = p->rms32,
         };
-        j->logits = ath_arena_alloc(&a, (size_t)n_run * (size_t)V * sizeof(float), 64);
+        j->logits = ath_arena_alloc(&a, (size_t)(n_run ? n_run : 1) * (size_t)V * sizeof(float), 64);
         j->err = ath_arena_zalloc(&a, (size_t)L1 * sizeof(double), 8);
         j->err32 = ath_arena_zalloc(&a, (size_t)L1 * sizeof(double), 8);
-        j->res_host = j->eng ? ath_arena_alloc(&a, (size_t)n_run * (size_t)H * sizeof(float), 64) : NULL;
+        j->res_host = j->eng ? ath_arena_alloc(&a, (size_t)(n_run ? n_run : 1) * (size_t)H * sizeof(float), 64) : NULL;
         ATH_REQUIRE(j->logits && j->err && j->err32 && (!j->eng || j->res_host));
         if (k < n_cpu && kc % 2 == 0)   /* RMS of each layer's stream over the positions run */
-            for (int64_t l = 0; l < L1; l++) {
+            for (int64_t l = 0, nr = positions_to_run(p->n_tokens); l < L1; l++) {
                 const size_t at = (size_t)(l * p->n_tokens) * (size_t)H;
                 p->rms[l] = rms_of((const char *)p->res->data + at * ath_dtype_size(p->res->dtype), p->res->dtype,
-                                   (int64_t)n_run * H);
+                                   nr * H);
                 p->rms32[l] = rms_of((const char *)p->res32->data + at * ath_dtype_size(p->res32->dtype),
-                                     p->res32->dtype, (int64_t)n_run * H);
+                                     p->res32->dtype, nr * H);
             }
     }
     ATH_REQUIRE_OK(ath_pool_init(&pool, ath_pool_default_threads(), &a));
@@ -703,7 +707,7 @@ ATH_TEST(forward_golden)
     bool full = true;
     for (int k = 0; k < n_jobs; k++) {
         ATH_EXPECT_OK(J[k].st);
-        full = full && J[k].n_run == J[k].n_tokens;
+        full = full && (J[k].n_run == J[k].n_tokens || J[k].n_run == 0);
     }
     for (int k = 0; k < n_jobs; k++)
         if (J[k].st != ATH_OK)
@@ -713,7 +717,7 @@ ATH_TEST(forward_golden)
      * reference's top-2 margin in the bf16 reference, over every position */
     double noise = 0;
     for (size_t i = 0; i < n_prompts; i++)
-        for (int32_t t = 0; t < J[2 * i].n_run; t++) {
+        for (int32_t t = 0; t < P[i].n_tokens; t++) {
             const char *l32 = (const char *)P[i].logits32->data + (size_t)t * (size_t)V * 4;
             const char *l16 = (const char *)P[i].logits->data + (size_t)t * (size_t)V * 2;
             int64_t x, y;
@@ -732,6 +736,8 @@ ATH_TEST(forward_golden)
     for (int k = 0; k < n_jobs; k++) {
         const job *j = &J[k];
         const prompt *p = &P[(k % n_cpu) / 2];
+        if (j->n_run == 0)
+            continue;
         double kl_sum = 0, kl_max = 0, ref_sum = 0, ref_max = 0;
         int greedy_bad = 0, greedy_checked = 0, ath_differs = 0, ref_differs = 0;
         for (int32_t t = 0; t < j->n_run; t++) {
@@ -807,6 +813,8 @@ ATH_TEST(forward_golden)
         all_checked[d] += greedy_checked;
     }
     for (int d = 0; d < (eng ? 2 : 1); d++) {
+        if (all_n[d] == 0)
+            continue;
         printf("  bf16 on the %s, all %d positions run: mean KL %.3e, bf16 reference %.3e (ratio %.2f); greedy\n"
                "  token differs from the fp32 reference at %d of %d positions whose top-2 margin exceeds the bf16 noise\n",
                d ? "GPU" : "CPU", all_n[d], all_kl[d] / all_n[d], all_ref[d] / all_n[d], all_kl[d] / all_ref[d],

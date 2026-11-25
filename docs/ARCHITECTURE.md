@@ -189,6 +189,8 @@ Step 4 departs from the first design of the state in three places. A spec counts
 
 Step 8 put the forward pass on the GPU without a second composition. The pool became one member of `ath_exec`, which says where a pass runs: on the CPU (`pool`, or a NULL exec), or on a device (`dev`), with a device copy of every param the pass reads (`weights`, indexed like `m->params`) and device working memory (`scratch`). A state lives where its pass runs (`ath_state.dev`; `ath_state_init_gpu`), and `ath_model_forward` refuses a pass on one side over a state on the other. The family's `forward` calls the ops' entry points (`ath_<op>(d, ...)`, `src/ops/dispatch.c`), which run the reference ops on the CPU or the kernels on the device, so `src/models/qwen35/forward.c` is one composition for both. On a GPU the logits still land in host memory, ready when the call returns; hooks see device tensors there. `ath_state_reset` now returns a status, since on a device it queues work. The engine (`src/infer/engine.h`) builds the GPU exec: it opens the device and copies the params once.
 
+Step 12 added the routed experts of a MoE model to `ath_exec`, by addition: `experts` ([n_layers], each layer's `ath_moe_experts`, src/ops/ops.h: a table in device memory of where each expert's gate, up and down are on the device, NULL where they are not, and their copies in host memory with flags) and `moe_ws` (the working state of the CPU's share). The engine fills them through a placement (`src/infer/tier.c`); a family reads its experts there on a GPU, never in `weights`, whose entries for routed experts stay empty. The contract states the order a placement relies on: a routed expert's params, in param order, are its gate, up and down projections. Where an expert is never changes a result (AGENTS.md invariant 7, read as option (b) at step 12: the CPU and GPU expert paths follow one arithmetic order).
+
 Step 9 made a decode step something that can be recorded once and replayed, for the decoder of `src/infer/` (one graph launch per token, the next token chosen on the GPU). Two additions to the contract, both by addition: `ath_batch` gained `pos` and `flags`, and a device batch (`ATH_BATCH_DEVICE`) has its tokens, positions and logits in the memory of the device the pass runs on, so the pass copies nothing to or from the host and waits for nothing; the host cannot check its token ids or positions, which the caller guarantees. And no op argument depends on `n_past` any more: the family writes the new keys and values into the cache at their positions (`ath_scatter_rows`) and gives attention the whole cache with the queries' positions (`ath_attn` with `pos`), so the work of a step is the same whatever the length of the sequence. A replayed step gives the logits of the same step run directly, bit for bit.
 
 ### Text
@@ -265,7 +267,7 @@ athanor/
 │   ├── model/     model.h registry.c state.c text.c
 │   ├── models/
 │   │   └── qwen35/  qwen35.h family.c config.c weights.c forward.c text.c [backward.c] [cuda/fused.cu]
-│   ├── infer/     engine.h engine.c (step 8; the decoder, step 9), state.c sched.c tier.c spec.c (later)
+│   ├── infer/     engine.h engine.c (step 8; the decoder, step 9), tier.h tier.c (step 12), state.c sched.c spec.c (later)
 │   ├── quant/     formats.c rtn.c gptq.c awq.c recipe.c container.c gguf.c eval.c
 │   ├── ablit/     capture.c direction.c edit.c search.c eval.c
 │   ├── train/     loop.c optim.c lora.c hotcold.c data.c planner.c ckpt.c

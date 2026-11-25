@@ -50,19 +50,19 @@ Goal: a model larger than the GPU. Qwen3.6-35B-A3B has 35B parameters, of which 
     - the MTP layer `blk.40`, bound as `unused` until step 13.
   - `docs/contract/qwen36-35b-a3b.md`.
   - Checked on Qwen3.5-0.8B, whose bf16 GGUF (step 9) must give the safetensors' results within the tolerances.
-- [ ] **12.5 The MoE ops.**
+- [x] **12.5 The MoE ops.**
   - The router's selection: softmax in fp32 over the experts, top-k, renormalized.
   - The routed experts: gate and up, SiLU, down, each output weighted; the canonical order.
   - The combination with the gated shared expert.
   - Each with its reference in `src/ops/moe.c`, its kernels in `src/ops/cuda/moe.cu` and a CPU fast path (AVX-512, with a portable fallback) for the experts. The expert path is the same bit for bit in all three.
-- [ ] **12.6 Tiering.**
+- [x] **12.6 Tiering.**
   - `src/infer/tier.c`:
     - non-expert params in VRAM;
     - every expert in RAM, read once from the file;
     - a VRAM cache of experts chosen by observed use, updated between tokens.
   - In decode, per MoE layer the GPU computes the cached experts while the CPU computes the others from RAM. In a prompt, the experts that are not cached are streamed to the GPU.
   - The contract gains what a pass needs to find each expert's copy (`docs/ARCHITECTURE.md`). Pipelines stay free of GPU code (invariant 11).
-- [ ] **12.7 Decode on the MoE model.** The decoder of step 9 (one replay per token) with the CPU's share inside the step; `athanor chat` and `athanor bench` on Qwen3.6-35B-A3B.
+- [x] **12.7 Decode on the MoE model.** The decoder of step 9 (one replay per token) with the CPU's share inside the step; `athanor chat` and `athanor bench` on Qwen3.6-35B-A3B.
 - [ ] **12.8 Tests and numerics.**
   - A tiny Qwen3.5-MoE written as a Q8_0 GGUF by `tests/golden/`, with the reference's outputs in fp32 and bf16.
   - The forward records of Qwen3.6-35B-A3B from a reference that streams the GGUF's dequantized layers through transformers' modules: fp32 and bf16, the step 4 gate.
@@ -685,3 +685,6 @@ The numbers: `docs/results/2026-11-25-step10-prefill/` and the vLLM profile in t
 - 2026-11-25: task 12.3 done (`b8c84df`): Q8_0 matmul and embedding on the CPU and the GPU in one canonical order (`src/ops/q8_0.h`), every implementation the reference's bits; the decode kernel reads the 509 MB output head at 897 GB/s (bf16 GEMV: 907), the prompt kernel runs at about 9 TFLOPS (CUDA cores, the canonical order; a twelfth of cuBLASLt bf16, enough while prefill has no gate). The canonical exponential is within 0.89 ulp of exp.
 - 2026-11-25: task 12.1 in progress: Strata `2af30cc` built in `~/opt/strata` with CUDA 13.5 for `sm_120` (plain cmake, not `setup.sh`); `strata-q36` runs the GGUF in place. A first run on a busy machine (no claim): 25 of 256 experts per layer in VRAM at its default context of 32,768, decode 28.6 tokens/s with MTP off and 74.8 with MTP on. The measurement for the gate waits for the end of the step and an idle machine.
 - 2026-11-25: task 12.4 done: the family reads GGUF files (llama.cpp's names, merged projections as slices, squeezed tensors as views, Q8_0 matmul and embedding weights, the MTP block ignored), with the converter's transforms read back: norm weights stored as 1 + w (offset 0), A = −exp(A_log) stored (`ath_gdn_gates` takes it with `a_given`), value heads in tiled order (`ath_gdn` with `tiled`). `docs/contract/qwen36-35b-a3b.md` records the checkpoint and the transforms. Qwen3.6-35B-A3B binds all 753 tensors. Checked on Qwen3.5-0.8B's bf16 GGUF against its safetensors: CPU bf16 the same logits bit for bit, f32 within 2.4e-5; GPU f32 within 6.0e-6, GPU bf16 the same greedy tokens (A computed by torch in the converter and by CUDA's expf here differ by an ulp in some decays). Experts are now bound as separate gate and up views in both formats.
+- 2026-11-25: tasks 12.5 to 12.7 done. The MoE ops (`src/ops/moe.c`, `moe_cpu.c`, `cuda/moe.cu`), with the routed expert path in the canonical order on the CPU (AVX-512 or one lane) and the GPU, the experts split between them within one layer (`ath_moe_experts_split`: a side stream, the CPU's share by `ath_host_call`, which graphs record, and a merge). The placement (`src/infer/tier.c`): every expert in pinned RAM in a layout both read (Q8_0_R16), as many in VRAM slots as fit (73 to 75 of 256 per layer on the RTX 5080), the slots following use between decoder steps. The decoder of step 9 runs it unchanged. Invariant 7 on Qwen3.6-35B-A3B: with 73, 0 and 24 experts per layer in VRAM, and the slots changing between steps, 0 of 12,912,640 logits differ.
+- 2026-11-25: Qwen3.6-35B-A3B against the reference (`tests/golden/moe.py`: transformers 5.24.0's modules one layer at a time over the GGUF dequantized exactly, the converter's transforms undone; 4 prompts, 234 positions). GPU bf16: pooled KL 1.811e-3 against the bf16 reference's 2.970e-3 (ratio 0.61), greedy token equal to the fp32 reference's at all 180 positions above the bf16 noise (0.718). GPU f32: KL 1e-12, logits within 9.6e-6, residual stream within 3.5e-5 (step 4's 1e-4 and 2e-4): the transforms, the value heads' order included, read back right. The bf16 reference rounds the dequantized weights to bf16, which athanor does not (its Q8_0 weights are exact): the comparison favours athanor by that much, and the f32 run is the strict check.
+- 2026-11-25: first speeds on Qwen3.6-35B-A3B (no claim; busy machine, random tokens): decode 102.7 tokens/s with 75 experts per layer in VRAM after a warm-up (the slots adapt), 34.9 with every expert on the CPU (about 43 GB/s from RAM); prefill of 512 tokens 129 tokens/s (the experts outside VRAM are computed by the CPU in prompts too).

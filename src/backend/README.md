@@ -4,7 +4,7 @@ Device runtimes. The GPU runtime landed in step 6, for CUDA, written once for NV
 
 | File | Content | Step |
 | --- | --- | --- |
-| `backend.h` | the interface: devices and their properties, device and pinned host memory, copies, memset, three streams per device, events for ordering and timing, the device arena; the matmul library's handle and workspace in `ath_device` (step 7); `ath_copy_2d`, strided copies (step 8) | 6, 7, 8 |
+| `backend.h` | the interface: devices and their properties, device and pinned host memory, copies, memset, three streams per device, events for ordering and timing, the device arena; the matmul library's handle and workspace in `ath_device` (step 7); `ath_copy_2d`, strided copies (step 8); `ath_host_call`, host work queued in a stream, which graphs record as host nodes, and `ath_stream_capturing` (step 12) | 6, 7, 8, 12 |
 | `cuda/gpu.cu` | the CUDA implementation (HIP through `compat.h`), in the C subset of CUDA C++ with C linkage; built by `make cuda`; creates the cuBLASLt handle and workspace with the device (step 7) | 6, 7 |
 | `cuda/gpu.h` | private to GPU code (`.cu` files): runtime errors mapped to a status (`ath_gpu_fail`, `ATH_GPU_CHECK`), the device made current, its streams, the check after a kernel launch (`ath_gpu_launched`) | 7 |
 | `gpu_none.c` | the same interface in a build without a GPU backend (`make`): no devices, every call `ATH_ERR_UNSUPPORTED` | 6 |
@@ -70,7 +70,7 @@ ATH_CHECK(ath_stream_sync(&d, ATH_STREAM_COMPUTE));
 
 ## Streams
 
-Three per device: compute, host to device, device to host. Every op of `src/ops` runs on the compute stream (step 7). Expert prefetch and hot/cold swaps (steps 12 and phase 4) use the copy streams and synchronize with events.
+Three per device: compute, host to device, device to host. Every op of `src/ops` runs on the compute stream (step 7). Expert prefetch and hot/cold swaps (steps 12 and phase 4) use the copy streams and synchronize with events. Since step 12 the device-to-host stream also carries the CPU's share of a MoE layer: the layer's inputs copied to pinned memory, then `ath_host_call` runs the CPU's experts, and an event lets the compute stream merge their outputs; recorded in a graph, the copies and the host call replay with the step.
 
 ## One kernel source for two vendors
 
