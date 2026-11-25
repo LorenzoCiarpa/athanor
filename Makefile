@@ -84,6 +84,7 @@ OPS_SRC   := $(wildcard src/ops/*.c)
 TEXT_SRC  := $(wildcard src/text/*.c)
 MODEL_SRC := $(wildcard src/model/*.c)
 INFER_SRC := $(wildcard src/infer/*.c)
+NET_SRC   := $(wildcard src/net/*.c)
 # GPU code: the CUDA C of the cuda/ folders (the backend's runtime, the ops'
 # kernels) with a GPU; without one, the stubs gpu_none.c of both
 # (src/backend/README.md, Source layout).
@@ -96,7 +97,7 @@ BACKEND_SRC += src/backend/gpu_none.c
 OPS_SRC     += src/ops/gpu_none.c
 GPU_SRC   :=
 endif
-LIB_SRC   := $(CORE_SRC) $(OPS_SRC) $(TEXT_SRC) $(MODEL_SRC) $(FAMILY_SRC) $(BACKEND_SRC) $(INFER_SRC)
+LIB_SRC   := $(CORE_SRC) $(OPS_SRC) $(TEXT_SRC) $(MODEL_SRC) $(FAMILY_SRC) $(BACKEND_SRC) $(INFER_SRC) $(NET_SRC)
 LIB_OBJ   := $(LIB_SRC:%.c=$(BUILD)/obj/%.o) $(GPU_SRC:%.cu=$(BUILD)/obj/%.o)
 
 TOOL_SRC := $(wildcard tools/*.c)

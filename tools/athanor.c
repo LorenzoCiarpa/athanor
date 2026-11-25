@@ -17,6 +17,8 @@ static const command commands[] = {
     {"chat", "chat with a model, on the GPU or the CPU", ath_cmd_chat, ath_cmd_chat_usage},
     {"devices", "list the GPUs this build can use", ath_cmd_devices, ath_cmd_devices_usage},
     {"bench", "measure prefill and decode speed (docs/BENCHMARKS.md)", ath_cmd_bench, ath_cmd_bench_usage},
+    {"serve", "serve a model over HTTP for coding agents (Anthropic and OpenAI APIs)", ath_cmd_serve,
+     ath_cmd_serve_usage},
 };
 
 static void usage(FILE *out)

@@ -23,5 +23,7 @@ int  ath_cmd_devices(ath_arena *a, int argc, char **argv);
 void ath_cmd_devices_usage(FILE *out);
 int  ath_cmd_bench(ath_arena *a, int argc, char **argv);
 void ath_cmd_bench_usage(FILE *out);
+int  ath_cmd_serve(ath_arena *a, int argc, char **argv);
+void ath_cmd_serve_usage(FILE *out);
 
 #endif /* ATH_TOOLS_COMMANDS_H */
