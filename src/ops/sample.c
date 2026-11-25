@@ -13,6 +13,7 @@
  * whole vocabulary is sorted (heapsort: glibc's qsort may allocate).
  */
 #include "ops/check.h"
+#include "ops/launch.h"
 #include "ops/ops.h"
 
 #include <math.h>
@@ -58,6 +59,13 @@ static void heap_sort(cand *c, int64_t n)
     }
 }
 
+static bool params_ok(const ath_sampler *p)
+{
+    return p->temperature >= 0 && p->top_k >= 0 && p->top_p > 0 && p->top_p <= 1 && p->min_p >= 0 && p->min_p <= 1;
+}
+
+static bool greedy(const ath_sampler *p) { return p->temperature == 0 || p->top_k == 1; }
+
 ath_status ath_sample_ref(const ath_tensor *logits, const ath_sampler *p, double u, ath_arena *scratch,
                           int32_t *out)
 {
@@ -67,14 +75,13 @@ ath_status ath_sample_ref(const ath_tensor *logits, const ath_sampler *p, double
     if (logits->ndim < 1 || logits->ndim > 2 || (logits->ndim == 2 && logits->shape[0] != 1) ||
         ops_last(logits) < 1 || ops_last(logits) > INT32_MAX)
         return ops_fail(ATH_ERR_INVALID_ARG, op, "logits must be [vocab] or [1, vocab]");
-    if (!(p->temperature >= 0) || p->top_k < 0 || !(p->top_p > 0 && p->top_p <= 1) ||
-        !(p->min_p >= 0 && p->min_p <= 1) || !(u >= 0 && u < 1))
+    if (!params_ok(p) || !(u >= 0 && u < 1))
         return ops_fail(ATH_ERR_INVALID_ARG, op, "temperature %g, top_k %d, top_p %g, min_p %g, u %g",
                         (double)p->temperature, p->top_k, (double)p->top_p, (double)p->min_p, u);
     ATH_CHECK(OPS_PLACE(op, OPS_HOST, logits));
     const int64_t V = ops_last(logits);
 
-    if (p->temperature == 0 || p->top_k == 1) {
+    if (greedy(p)) {
         cand best = {ld(logits, 0), 0};
         for (int64_t i = 1; i < V; i++) {
             cand c = {ld(logits, i), (int32_t)i};
@@ -150,4 +157,33 @@ ath_status ath_sample_ref(const ath_tensor *logits, const ath_sampler *p, double
     *out = id;
     ath_arena_reset(scratch, pos);
     return ATH_OK;
+}
+
+bool ath_sample_gpu_fits(const ath_sampler *p)
+{
+    return p && params_ok(p) && (greedy(p) || (p->top_k > 0 && p->top_k <= ATH_SAMPLE_GPU_MAX_K));
+}
+
+ath_status ath_sample_gpu(const ath_device *d, const ath_tensor *logits, const ath_sampler *p, const double *u,
+                          ath_dev_arena *scratch, int32_t *out)
+{
+    ATH_CHECK(ops_float(logits, op, "logits"));
+    if (!p || !scratch || !out || !u)
+        return ops_fail(ATH_ERR_INVALID_ARG, op, "missing sampler, scratch, u or output");
+    if (logits->ndim < 1 || logits->ndim > 2 || (logits->ndim == 2 && logits->shape[0] != 1) ||
+        ops_last(logits) < 1 || ops_last(logits) > INT32_MAX)
+        return ops_fail(ATH_ERR_INVALID_ARG, op, "logits must be [vocab] or [1, vocab]");
+    if (!params_ok(p))
+        return ops_fail(ATH_ERR_INVALID_ARG, op, "temperature %g, top_k %d, top_p %g, min_p %g",
+                        (double)p->temperature, p->top_k, (double)p->top_p, (double)p->min_p);
+    if (!ath_sample_gpu_fits(p))
+        return ops_fail(ATH_ERR_UNSUPPORTED, op, "top_k %d on the GPU: 1 to %d", p->top_k, ATH_SAMPLE_GPU_MAX_K);
+    ATH_CHECK(OPS_PLACE(op, OPS_GPU, logits));
+    const int64_t V = ops_last(logits);
+    const int32_t k = greedy(p) ? 1 : (int32_t)(p->top_k < V ? p->top_k : V);
+    const ath_dev_arena_pos mark = ath_dev_arena_mark(scratch);
+    void *work = ath_dev_arena_alloc(scratch, ath_sample_launch_bytes(V, k), 0);
+    ath_status st = work ? ath_sample_launch(d, logits, p, k, u, work, out) : ATH_ERR_NOMEM;
+    ath_dev_arena_reset(scratch, mark);   /* the next work on the stream comes after the kernels */
+    return st;
 }

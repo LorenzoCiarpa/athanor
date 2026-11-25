@@ -382,6 +382,63 @@ ATH_TEST(gpu_gemv)
     gpu_close(&g);
 }
 
+/* ---- sampling (step 9) ----------------------------------------------------------------- */
+
+/* GPU sampling against ath_sample_ref on the same logits and u: greedy and
+ * top-k samplers with temperature, top-p and min-p, vocabularies from 7
+ * tokens to the 0.8B model's, logits with many ties (rounded to a coarse
+ * grid) and without, u across [0, 1). */
+ATH_TEST(gpu_sample)
+{
+    gpu g;
+    GPU_OR_SKIP(g);
+    static const int64_t Vs[] = {7, 1000, 248320};
+    static const ath_sampler ps[] = {
+        {0, 0, 1, 0},          {1, 1, 1, 0},           {0.7f, 20, 0.8f, 0},
+        {0.6f, 20, 0.95f, 0},  {1, 64, 1, 0.05f},      {1.3f, 5, 0.5f, 0.2f},
+    };
+    static const double us[] = {0, 0.05, 0.25, 0.5, 0.75, 0.9, 0.999, 0.3333, 0.6667, 0.123};
+    int64_t cases = 0, differ = 0;
+    for (size_t vi = 0; vi < ATH_ARRAY_LEN(Vs); vi++)
+        for (int ties = 0; ties < 2; ties++) {
+            const int64_t V = Vs[vi];
+            ath_tensor lg = rand_t(&g, ATH_DTYPE_F32, -8, 8, SHAPE(1, V));
+            for (int64_t i = 0; ties && i < V; i++)   /* a coarse grid: many equal logits */
+                ((float *)lg.data)[i] = roundf(((float *)lg.data)[i] * 2) / 2;
+            const ath_dev_arena_pos mark = ath_dev_arena_mark(&g.dev);
+            ath_tensor ld = up(&g, &lg);
+            double *ud = ath_dev_arena_alloc(&g.dev, sizeof(double), 0);
+            int32_t *od = ath_dev_arena_alloc(&g.dev, sizeof(int32_t), 0);
+            ATH_REQUIRE(ud && od);
+            for (size_t pi = 0; pi < ATH_ARRAY_LEN(ps); pi++)
+                for (size_t ui = 0; ui < ATH_ARRAY_LEN(us); ui++) {
+                    int32_t want = -1, got = -2;
+                    ATH_REQUIRE_OK(ath_sample_ref(&lg, &ps[pi], us[ui], &g.host, &want));
+                    ATH_REQUIRE_OK(ath_copy(&g.d, ud, &us[ui], sizeof(double), ATH_STREAM_COMPUTE));
+                    ATH_EXPECT_OK(ath_sample_gpu(&g.d, &ld, &ps[pi], ud, &g.dev, od));
+                    ATH_REQUIRE_OK(ath_copy(&g.d, &got, od, sizeof got, ATH_STREAM_COMPUTE));
+                    ATH_REQUIRE_OK(ath_stream_sync(&g.d, ATH_STREAM_COMPUTE));
+                    cases++;
+                    if (got != want) {
+                        differ++;
+                        printf("    sample V %lld ties %d sampler %zu u %g: GPU %d, reference %d\n", (long long)V,
+                               ties, pi, us[ui], got, want);
+                    }
+                }
+            ath_dev_arena_reset(&g.dev, mark);
+        }
+    printf("    sampling: %lld cases, %lld differ from the reference\n", (long long)cases, (long long)differ);
+    ATH_EXPECT(differ == 0);
+    /* every token a candidate: not on the GPU */
+    ath_tensor lg = rand_t(&g, ATH_DTYPE_F32, -1, 1, SHAPE(1, 100)), ld = up(&g, &lg);
+    double *ud = ath_dev_arena_alloc(&g.dev, sizeof(double), 0);
+    int32_t *od = ath_dev_arena_alloc(&g.dev, sizeof(int32_t), 0);
+    const ath_sampler all = {0.7f, 0, 0.9f, 0}, big = {0.7f, ATH_SAMPLE_GPU_MAX_K + 1, 1, 0};
+    ATH_EXPECT(!ath_sample_gpu_fits(&all) && !ath_sample_gpu_fits(&big));
+    ATH_EXPECT_STATUS(ath_sample_gpu(&g.d, &ld, &all, ud, &g.dev, od), ATH_ERR_UNSUPPORTED);
+    gpu_close(&g);
+}
+
 /* ---- norms ----------------------------------------------------------------------- */
 
 ATH_TEST(gpu_norms)
@@ -736,7 +793,7 @@ ATH_TEST(gpu_gdn)
 }
 
 static const ath_test_case tests[] = {
-    ATH_TEST_ENTRY(gpu_argument_checks), ATH_TEST_ENTRY(gpu_embed),       ATH_TEST_ENTRY(gpu_matmul),      ATH_TEST_ENTRY(gpu_gemv), ATH_TEST_ENTRY(gpu_scatter_rows),
+    ATH_TEST_ENTRY(gpu_argument_checks), ATH_TEST_ENTRY(gpu_embed),       ATH_TEST_ENTRY(gpu_matmul),      ATH_TEST_ENTRY(gpu_gemv), ATH_TEST_ENTRY(gpu_scatter_rows), ATH_TEST_ENTRY(gpu_sample),
     ATH_TEST_ENTRY(gpu_norms),           ATH_TEST_ENTRY(gpu_rope),        ATH_TEST_ENTRY(gpu_elementwise),
     ATH_TEST_ENTRY(gpu_attn),            ATH_TEST_ENTRY(gpu_conv),        ATH_TEST_ENTRY(gpu_gdn_gates),
     ATH_TEST_ENTRY(gpu_gdn),

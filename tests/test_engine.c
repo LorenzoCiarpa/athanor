@@ -26,6 +26,7 @@
 
 #include "core/file.h"
 #include "core/json.h"
+#include "core/rng.h"
 #include "infer/engine.h"
 #include "model/model.h"
 
@@ -250,6 +251,83 @@ ATH_TEST(engine_pieces)
     tiny_close(&t);
 }
 
+/* The decoder (step 9): a recorded and replayed decode step gives the logits
+ * of the same step run directly, bit for bit, and with the same uniform
+ * numbers it chooses the tokens ath_sample_ref chooses on them: on the
+ * host (top-k 0), on the GPU (top-k 3) and greedy. A full state is refused. */
+ATH_TEST(engine_decoder)
+{
+    GPU_OR_SKIP();
+    enum { NP = 5, NG = 20, CAP = NP + NG };
+    static const int32_t prompt[NP] = {3, 15, 0, 7, 7};
+    static const ath_sampler ps[] = {{0.8f, 0, 1, 0}, {0.8f, 3, 0.9f, 0}, {0, 0, 1, 0}};
+    static const char *names[] = {"host sampling", "GPU sampling", "greedy"};
+    tiny_model t;
+    ATH_REQUIRE_OK(tiny_open(&t, 11));
+    const ath_model *m = &t.m;
+    ath_engine e;
+    ATH_REQUIRE_OK(ath_engine_open(&e, m, 0, &t.a));
+    ath_arena scratch;
+    ath_arena_init(&scratch, 0);
+    double us[NG];
+    ath_rng rng;
+    ath_rng_init(&rng, 5);
+    for (int i = 0; i < NG; i++)
+        us[i] = ath_rng_uniform(&rng);
+    static float want_l[NG][V];
+    for (size_t k = 0; k < ATH_ARRAY_LEN(ps); k++) {
+        /* directly: host logits, ath_sample_ref */
+        ath_state d;
+        ATH_REQUIRE_OK(ath_engine_state(&e, &d, ATH_DTYPE_BF16, CAP, &t.a));
+        ATH_REQUIRE_OK(ath_model_forward(m, &(ath_batch){.tokens = prompt, .n_tokens = NP - 1}, &d, NULL, &scratch, &e.exec));
+        int32_t want[NG], tok = prompt[NP - 1];
+        for (int i = 0; i < NG; i++) {
+            ath_tensor l = f32_tensor(want_l[i], 1, V);
+            ATH_REQUIRE_OK(ath_model_forward(m, &(ath_batch){.tokens = &tok, .n_tokens = 1, .logits = &l}, &d, NULL, &scratch, &e.exec));
+            ATH_REQUIRE_OK(ath_sample_ref(&l, &ps[k], us[i], &scratch, &tok));
+            want[i] = tok;
+        }
+        /* the decoder: the first step direct, the second recorded, the rest replayed */
+        ath_state g;
+        ATH_REQUIRE_OK(ath_engine_state(&e, &g, ATH_DTYPE_BF16, CAP, &t.a));
+        ATH_REQUIRE_OK(ath_model_forward(m, &(ath_batch){.tokens = prompt, .n_tokens = NP - 1}, &g, NULL, &scratch, &e.exec));
+        ath_decoder dc;
+        ATH_REQUIRE_OK(ath_decoder_open(&dc, &e, &g, &ps[k], &t.a));
+        ATH_EXPECT(dc.gpu_sampling == (k > 0));
+        int same_tokens = 0, same_logits = 0;
+        tok = prompt[NP - 1];
+        for (int i = 0; i < NG; i++) {
+            ATH_REQUIRE_OK(ath_decoder_step(&dc, tok, us[i], &tok));
+            same_tokens += tok == want[i];
+            if (!dc.gpu_sampling)
+                same_logits += memcmp(dc.hlogits.data, want_l[i], sizeof want_l[i]) == 0;
+        }
+        printf("    decoder, %-14s %d of %d tokens as directly%s\n", names[k], same_tokens, NG,
+               dc.gpu_sampling ? "" : same_logits == NG ? ", every logit the same bits" : ", logits DIFFER");
+        ATH_EXPECT(same_tokens == NG);
+        ATH_EXPECT(dc.gpu_sampling || same_logits == NG);
+        ATH_EXPECT(dc.g.exec != NULL);
+        ATH_EXPECT_EQ_INT(g.n_past, CAP - 1);
+        /* one more fits, then the state is full */
+        ATH_EXPECT_OK(ath_decoder_step(&dc, tok, 0.5, &tok));
+        ATH_EXPECT_STATUS(ath_decoder_step(&dc, tok, 0.5, &tok), ATH_ERR_RANGE);
+        /* a reset state decodes again with the same recording */
+        ATH_REQUIRE_OK(ath_state_reset(&g, m));
+        ATH_REQUIRE_OK(ath_model_forward(m, &(ath_batch){.tokens = prompt, .n_tokens = NP - 1}, &g, NULL, &scratch, &e.exec));
+        tok = prompt[NP - 1];
+        int again = 0;
+        for (int i = 0; i < NG; i++) {
+            ATH_REQUIRE_OK(ath_decoder_step(&dc, tok, us[i], &tok));
+            again += tok == want[i];
+        }
+        ATH_EXPECT(again == NG);
+        ath_decoder_close(&dc);
+    }
+    ath_arena_free(&scratch);
+    ath_engine_close(&e);
+    tiny_close(&t);
+}
+
 /* ---- the gate: greedy generation on the real checkpoint ------------------------- */
 
 static const char *golden_dir(void)
@@ -421,7 +499,7 @@ ATH_TEST(generate_golden)
 
 static const ath_test_case tests[] = {
     ATH_TEST_ENTRY(engine_without_gpu), ATH_TEST_ENTRY(engine_weights), ATH_TEST_ENTRY(engine_state),
-    ATH_TEST_ENTRY(engine_pieces),      ATH_TEST_ENTRY(generate_golden),
+    ATH_TEST_ENTRY(engine_pieces),     ATH_TEST_ENTRY(engine_decoder),      ATH_TEST_ENTRY(generate_golden),
 };
 
 int main(int argc, char **argv)

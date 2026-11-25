@@ -287,6 +287,18 @@ typedef struct {
 ath_status ath_sample_ref(const ath_tensor *logits, const ath_sampler *p, double u, ath_arena *scratch,
                           int32_t *out);
 
+/* GPU (step 9): the same choice from logits in device memory, with u (one
+ * double) and the token (one int32) in device memory too, so that a decode
+ * step samples without the host. Greedy, or top_k from 1 to
+ * ATH_SAMPLE_GPU_MAX_K; with every token a candidate (top_k 0, or above the
+ * maximum) ATH_ERR_UNSUPPORTED, and the caller samples on the host. u
+ * cannot be checked: it must be in [0, 1). Working memory comes from the
+ * device scratch arena and is released before returning. */
+#define ATH_SAMPLE_GPU_MAX_K 64
+bool       ath_sample_gpu_fits(const ath_sampler *p);
+ath_status ath_sample_gpu(const ath_device *d, const ath_tensor *logits, const ath_sampler *p, const double *u,
+                          ath_dev_arena *scratch, int32_t *out);
+
 #ifdef __cplusplus
 }
 #endif

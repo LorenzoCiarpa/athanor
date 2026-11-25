@@ -241,6 +241,66 @@ ath_status ath_stream_sync(const ath_device *d, ath_stream s)
     return ATH_OK;
 }
 
+/* ---- graphs ------------------------------------------------------------------ */
+
+ath_status ath_graph_begin(const ath_device *d, ath_stream s)
+{
+    if (!stream_ok(s))
+        return ATH_ERR_INVALID_ARG;
+    ATH_CHECK(ath_gpu_use(d));
+    /* thread-local: only this thread's calls are checked against the capture */
+    ATH_GPU_CHECK(cudaStreamBeginCapture(ath_gpu_stream(d, s), cudaStreamCaptureModeThreadLocal));
+    return ATH_OK;
+}
+
+ath_status ath_graph_end(const ath_device *d, ath_stream s, ath_graph *g)
+{
+    if (!stream_ok(s) || !g)
+        return ATH_ERR_INVALID_ARG;
+    memset(g, 0, sizeof *g);
+    ATH_CHECK(ath_gpu_use(d));
+    cudaGraph_t graph = NULL;
+    cudaError_t e = cudaStreamEndCapture(ath_gpu_stream(d, s), &graph);
+    if (e != cudaSuccess) {
+        if (graph)
+            cudaGraphDestroy(graph);
+        return ath_gpu_fail(e, "cudaStreamEndCapture");
+    }
+    if (!graph)
+        return ATH_OK;
+    cudaGraphExec_t exec = NULL;
+    e = cudaGraphInstantiateWithFlags(&exec, graph, 0);
+    if (e != cudaSuccess) {
+        cudaGraphDestroy(graph);
+        return ath_gpu_fail(e, "cudaGraphInstantiateWithFlags");
+    }
+    g->graph = graph;
+    g->exec = exec;
+    return ATH_OK;
+}
+
+ath_status ath_graph_launch(const ath_device *d, const ath_graph *g, ath_stream s)
+{
+    if (!stream_ok(s) || !g || !g->exec)
+        return ATH_ERR_INVALID_ARG;
+    ATH_CHECK(ath_gpu_use(d));
+    ATH_GPU_CHECK(cudaGraphLaunch((cudaGraphExec_t)g->exec, ath_gpu_stream(d, s)));
+    return ATH_OK;
+}
+
+void ath_graph_destroy(const ath_device *d, ath_graph *g)
+{
+    if (!g)
+        return;
+    if (d && (g->exec || g->graph) && ath_gpu_use(d) == ATH_OK) {
+        if (g->exec)
+            cudaGraphExecDestroy((cudaGraphExec_t)g->exec);
+        if (g->graph)
+            cudaGraphDestroy((cudaGraph_t)g->graph);
+    }
+    memset(g, 0, sizeof *g);
+}
+
 ath_status ath_device_sync(const ath_device *d)
 {
     ATH_CHECK(ath_gpu_use(d));

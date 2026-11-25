@@ -65,6 +65,15 @@ typedef hipDeviceProp_t cudaDeviceProp;
 #define cudaEventRecord              hipEventRecord
 #define cudaEventSynchronize         hipEventSynchronize
 #define cudaEventElapsedTime         hipEventElapsedTime
+#define cudaGraph_t                  hipGraph_t
+#define cudaGraphExec_t              hipGraphExec_t
+#define cudaStreamBeginCapture       hipStreamBeginCapture
+#define cudaStreamEndCapture         hipStreamEndCapture
+#define cudaStreamCaptureModeThreadLocal hipStreamCaptureModeThreadLocal
+#define cudaGraphInstantiateWithFlags hipGraphInstantiateWithFlags
+#define cudaGraphLaunch              hipGraphLaunch
+#define cudaGraphExecDestroy         hipGraphExecDestroy
+#define cudaGraphDestroy             hipGraphDestroy
 
 /* the matmul library */
 typedef hipblasLtHandle_t                 cublasLtHandle_t;

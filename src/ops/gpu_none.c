@@ -77,3 +77,16 @@ ath_status ath_scatter_rows_launch(const ath_device *d, const ath_tensor *src, c
     (void)d, (void)src, (void)idx, (void)dst;
     return none("scatter_rows");
 }
+
+size_t ath_sample_launch_bytes(int64_t V, int32_t k)
+{
+    (void)V, (void)k;
+    return 0;
+}
+
+ath_status ath_sample_launch(const ath_device *d, const ath_tensor *logits, const ath_sampler *p, int32_t k,
+                             const double *u, void *work, int32_t *out)
+{
+    (void)d, (void)logits, (void)p, (void)k, (void)u, (void)work, (void)out;
+    return none("sample");
+}

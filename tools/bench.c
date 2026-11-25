@@ -14,9 +14,11 @@
  * --warmup times unmeasured and --reps times measured, from a reset state;
  * the report gives the median with the minimum and the maximum.
  *
- * Decode runs the way `athanor chat` does: each token is one forward call
- * whose logits come back to the host, where the next token is chosen
- * (ath_sample_ref). The JSON report (--json) records the hardware, the
+ * Decode on a GPU runs through the decoder of src/infer/engine.h (step 9),
+ * as `athanor chat` does: one recorded graph per token, the greedy choice
+ * made on the device. --direct runs each token as one forward call whose
+ * logits come back to the host, where the next token is chosen
+ * (ath_sample_ref): the decode of step 8. The JSON report (--json) records the hardware, the
  * software, the model files with their SHA-256, the workload, the method
  * and every measured run, and memory as the driver and the kernel see it.
  */
@@ -65,6 +67,8 @@ void ath_cmd_bench_usage(FILE *out)
             "  --threads <n>         CPU threads (default: all)\n"
             "  --seed <n>            seed of the token ids (default 1)\n"
             "  --json <file>         write the report there\n"
+            "  --direct              decode with one forward call per token and the logits on\n"
+            "                        the host (step 8), not with the decoder's graph\n"
             "  --no-hash             do not hash the weight files for the report\n",
             MAX_REPS);
 }
@@ -75,7 +79,7 @@ typedef struct {
     int32_t     n_prompts, n_depths;
     int32_t     gen, reps, warmup, chunk, threads;
     uint64_t    seed;
-    bool        hash;
+    bool        hash, direct;
 } options;
 
 typedef struct {
@@ -100,6 +104,8 @@ typedef struct {
     int32_t     *ids;          /* the pseudo-random token ids    */
     int64_t      n_ids;
     ath_sampler  greedy;
+    ath_decoder  dc;
+    bool         decoder;      /* tg through dc */
     uint64_t     dev_used_before, dev_used_peak;
 } bench;
 
@@ -177,7 +183,9 @@ static ath_status run_tg(bench *b, const options *o, int64_t depth, double *secs
     ATH_CHECK(feed(b, b->ids, depth, o->chunk, false));
     int32_t tok = b->ids[depth];
     double t0 = now_s();
-    for (int32_t i = 0; i < o->gen; i++) {
+    for (int32_t i = 0; b->decoder && i < o->gen; i++)
+        ATH_CHECK(ath_decoder_step(&b->dc, tok, 0.0, &tok));
+    for (int32_t i = 0; !b->decoder && i < o->gen; i++) {
         ath_batch bt = {.tokens = &tok, .n_tokens = 1, .logits = &b->logits};
         ATH_CHECK(ath_model_forward(&b->m, &bt, &b->st, NULL, b->scratch, &b->exec));
         ATH_CHECK(ath_sample_ref(&b->logits, &b->greedy, 0.0, b->scratch, &tok));
@@ -394,9 +402,11 @@ static ath_status write_report(const bench *b, const options *o, const result *r
     ATH_CHECK(ath_buf_printf(j,
                              ",\n  \"workload\": {\"tokens\": \"pseudo-random ids (ath_rng, seed %llu)\", "
                              "\"batch\": 1, \"prompt_chunk\": %d, \"context\": %d, \"activations\": \"bf16\", "
-                             "\"sampling\": \"greedy, on the host (ath_sample_ref), as athanor chat\", "
-                             "\"device\": \"%s\"}",
-                             (unsigned long long)o->seed, o->chunk, b->st.capacity, b->e ? "gpu" : "cpu"));
+                             "\"sampling\": \"greedy\", \"decode\": \"%s\", \"device\": \"%s\"}",
+                             (unsigned long long)o->seed, o->chunk, b->st.capacity,
+                             b->decoder ? "decoder: one recorded graph per token, the choice on the GPU (step 9)"
+                                        : "one forward call per token, logits to the host, ath_sample_ref (step 8)",
+                             b->e ? "gpu" : "cpu"));
     ATH_CHECK(ath_buf_printf(j,
                              ",\n  \"method\": {\"warmup_runs\": %d, \"measured_runs\": %d, \"statistic\": "
                              "\"median, with min and max\", \"timer\": \"CLOCK_MONOTONIC around whole calls; "
@@ -471,6 +481,8 @@ static int parse(int argc, char **argv, options *o)
             o->device = v;
         else if (!strcmp(a, "--json") && v)
             o->json = v;
+        else if (!strcmp(a, "--direct"))
+            o->direct = true, takes = false;
         else if (!strcmp(a, "--no-hash"))
             o->hash = false, takes = false;
         else if (a[0] != '-' && !o->model)
@@ -525,6 +537,10 @@ int ath_cmd_bench(ath_arena *a, int argc, char **argv)
             b.exec = b.e->exec;
             st = ath_engine_state(b.e, &b.st, ATH_DTYPE_BF16, (int32_t)ctx, a);
         }
+        if (st == ATH_OK && !o.direct) {
+            st = ath_decoder_open(&b.dc, b.e, &b.st, &b.greedy, a);
+            b.decoder = st == ATH_OK;
+        }
     } else if (st == ATH_OK) {
         st = ath_pool_init(&b.pool, o.threads ? o.threads : ath_pool_default_threads(), a);
         b.pool_open = st == ATH_OK;
@@ -569,6 +585,8 @@ int ath_cmd_bench(ath_arena *a, int argc, char **argv)
     if (st == ATH_OK && o.json)
         printf("report: %s\n", o.json);
 
+    if (b.decoder)
+        ath_decoder_close(&b.dc);
     if (b.e)
         ath_engine_close(b.e);
     if (b.pool_open)

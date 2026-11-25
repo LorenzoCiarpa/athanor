@@ -153,6 +153,34 @@ ath_status ath_event_sync(const ath_device *d, const ath_event *e);
  * end). ATH_ERR_INVALID_ARG for events created without timing. */
 ath_status ath_event_elapsed(const ath_device *d, const ath_event *start, const ath_event *end, float *ms);
 
+/* ---- graphs (step 9) --------------------------------------------------------
+ *
+ * A graph records the work queued on one stream between ath_graph_begin and
+ * ath_graph_end, without running it; ath_graph_launch then runs all of it
+ * with one call. A decode step of some 500 kernels costs one launch on the
+ * host instead of 500. The recorded work keeps its arguments, addresses
+ * included, so whatever changes from one replay to the next must be read
+ * from memory by the work itself (a copy from pinned host memory, written
+ * before the launch, or values left in device memory by the previous
+ * replay). While a stream is being recorded nothing may wait for it, and
+ * nothing is allocated or freed through the runtime. */
+typedef struct {
+    void *graph;   /* the recorded work        */
+    void *exec;    /* the graph ready to run   */
+} ath_graph;
+
+/* Start recording the work queued on stream s. */
+ath_status ath_graph_begin(const ath_device *d, ath_stream s);
+/* Stop recording s and prepare the graph in g. Also after a failure while
+ * recording, which leaves the stream usable again: then g stays empty and
+ * the runtime's error is returned (or ATH_OK with an empty g if nothing
+ * failed in the runtime; the caller knows its own failure). */
+ath_status ath_graph_end(const ath_device *d, ath_stream s, ath_graph *g);
+/* Run the recorded work on stream s, after the work queued there so far. */
+ath_status ath_graph_launch(const ath_device *d, const ath_graph *g, ath_stream s);
+/* Free g (empty or not). */
+void ath_graph_destroy(const ath_device *d, ath_graph *g);
+
 /* ---- device arena ----------------------------------------------------------
  *
  * Linear allocation in device memory, with the semantics of the core arenas

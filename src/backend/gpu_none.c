@@ -78,6 +78,33 @@ ath_status ath_stream_sync(const ath_device *d, ath_stream s)
     return ATH_ERR_UNSUPPORTED;
 }
 
+ath_status ath_graph_begin(const ath_device *d, ath_stream s)
+{
+    (void)d, (void)s;
+    return ATH_ERR_UNSUPPORTED;
+}
+
+ath_status ath_graph_end(const ath_device *d, ath_stream s, ath_graph *g)
+{
+    (void)d, (void)s;
+    if (g)
+        memset(g, 0, sizeof *g);
+    return ATH_ERR_UNSUPPORTED;
+}
+
+ath_status ath_graph_launch(const ath_device *d, const ath_graph *g, ath_stream s)
+{
+    (void)d, (void)g, (void)s;
+    return ATH_ERR_UNSUPPORTED;
+}
+
+void ath_graph_destroy(const ath_device *d, ath_graph *g)
+{
+    (void)d;
+    if (g)
+        memset(g, 0, sizeof *g);
+}
+
 ath_status ath_device_sync(const ath_device *d)
 {
     (void)d;
