@@ -22,6 +22,12 @@ ath_status ath_matmul_launch(const ath_device *d, const ath_tensor *x, const ath
     return none("matmul");
 }
 
+ath_status ath_matmul_q8_0_launch(const ath_device *d, const ath_tensor *x, const ath_tensor *w, ath_tensor *out)
+{
+    (void)d, (void)x, (void)w, (void)out;
+    return none("matmul");
+}
+
 ath_status ath_norm_launch(const ath_device *d, ath_norm_kind kind, const ath_tensor *x, const ath_tensor *z,
                            const ath_tensor *w, float w_offset, float eps, ath_tensor *out)
 {

@@ -321,6 +321,76 @@ ATH_TEST(gpu_matmul)
     gpu_close(&g);
 }
 
+/* ---- Q8_0 (step 12) ------------------------------------------------------------ */
+
+/* A random Q8_0 [M, K] weight on the host: f16 scales between 2^-10 and
+ * 2^-6, int8 values in [-127, 127]. */
+static ath_tensor rand_q8_0(gpu *g, int64_t M, int64_t K)
+{
+    ath_tensor t = host(g, ATH_DTYPE_Q8_0, SHAPE(M, K));
+    uint8_t *p = (uint8_t *)t.data;
+    for (int64_t b = 0; b < M * K / 32; b++, p += 34) {
+        const uint16_t h = (uint16_t)(((5 + (b % 5)) << 10) | ((uint16_t)rnd(0, 1023) & 0x3ff));
+        p[0] = (uint8_t)h;
+        p[1] = (uint8_t)(h >> 8);
+        for (int i = 0; i < 32; i++)
+            p[2 + i] = (uint8_t)(int8_t)rnd(-127, 128);
+    }
+    return t;
+}
+
+/* The canonical order (src/ops/q8_0.h): every Q8_0 kernel gives the
+ * reference's bits, for any number of rows: one row (decode), a few, a
+ * prompt in passes of 8; K a multiple of 512 (the staged kernel) or not
+ * (the one that reads its own blocks); x in f32 and bf16, out in both; x off
+ * a 16-byte boundary. And the embedding lookup of a Q8_0 table. */
+ATH_TEST(gpu_matmul_q8_0)
+{
+    gpu g;
+    GPU_OR_SKIP(g);
+    static const struct { int64_t N, K, M; } shapes[] = {
+        {1, 2048, 512}, {1, 512, 2048}, {3, 4096, 77}, {8, 1024, 33}, {21, 2048, 64}, {1, 96, 5}, {5, 160, 9},
+    };
+    static const ath_dtype dts[] = {ATH_DTYPE_BF16, ATH_DTYPE_F32};
+    const ath_dev_arena_pos mark = ath_dev_arena_mark(&g.dev);
+    for (size_t s = 0; s < ATH_ARRAY_LEN(shapes); s++)
+        for (int c = 0; c < 4; c++) {
+            const int64_t N = shapes[s].N, K = shapes[s].K, M = shapes[s].M;
+            ath_tensor xbig = rand_t(&g, dts[c & 1], -1, 1, SHAPE(N + 1, K)), x;
+            ATH_REQUIRE_OK(ath_tensor_slice(&xbig, 0, c == 3 ? 1 : 0, N, &x));
+            ath_tensor w = rand_q8_0(&g, M, K);
+            ath_tensor want = host(&g, dts[c >> 1], SHAPE(N, M));
+            ATH_REQUIRE_OK(ath_matmul_ref(&x, &w, &want));
+            ath_tensor xbd = up(&g, &xbig), xd, wd = up(&g, &w), out = up(&g, &want);
+            ATH_REQUIRE_OK(ath_tensor_slice(&xbd, 0, c == 3 ? 1 : 0, N, &xd));
+            ATH_EXPECT_OK(ath_memset(&g.d, out.data, 0xff, ath_tensor_nbytes(&out), ATH_STREAM_COMPUTE));
+            ATH_EXPECT_OK(ath_matmul_gpu(&g.d, &xd, &wd, &out));
+            ath_tensor got = down(&g, &out);
+            if (memcmp(got.data, want.data, ath_tensor_nbytes(&want)) != 0) {
+                char msg[128];
+                snprintf(msg, sizeof msg, "q8_0 matmul %lldx%lldx%lld x %s out %s: not the reference's bits",
+                         (long long)N, (long long)K, (long long)M, dt_name(dts[c & 1]), dt_name(dts[c >> 1]));
+                ath_test_fail_(t_, __FILE__, __LINE__, msg);
+            }
+            ath_dev_arena_reset(&g.dev, mark);
+        }
+
+    /* embedding rows of a Q8_0 table */
+    const int32_t id_vals[] = {0, 36, 5, 5, 17};
+    ath_tensor ids = host(&g, ATH_DTYPE_I32, SHAPE(5));
+    memcpy(ids.data, id_vals, sizeof id_vals);
+    ath_tensor table = rand_q8_0(&g, 37, 96);
+    for (int b = 0; b < 2; b++) {
+        ath_tensor want = host(&g, dts[b], SHAPE(5, 96));
+        ATH_REQUIRE_OK(ath_embed_ref(&table, &ids, &want));
+        ath_tensor td = up(&g, &table), idd = up(&g, &ids), out = up(&g, &want);
+        ATH_EXPECT_OK(ath_embed_gpu(&g.d, &td, &idd, &out));
+        ath_tensor got = down(&g, &out);
+        ATH_EXPECT(memcmp(got.data, want.data, ath_tensor_nbytes(&want)) == 0);
+    }
+    gpu_close(&g);
+}
+
 /* The GEMV kernel (step 9): every row count it takes, K from one 16-byte
  * piece to more than a lane's four, odd M, both activation dtypes into
  * both output dtypes; an x that is not on a 16-byte boundary goes to the
@@ -1030,7 +1100,7 @@ ATH_TEST(gpu_gdn_chunk)
 }
 
 static const ath_test_case tests[] = {
-    ATH_TEST_ENTRY(gpu_argument_checks), ATH_TEST_ENTRY(gpu_embed),       ATH_TEST_ENTRY(gpu_matmul),      ATH_TEST_ENTRY(gpu_gemv), ATH_TEST_ENTRY(gpu_matmul_n), ATH_TEST_ENTRY(gpu_matmul_swiglu), ATH_TEST_ENTRY(gpu_scatter_rows), ATH_TEST_ENTRY(gpu_sample),
+    ATH_TEST_ENTRY(gpu_argument_checks), ATH_TEST_ENTRY(gpu_embed),       ATH_TEST_ENTRY(gpu_matmul),      ATH_TEST_ENTRY(gpu_gemv), ATH_TEST_ENTRY(gpu_matmul_q8_0), ATH_TEST_ENTRY(gpu_matmul_n), ATH_TEST_ENTRY(gpu_matmul_swiglu), ATH_TEST_ENTRY(gpu_scatter_rows), ATH_TEST_ENTRY(gpu_sample),
     ATH_TEST_ENTRY(gpu_norms),           ATH_TEST_ENTRY(gpu_add_rmsnorm),           ATH_TEST_ENTRY(gpu_rope),        ATH_TEST_ENTRY(gpu_elementwise),
     ATH_TEST_ENTRY(gpu_attn),            ATH_TEST_ENTRY(gpu_attn_mma),    ATH_TEST_ENTRY(gpu_conv),        ATH_TEST_ENTRY(gpu_gdn_gates),
     ATH_TEST_ENTRY(gpu_gdn),             ATH_TEST_ENTRY(gpu_gdn_chunk),

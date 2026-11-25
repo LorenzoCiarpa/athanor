@@ -82,7 +82,11 @@ ath_status ath_embed_gpu(const ath_device *d, const ath_tensor *table, const ath
 
 /* out = x · wᵀ: out[r, m] = Σ_k x[r, k] w[m, k], summed in order of k.
  * x [..., K]; w [M, K] (the layout of the checkpoint); out [..., M] with the
- * leading dimensions of x. */
+ * leading dimensions of x. x and out are f32 or bf16; w is f32, bf16 or
+ * Q8_0 (step 12). A Q8_0 weight is summed in the canonical order of
+ * src/ops/q8_0.h instead (blocks of 32 terms, 16 partial sums, a fixed
+ * tree), which every implementation follows, the GPU's included: the same
+ * bits on both sides (invariant 7, step 12). */
 ath_status ath_matmul_ref(const ath_tensor *x, const ath_tensor *w, ath_tensor *out);
 
 /* The same contract and the same bits as ath_matmul_ref, faster: several

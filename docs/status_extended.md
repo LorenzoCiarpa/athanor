@@ -1210,7 +1210,7 @@ Branch `step12-moe-tiering`, from `main` (steps 1–10; step 11 is postponed). T
 
 #### 12.1 The Strata baseline
 
-(in progress)
+No file of the repository yet. Strata `2af30cc` (2026-11-24, version 0.1.68 in its CMake project) cloned in `~/opt/strata` and built with plain cmake (not its `setup.sh`, which can call `sudo apt` and hash the model): CUDA 13.5 for `sm_120`, `-DSTRATA_ENABLE_CUDA=ON -DSTRATA_Q6K_EXPERTS=ON -DSTRATA_BUILD_TESTS=OFF`, targets `strata` and `strata-q36`, commands in `~/opt/strata-build.log`. `strata-q36 --model <the GGUF> --tokens <ids> --n 128 [--mtp 2]` opens the file in place (nothing copied) and prints prompt and decode speed. A first run on a machine that was not idle (no claim): 25 of 256 experts per layer in VRAM at its default context of 32,768 (an fp32 KV cache), the rest in 32.7 GiB of pinned memory computed on 8 CPU threads, decode 28.6 tokens/s with MTP off and 74.8 with MTP on (76% of drafts accepted), 22.6 after a 4096-token prompt. The measurement for the report comes at the end of the step, on an idle machine.
 
 #### 12.2 The GGUF reader and the checkpoint abstraction
 
@@ -1225,6 +1225,21 @@ Branch `step12-moe-tiering`, from `main` (steps 1–10; step 11 is postponed). T
 | `tools/inspect.c` | Changed | Lists a GGUF checkpoint too: the file line (version, keys, architecture, data section), its tensors with their dtypes (`q8_0`), totals per dtype including block formats, the padding check |
 | `tests/test_core.c` | Changed | `q8_0_blocks` (sizes, views and slices on block boundaries); `gguf_reads` (a file built in memory: metadata of five types, three tensors, the checkpoint directory with a vision projector beside it, two files refused, safetensors first); `gguf_rejects_bad_files` (16 malformed variants); `gguf_real_model` (the Qwen3.6-35B-A3B GGUF when present: 753 tensors in natural order) |
 | `src/core/README.md`, `docs/ARCHITECTURE.md` | Changed | The two new files, Q8_0, loading through `ath_ckpt`; the weight-source abstraction arrived with its second user |
+
+#### 12.3 Q8_0
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `src/ops/q8_0.h` | New | The canonical order of a Q8_0 dot product (an fma chain per block, 16 partial sums by block, the scale by fma, a fixed tree), the exact f16 conversion, `ath_q8_expf` and `ath_q8_silu`; compiled by C and CUDA alike |
+| `src/ops/matmul.c`, `ops.h` | Changed | Q8_0 weights in `ath_matmul_ref` and `ath_matmul_fast` (8 outputs at a time, a block of x widened once per 8), in the canonical order |
+| `src/ops/embed.c`, `cuda/embed.cu` | Changed | Q8_0 tables: d · q exact in f32, then the output's rounding |
+| `src/ops/cuda/q8_0.cuh` | New | A half-warp per dot product; the 16 blocks of a group staged in shared memory with coalesced loads, the words of a block shifted into place; the chain, the butterfly as the canonical tree |
+| `src/ops/cuda/matmul_q8_0.cu` | New | `q8_gemv` (up to 8 rows, the next group loading while one computes), `q8_tile` (prompts: 32 × 16 tiles, activations transposed in shared memory), `q8_any` (other K); `ath_matmul_q8_0_launch` |
+| `src/ops/cuda/matmul.cu`, `launch.h`, `gpu_none.c` | Changed | `ath_matmul_launch` sends Q8_0 weights to `matmul_q8_0.cu`; the declaration and the stub |
+| `tests/test_ops.c`, `tests/test_gpu_ops.c` | Changed | `q8_0_f16_and_exp`, `matmul_q8_0`, `gpu_matmul_q8_0` (`tests/README.md`, Q8_0) |
+| `src/ops/README.md`, `tests/README.md` | Changed | The Q8_0 sections |
+
+Measured with a throwaway harness (no claim: `docs/BENCHMARKS.md`): the decode kernel reads the output head (248,320 × 2048, 509 MB in Q8_0) at 897 GB/s, the bf16 GEMV's 907; the prompt kernel runs a 4096 × 2048 × 8192 product in 14.7 ms, about 9 TFLOPS against cuBLASLt's 113 in bf16.
 
 ---
 

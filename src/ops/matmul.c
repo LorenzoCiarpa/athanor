@@ -12,6 +12,7 @@
 #include "ops/check.h"
 #include "ops/launch.h"
 #include "ops/ops.h"
+#include "ops/q8_0.h"
 
 static const char op[] = "matmul";
 
@@ -20,7 +21,7 @@ static ath_status check(const ath_tensor *x, const ath_tensor *w, const ath_tens
                         int64_t *N, int64_t *M, int64_t *K)
 {
     ATH_CHECK(ops_float(x, op, "x"));
-    ATH_CHECK(ops_float(w, op, "w"));
+    ATH_CHECK(w && w->dtype == ATH_DTYPE_Q8_0 ? ops_tensor(w, ATH_DTYPE_Q8_0, op, "w") : ops_float(w, op, "w"));
     ATH_CHECK(ops_float(out, op, "out"));
     if (x->ndim < 1 || w->ndim != 2 || out->ndim != x->ndim)
         return ops_fail(ATH_ERR_INVALID_ARG, op, "shapes must be x [..., K], w [M, K], out [..., M]");
@@ -37,11 +38,33 @@ static ath_status check(const ath_tensor *x, const ath_tensor *w, const ath_tens
     return OPS_PLACE(op, where, x, w, out);
 }
 
+/* One output against a Q8_0 row, in the canonical order (q8_0.h). */
+static float dot_q8_0_ref(const ath_tensor *x, int64_t r, const uint8_t *row, int64_t K)
+{
+    float P[ATH_Q8_0_LANES] = {0};
+    for (int64_t b = 0; b < K / ATH_Q8_0_BLOCK; b++) {
+        const uint8_t *blk = row + b * ATH_Q8_0_BYTES;
+        const int8_t *q = (const int8_t *)(blk + 2);
+        float s = (float)q[0] * ld(x, r * K + b * ATH_Q8_0_BLOCK);
+        for (int i = 1; i < ATH_Q8_0_BLOCK; i++)
+            s = fmaf((float)q[i], ld(x, r * K + b * ATH_Q8_0_BLOCK + i), s);
+        P[b % ATH_Q8_0_LANES] = fmaf(ath_q8_0_scale(blk), s, P[b % ATH_Q8_0_LANES]);
+    }
+    return ath_q8_0_tree(P);
+}
+
 ath_status ath_matmul_ref(const ath_tensor *x, const ath_tensor *w, ath_tensor *out)
 {
     int64_t N, M, K;
     ATH_CHECK(check(x, w, out, OPS_HOST, &N, &M, &K));
 
+    if (w->dtype == ATH_DTYPE_Q8_0) {
+        const size_t row = ath_dtype_bytes(ATH_DTYPE_Q8_0, K);
+        for (int64_t r = 0; r < N; r++)
+            for (int64_t m = 0; m < M; m++)
+                st(out, r * M + m, dot_q8_0_ref(x, r, (const uint8_t *)w->data + (size_t)m * row, K));
+        return ATH_OK;
+    }
     for (int64_t r = 0; r < N; r++)
         for (int64_t m = 0; m < M; m++) {
             float acc = 0.0f;
@@ -117,10 +140,49 @@ static void one_at_a_time(const job *j, int64_t m0, int64_t m1)
         }
 }
 
+/* Outputs m0 .. m1 − 1 of every row of x against Q8_0 weights, in the
+ * canonical order (q8_0.h), CHAINS outputs at a time so that their chains
+ * overlap; each block of x is widened to f32 once per CHAINS outputs. fmaf
+ * compiles to one instruction where the build targets FMA and to libm's
+ * correctly rounded fmaf otherwise: the same bits either way. */
+static void range_q8_0(const job *j, int64_t m0, int64_t m1)
+{
+    const int64_t K = j->K, nb = K / ATH_Q8_0_BLOCK;
+    const size_t rowb = ath_dtype_bytes(ATH_DTYPE_Q8_0, K);
+    for (int64_t r = 0; r < j->N; r++) {
+        for (int64_t m = m0; m < m1; m += CHAINS) {
+            const int c = m1 - m < CHAINS ? (int)(m1 - m) : CHAINS;
+            float P[CHAINS][ATH_Q8_0_LANES] = {{0}};
+            for (int64_t b = 0; b < nb; b++) {
+                float xb[ATH_Q8_0_BLOCK];
+                for (int e = 0; e < ATH_Q8_0_BLOCK; e++)
+                    xb[e] = ld(j->x, r * K + b * ATH_Q8_0_BLOCK + e);
+                for (int i = 0; i < c; i++) {
+                    const uint8_t *blk = (const uint8_t *)j->w->data + (size_t)(m + i) * rowb + b * ATH_Q8_0_BYTES;
+                    const int8_t *q = (const int8_t *)(blk + 2);
+                    float s = (float)q[0] * xb[0];
+                    for (int e = 1; e < ATH_Q8_0_BLOCK; e++)
+                        s = fmaf((float)q[e], xb[e], s);
+                    P[i][b % ATH_Q8_0_LANES] = fmaf(ath_q8_0_scale(blk), s, P[i][b % ATH_Q8_0_LANES]);
+                }
+            }
+            for (int i = 0; i < c; i++)
+                st(j->out, r * j->M + m + i, ath_q8_0_tree(P[i]));
+        }
+    }
+}
+
 /* Task t of n: a contiguous range of blocks. */
 static void task(void *ctx, int32_t t, int32_t n)
 {
     const job *j = ctx;
+    if (j->w->dtype == ATH_DTYPE_Q8_0) {
+        const int64_t b0 = j->blocks * t / n, b1 = j->blocks * (t + 1) / n;
+        const int64_t m1 = b1 * CHAINS < j->M ? b1 * CHAINS : j->M;
+        if (b0 * CHAINS < m1)
+            range_q8_0(j, b0 * CHAINS, m1);
+        return;
+    }
     for (int64_t b = j->blocks * t / n; b < j->blocks * (t + 1) / n; b++) {
         const int64_t m = b * CHAINS;
         if (m + CHAINS <= j->M && j->w->dtype == ATH_DTYPE_BF16)

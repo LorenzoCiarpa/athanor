@@ -124,15 +124,30 @@ Every kernel of the table matches its reference within the tolerances of `tests/
 
 Measured and dropped: adding a prompt's output projection inside cuBLASLt (beta = 1, 1.2 ms of pp4096) rounds once where the reference rounds twice and moved one greedy token above the noise in step 8's gate; choosing cuBLASLt's algorithm by timing its candidates (0 to 9% per shape, about 1.3 ms of pp4096) would make the bits depend on the timings; a plan cache for cuBLASLt (prompts are GPU-bound: the host queues 10.2 ms of kernels in less time than they run); not inlining the triangular product (its 8 × 8 tile went through local memory, 8 times slower). Kernels are kept small on purpose: the chunked prep was 9.7k instructions, more than the instruction cache, and code that runs once per block (stores of 64 values, IEEE divisions) ran at the speed of fetching it from L2; written as loops it went from 145 to 130 µs.
 
+## Q8_0 (step 12)
+
+Q8_0 weights (`core/tensor.h`, `ATH_DTYPE_Q8_0`: blocks of 32 elements, an f16 scale and 32 int8) are summed in one canonical order in every implementation, so that the CPU and the GPU give the same bits (AGENTS.md invariant 7, option (b) decided at step 12): inside a block a chain of fused multiply-adds over its 32 elements, 16 partial sums taking the blocks in turn (block b into partial b mod 16) with one fused multiply-add of the block's scale, and a fixed tree over the 16 partials (`q8_0.h`). The same header holds the exact f16 conversion and `ath_q8_expf`, an exponential written with IEEE operations only (fma, floor, bit assembly), within 0.89 ulp of exp on [-87, 88] and identical on both sides, for SiLU inside the experts.
+
+| File | Content |
+| --- | --- |
+| `q8_0.h` | private, C and CUDA: `ath_f16_to_f32`, `ath_q8_0_scale`, the canonical tree, `ath_q8_expf`, `ath_q8_silu` |
+| `matmul.c` | `ath_matmul_ref` and `ath_matmul_fast` take a Q8_0 weight: the canonical order, the fast path computing 8 outputs at a time with each block of x widened once |
+| `embed.c` | a Q8_0 table: d · q, exact in f32, then the output's rounding |
+| `cuda/q8_0.cuh` | private, device code: a half-warp per dot product (lane j takes the blocks b with b mod 16 = j, the xor butterfly is the canonical tree); 16 blocks (544 bytes) staged in shared memory with coalesced 16-byte loads, each lane reading its block as words shifted into place |
+| `cuda/matmul_q8_0.cu` | `q8_gemv` for up to 8 rows (decode: the output head, 509 MB in Q8_0, at 897 GB/s, the bf16 GEMV's 907), `q8_tile` for prompts (32 columns × 16 rows per block, the activations transposed in shared memory so that 4 loads feed 16 fused multiply-adds: about 9 TFLOPS, a twelfth of cuBLASLt's bf16, enough for step 12, where prefill has no gate), `q8_any` for K not a multiple of 512 or unaligned weights (one lane reads its own block) |
+| `cuda/embed.cu` | the Q8_0 lookup |
+
+All of them give `ath_matmul_ref`'s bits for any number of rows (`tests/test_ops.c`, `tests/test_gpu_ops.c`).
+
 ## Op list
 
 | Op | Content | Step |
 | --- | --- | --- |
-| `embed` | token embedding lookup | 3, 7 (GPU) |
+| `embed` | token embedding lookup; Q8_0 tables (step 12) | 3, 7 (GPU), 12 |
 | `norm` | RMSNorm (parameterization per contract), gated RMSNorm, L2 norm; the residual add fused into RMSNorm on the GPU | 3, 7 (GPU), 10 |
 | `rope` | rotary embedding, full or partial | 3, 7 (GPU) |
 | `act` | SwiGLU, sigmoid gates, residual add | 3, 7 (GPU) |
-| `matmul` | dense GEMM/GEMV for bf16 and f32 (cuBLASLt on the GPU); per-format GEMV/GEMM from phase 2 | 3 (ref), 4 (fast CPU), 7 (GPU), 9–10 (fast GPU) |
+| `matmul` | dense GEMM/GEMV for bf16 and f32 (cuBLASLt on the GPU); Q8_0 weights in the canonical order (step 12); the other formats from phase 2 | 3 (ref), 4 (fast CPU), 7 (GPU), 9–10 (fast GPU), 12 (Q8_0) |
 | `attn` | causal attention with GQA: naive reference; split-K decode and tensor-core prefill on GPU | 3, 7, 9, 10 |
 | `conv` | short depthwise causal conv1d with state | 3, 7 (GPU) |
 | `scatter` | rows written at given rows (the KV cache by position) | 9 |

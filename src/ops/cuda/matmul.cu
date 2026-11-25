@@ -357,6 +357,8 @@ extern "C" ath_status ath_matmul_launch(const ath_device *d, const ath_tensor *x
     const int64_t N = K > 0 ? ath_tensor_numel(x) / K : ath_tensor_numel(out) / (M > 0 ? M : 1);
     if (N * M == 0)
         return ATH_OK;
+    if (w->dtype == ATH_DTYPE_Q8_0)                /* step 12: matmul_q8_0.cu */
+        return ath_matmul_q8_0_launch(d, x, w, out);
     if (K == 0)                                    /* empty sums: zeros, in either dtype */
         return ath_memset(d, out->data, 0, ath_tensor_nbytes(out), ATH_STREAM_COMPUTE);
     ATH_CHECK(ath_gpu_use(d));

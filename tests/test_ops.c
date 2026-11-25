@@ -7,6 +7,7 @@
 
 #include "core/arena.h"
 #include "ops/ops.h"
+#include "ops/q8_0.h"
 
 #include <float.h>
 
@@ -219,6 +220,122 @@ ATH_TEST(matmul_fast_same_bits)
     ath_tensor xv = x;
     xv.tier = ATH_TIER_VRAM;
     ATH_EXPECT_STATUS(ath_matmul_fast(&xv, &w, &out, &pool), ATH_ERR_UNSUPPORTED);
+}
+
+/* ---- Q8_0 (step 12) ---------------------------------------------------------- */
+
+/* A random Q8_0 [M, K] weight: per block a scale of about 1/127 times a
+ * random magnitude in f16, and int8 values in [-127, 127]. */
+static ath_tensor random_q8_0(int64_t M, int64_t K)
+{
+    ath_tensor t = mk(ATH_DTYPE_Q8_0, 2, (const int64_t[]){M, K}, NULL);
+    uint8_t *p = t.data;
+    for (int64_t b = 0; b < M * K / 32; b++, p += 34) {
+        /* f16 scales between 2^-10 and 2^-6: exponents 5 .. 9, a random mantissa */
+        const uint16_t h = (uint16_t)(((5 + (b % 5)) << 10) | ((uint16_t)((rnd() + 1.0f) * 511.0f) & 0x3ff));
+        p[0] = (uint8_t)h;
+        p[1] = (uint8_t)(h >> 8);
+        for (int i = 0; i < 32; i++)
+            p[2 + i] = (uint8_t)(int8_t)(rnd() * 127.0f);
+    }
+    return t;
+}
+
+/* Element m, k of a Q8_0 weight, exactly. */
+static double q8_0_at(const ath_tensor *w, int64_t m, int64_t k)
+{
+    const uint8_t *blk = (const uint8_t *)w->data + (m * w->shape[1] + k) / 32 * 34;
+    const uint16_t h = (uint16_t)(blk[0] | blk[1] << 8);
+    return (double)ath_f16_to_f32(h) * (double)(int8_t)blk[2 + k % 32];
+}
+
+ATH_TEST(q8_0_f16_and_exp)
+{
+    ATH_EXPECT(ath_f16_to_f32(0x3c00) == 1.0f && ath_f16_to_f32(0x3800) == 0.5f);
+    ATH_EXPECT(ath_f16_to_f32(0xc000) == -2.0f && ath_f16_to_f32(0x7bff) == 65504.0f);
+    ATH_EXPECT(ath_f16_to_f32(0x0001) == ldexpf(1.0f, -24) && ath_f16_to_f32(0x03ff) == ldexpf(1023.0f, -24));
+    ATH_EXPECT(isinf(ath_f16_to_f32(0x7c00)) && isnan(ath_f16_to_f32(0x7e00)));
+    ATH_EXPECT(signbit(ath_f16_to_f32(0x8000)) && ath_f16_to_f32(0x8000) == 0.0f);
+
+    /* the canonical exponential: within 2 ulp of exp (in double) on [-87, 88] */
+    ATH_EXPECT(ath_q8_expf(0.0f) == 1.0f);
+    double worst = 0;
+    for (int i = 0; i < 175000; i++) {
+        const float x = -87.0f + (float)i * 1e-3f;   /* below 88: the clamp starts there */
+        const double e = exp((double)x), got = ath_q8_expf(x);
+        const double ulp = ldexp(1.0, ilogb(e) - 23);
+        const double err = fabs(got - e) / ulp;
+        worst = err > worst ? err : worst;
+    }
+    ATH_EXPECT(worst <= 2.0);
+    ATH_EXPECT(ath_q8_expf(-1000.0f) == ath_q8_expf(-87.0f) && ath_q8_expf(1000.0f) == ath_q8_expf(88.0f));
+    ATH_EXPECT(isnan(ath_q8_expf(NAN)));
+    ATH_EXPECT(ath_q8_silu(0.0f) == 0.0f && fabsf(ath_q8_silu(1.0f) - 0.7310586f) < 1e-6f);
+    printf("  canonical expf: worst %.3f ulp of exp on [-87, 88]\n", worst);
+}
+
+ATH_TEST(matmul_q8_0)
+{
+    /* hand case: K = 64, two blocks; the canonical order is exact here */
+    ath_tensor w = mk(ATH_DTYPE_Q8_0, 2, (const int64_t[]){1, 64}, NULL);
+    uint8_t *p = w.data;
+    p[0] = 0x00; p[1] = 0x38;                      /* 0.5  */
+    p[34] = 0x00; p[35] = 0x40;                    /* 2.0  */
+    for (int i = 0; i < 32; i++) {
+        p[2 + i] = (uint8_t)(int8_t)(i - 16);
+        p[36 + i] = (uint8_t)(int8_t)(i % 3 - 1);
+    }
+    ath_tensor x = mk(ATH_DTYPE_F32, 2, (const int64_t[]){1, 64}, NULL);
+    double want = 0;
+    for (int k = 0; k < 64; k++) {
+        ath_store_f32(x.data, ATH_DTYPE_F32, k, (float)(k % 5) - 2.0f);
+        want += q8_0_at(&w, 0, k) * ((k % 5) - 2.0);
+    }
+    ath_tensor out = F(SHAPE(1, 1), NULL);
+    ATH_REQUIRE_OK(ath_matmul_ref(&x, &w, &out));
+    ATH_EXPECT(at(&out, 0) == (float)want);
+
+    /* random shapes: the reference within its error bound of the exact sum,
+     * the fast path the reference's bits with any number of threads */
+    static const int64_t shapes[][3] = {{1, 1, 32}, {1, 7, 64}, {2, 9, 512}, {3, 33, 544}, {1, 300, 2048}, {4, 17, 4096}};
+    static const ath_dtype dt[] = {ATH_DTYPE_BF16, ATH_DTYPE_F32};
+    double worst = 0;
+    for (size_t i = 0; i < ATH_ARRAY_LEN(shapes); i++)
+        for (int c = 0; c < 4; c++) {
+            const int64_t N = shapes[i][0], M = shapes[i][1], K = shapes[i][2];
+            ath_tensor xq = random_tensor(dt[c & 1], 2, (const int64_t[]){N, K});
+            ath_tensor wq = random_q8_0(M, K);
+            ath_tensor ref = mk(dt[c >> 1], 2, (const int64_t[]){N, M}, NULL);
+            ath_tensor ref32 = mk(ATH_DTYPE_F32, 2, (const int64_t[]){N, M}, NULL);
+            ath_tensor one = mk(dt[c >> 1], 2, (const int64_t[]){N, M}, NULL);
+            ath_tensor many = mk(dt[c >> 1], 2, (const int64_t[]){N, M}, NULL);
+            ATH_EXPECT_OK(ath_matmul_ref(&xq, &wq, &ref));
+            ATH_EXPECT_OK(ath_matmul_ref(&xq, &wq, &ref32));
+            ATH_EXPECT_OK(ath_matmul_fast(&xq, &wq, &one, NULL));
+            ATH_EXPECT_OK(ath_matmul_fast(&xq, &wq, &many, &pool));
+            ATH_EXPECT(same_bits(&ref, &one));
+            ATH_EXPECT(same_bits(&ref, &many));
+            /* error bound of a sum of K terms in fp32: K · 2^-24 · Σ|w x|
+             * (a loose form of the classic bound, enough for a check) */
+            for (int64_t r = 0; r < N; r++)
+                for (int64_t m = 0; m < M; m++) {
+                    double exact = 0, mag = 0;
+                    for (int64_t k = 0; k < K; k++) {
+                        const double t = q8_0_at(&wq, m, k) * (double)at(&xq, r * K + k);
+                        exact += t;
+                        mag += fabs(t);
+                    }
+                    const double err = fabs((double)at(&ref32, r * M + m) - exact);
+                    const double bound = (double)K * ldexp(1.0, -24) * mag;
+                    ATH_EXPECT(err <= bound);
+                    worst = mag > 0 && err / bound > worst ? err / bound : worst;
+                }
+        }
+    printf("  Q8_0 matmul: worst error %.3f of the bound K 2^-24 sum|w x|\n", worst);
+
+    /* rows must be whole blocks: the dtype refuses others; a Q8_0 x is refused */
+    ath_tensor xbad = mk(ATH_DTYPE_Q8_0, 2, (const int64_t[]){1, 64}, NULL);
+    ATH_EXPECT_STATUS(ath_matmul_ref(&xbad, &w, &out), ATH_ERR_TYPE);
 }
 
 /* ---- norms ------------------------------------------------------------------- */
@@ -599,6 +716,8 @@ static const ath_test_case tests[] = {
     ATH_TEST_ENTRY(embed_rows),
     ATH_TEST_ENTRY(matmul_small),
     ATH_TEST_ENTRY(matmul_fast_same_bits),
+    ATH_TEST_ENTRY(q8_0_f16_and_exp),
+    ATH_TEST_ENTRY(matmul_q8_0),
     ATH_TEST_ENTRY(rmsnorm_hand),
     ATH_TEST_ENTRY(rmsnorm_gated_hand),
     ATH_TEST_ENTRY(l2norm_hand),
