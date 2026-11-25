@@ -20,6 +20,7 @@ How to read it:
   - [Step 6: GPU backend](#step-6-gpu-backend)
   - [Step 7: GPU ops, one by one](#step-7-gpu-ops-one-by-one)
   - [Step 8: sequence state and engine](#step-8-sequence-state-and-engine)
+  - [Before step 9: source layout](#before-step-9-source-layout)
 - [Files by step](#files-by-step)
 
 ---
@@ -1056,6 +1057,25 @@ What was found while testing:
 
 ---
 
+### Before step 9: source layout
+
+Branch `step9-fast-decode`, before the first task of step 9, at the maintainer's request (2026-11-25; the options and the reasons are in the log of `STATUS.md`). Code is grouped by layer, then by language: portable C at the root of a module, CUDA C in its `cuda/` folder.
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `src/backend/cuda/gpu.cu`, `gpu.h`, `compat.h` | Moved | From `src/backend/`; include paths and comments only |
+| `src/ops/cuda/kernel.cuh`, `embed.cu`, `matmul.cu`, `norm.cu`, `rope.cu`, `act.cu`, `attn.cu`, `conv.cu`, `gdn.cu` | Moved | From `src/ops/`; include paths and comments only |
+| `Makefile` | Changed | GPU sources from `src/backend/cuda/` and `src/ops/cuda/`; `.cu` objects named `.o` again, since a kernel and its op's reference no longer share a directory |
+| `src/core/base.h`, `src/backend/backend.h`, `src/ops/ops.h`, `src/ops/launch.h`, `src/ops/matmul.c` | Changed | Comments that name the moved files; `launch.h` says why it stays at the root (the boundary between the C and the kernels) |
+| `src/backend/README.md` | Changed | Source layout (new section): the rule, the three places that hold GPU code, `hip/` and `metal/` if ever needed; the file table, object names, launchers, one source for two vendors |
+| `src/ops/README.md`, `src/models/qwen35/README.md`, `src/quant/README.md` | Changed | The kernels' paths; fused kernels in `src/models/<family>/cuda/fused.cu` |
+| `AGENTS.md` | Changed | Invariant 4 and the op checklist name `src/ops/cuda/<op>.cu` and `src/backend/cuda/compat.h`; Code style gets a Source layout row |
+| `docs/ARCHITECTURE.md`, `docs/PLAN.md`, `docs/program/PROGRAM.md` | Changed | The tree and rule 6; the Source layout decision, and the paths of steps 6 and 7 marked as moved; rows 7, 8 and 10 |
+
+The move: commit `7e8aaad`; the documentation: the commit that names it here.
+
+---
+
 ## Files by step
 
 Every file of the repository and the steps that created or changed it (documentation-only edits included).
@@ -1126,3 +1146,5 @@ Every file of the repository and the steps that created or changed it (documenta
 | `AGENTS.md` | | 2.3 | 3.7 | 4.8 | | |  |  |
 | `README.md` | closing | | | 4.8 | 5.9 | |  | 8.9 |
 | module READMEs | closing (`src/core`, `tests`, `tools`) | 2.2, 2.5, 2.6, 2.7 (`src/model`, `src/models/qwen35`, `tools`, `tests`) | 3.2, 3.3, 3.6, 3.7 (`src/core`, `src/ops`, `tests`, `tests/golden`, `src/backend`) | 4.6 (`src/model`, `src/models/qwen35`, `tests`, `tests/golden`); 4.7 (`src/core`, `src/ops`, `src/backend`, `src/model`, `src/models/qwen35`, `tests`); 4.8 (`src/model`, `src/models/qwen35`, `src/net`, `src/infer`, `src/text`, `tools`) | 5.9 (`src/core`, `src/text`, `src/ops`, `src/model`, `src/models/qwen35`, `tools`, `tests`) | 6.8 (`src/backend`, `src/core`, `tools`, `tests`) | 7.6 (`src/ops`, `src/backend`, `tests`, `src/core`) | 8.9 (`src/model`, `src/models/qwen35`, `src/infer`, `src/ops`, `src/backend`, `tools`, `tests`, `tests/golden`) |
+
+Before step 9 (source layout), `src/backend/{gpu.cu,gpu.h,compat.h}` moved to `src/backend/cuda/` and `src/ops/{kernel.cuh,*.cu}` to `src/ops/cuda/`. The rows above keep the paths the steps used.

@@ -1,12 +1,12 @@
 # src/ops
 
-Every numeric operator in athanor. Each op is a pair of files plus tests:
+Every numeric operator in athanor. Each op is a pair of files plus tests, the portable C at the root of the folder and the CUDA C in `cuda/` (`src/backend/README.md`, Source layout):
 
 ```
-src/ops/<op>.c    <op>_ref(): scalar, fp32 accumulation, obviously correct, never optimized
-                  <op>_fast(): optional SIMD/multithreaded CPU path, only for ops used on CPU at runtime
-src/ops/<op>.cu   GPU kernel(s), CUDA C compiled for CUDA and HIP
-tests/test_ops.c  ref vs golden data; GPU vs ref; fast vs ref
+src/ops/<op>.c        <op>_ref(): scalar, fp32 accumulation, obviously correct, never optimized
+                      <op>_fast(): optional SIMD/multithreaded CPU path, only for ops used on CPU at runtime
+src/ops/cuda/<op>.cu  GPU kernel(s), CUDA C compiled for CUDA and HIP
+tests/test_ops.c      ref vs golden data; GPU vs ref; fast vs ref
 ```
 
 `ops.h` declares the functions with their shapes, dtypes and math. Step 3 landed the CPU references; step 4 the first fast CPU path, `ath_matmul_fast`; step 7 a GPU kernel for every op of the forward pass, `ath_<op>_gpu`; step 8 one entry point per op, `ath_<op>(d, ...)` in `dispatch.c`, which a family's forward pass calls for both devices.
@@ -64,9 +64,9 @@ Every function is tested on hand-computed cases in `tests/test_ops.c` and agains
 | File | What it holds |
 | --- | --- |
 | `<op>.c` | `ath_<op>_gpu` next to `ath_<op>_ref`: the same argument checks (one `args` function per op, called with `OPS_HOST` or `OPS_GPU`), then the launcher |
-| `<op>.cu` | the kernels and the launcher `ath_<op>_launch` (C linkage), which makes the device current and queues the kernels |
-| `launch.h` | private: the launchers' declarations |
-| `kernel.cuh` | private, device code: `k_ld`/`k_st` (f32 and bf16, the host's rounding bit for bit), `k_warp_sum`, `k_block_sum`, `k_silu`, grid-stride loops |
+| `cuda/<op>.cu` | the kernels and the launcher `ath_<op>_launch` (C linkage), which makes the device current and queues the kernels |
+| `launch.h` | private: the launchers' declarations, the boundary between the C and the kernels |
+| `cuda/kernel.cuh` | private, device code: `k_ld`/`k_st` (f32 and bf16, the host's rounding bit for bit), `k_warp_sum`, `k_block_sum`, `k_silu`, grid-stride loops |
 | `gpu_none.c` | the launchers in a build without a GPU (`make`): `ATH_ERR_UNSUPPORTED`, after the `_gpu` function has checked its arguments |
 | `check.h` | `ops_place` (`OPS_PLACE`): every tensor on the host for `_ref` and `_fast`, on the device for `_gpu` |
 
@@ -113,5 +113,5 @@ Backward functions for each op are added in phase 4 (T1) in the same files, with
 ## Rules
 
 - Kernels are parameterized by shape; specializations for hot shapes (head dimension, group size) are instantiated by macros in one place per op.
-- Fused or model-specific kernels do not belong here: they go in `src/models/<family>/fused.cu`.
-- The `_ref` functions are the truth. Optimizations go in `_fast` or `.cu`, never in `_ref`.
+- Fused or model-specific kernels do not belong here: they go in `src/models/<family>/cuda/fused.cu`.
+- The `_ref` functions are the truth. Optimizations go in `_fast` or the kernels, never in `_ref`.

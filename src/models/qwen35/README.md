@@ -11,7 +11,7 @@ The Qwen hybrid family (Qwen3.5, Qwen3.6, Qwen3.8 dense and MoE). The only direc
 | `forward.c` | the forward pass from the ops' entry points (`src/ops/dispatch.c`), one composition for both devices: on the CPU the reference ops with `ath_matmul_fast` (the same bits as `ath_matmul_ref`, on the caller's pool), on a GPU the kernels of step 7, with the params' device copies and device scratch memory (step 8): embedding, per layer the Gated DeltaNet or attention mixer and the MLP with their norms and residual additions, final norm, fp32 logits; one path for prefill, pieces and decode; KV, conv and recurrent state in the buffers of the state specs; activations in the state's dtype; calls `on_residual` at every layer boundary. MoE layers fail with `ATH_ERR_UNSUPPORTED` until step 12 | 4, 8 |
 | `text.c` | pre-tokenization (the `tokenizer.json` regex by hand, `ath_qwen35_pretokenize_regex`), chat template with tool definitions and thinking switch (`chat_template.jinja` by hand), incremental output parser (thinking blocks, tool calls with arguments typed by the tool's schema) | 5 |
 | `backward.c` | per-block backward | T1 |
-| `fused.cu` | optional fused kernels, admitted only with a benchmark | 9+ |
+| `cuda/fused.cu` | optional fused kernels, admitted only with a benchmark | 9+ |
 
 The exact markup of the chat template (roles, tool definitions, tool calls and results, thinking blocks) must be taken from the reference chat template shipped with the checkpoint (`tokenizer_config.json` or `chat_template.jinja`) and recorded in `docs/contract/`, never guessed; the rendered prompts are compared byte for byte with the reference's (`tests/test_text.c`).
 

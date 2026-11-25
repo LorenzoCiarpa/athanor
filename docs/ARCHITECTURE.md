@@ -214,7 +214,7 @@ The family list is compiled in from the Makefile: `FAMILIES=qwen35` generates `b
 | inference engine: states, scheduler, sampling, MoE tiering, speculative decoding | `forward.c` and later `backward.c`: composition of ops per block |
 | quantization formats, algorithms, recipes driven by roles | `text.c`: pre-tokenization split, chat template with tool definitions and thinking switch, output parser (thinking blocks, tool calls): tool rendering and output parsing are family-specific |
 | abliteration driven by hooks and flags | default quantization recipe (which tensors are sensitive) |
-| training: optimizers, LoRA, hot/cold layout, planner, data | optional fused kernels in `fused.cu`, admitted only with a benchmark |
+| training: optimizers, LoRA, hot/cold layout, planner, data | optional fused kernels in `cuda/fused.cu`, admitted only with a benchmark |
 | server (API formats: conversion of output events to OpenAI `tool_calls` and Anthropic `tool_use`), tools, test harness | golden test configuration |
 
 ## Adding models
@@ -238,14 +238,16 @@ athanor/
 ├── include/athanor.h            public C API
 ├── src/
 │   ├── core/      base.c arena.c buf.c tensor.c file.c json.c safetensors.c threads.c rng.c (each with its .h)
-│   ├── backend/   backend.h compat.h gpu.cu gpu_none.c devarena.c (step 6), gpu.h (step 7), cpu.c (later)
-│   ├── ops/       ops.h, check.h (private); per op a .c reference and a .cu kernel:
+│   ├── backend/   backend.h gpu_none.c devarena.c (step 6), cpu.c (later)
+│   │   └── cuda/  gpu.cu compat.h (step 6), gpu.h (step 7)
+│   ├── ops/       ops.h, check.h (private); per op a .c reference here and a .cu kernel in cuda/:
 │   │              embed matmul norm rope act attn conv gdn (step 3, kernels step 7), sample (step 5), moe quant;
-│   │              launch.h kernel.cuh gpu_none.c (private, step 7); dispatch.c (step 8)
+│   │              launch.h gpu_none.c (private, step 7); dispatch.c (step 8)
+│   │   └── cuda/  <op>.cu, kernel.cuh (private, step 7)
 │   ├── text/      bpe.c unicode.c, unicode_tables.h (generated, committed)
 │   ├── model/     model.h registry.c state.c text.c
 │   ├── models/
-│   │   └── qwen35/  qwen35.h family.c config.c weights.c forward.c text.c [backward.c] [fused.cu]
+│   │   └── qwen35/  qwen35.h family.c config.c weights.c forward.c text.c [backward.c] [cuda/fused.cu]
 │   ├── infer/     engine.h engine.c (step 8), state.c sched.c tier.c spec.c (later)
 │   ├── quant/     formats.c rtn.c gptq.c awq.c recipe.c container.c gguf.c eval.c
 │   ├── ablit/     capture.c direction.c edit.c search.c eval.c
@@ -279,3 +281,4 @@ athanor/
 3. Fused kernels live in the family folder, need a benchmark that shows the gain, and keep the op composition as fallback and reference.
 4. No model names outside `src/models/`.
 5. A pipeline that needs new information extends the contract, never works around it.
+6. Code is grouped by layer, then by language: portable C at the root of a module, GPU code in a folder named after its language, `cuda/` (CUDA C, which hipcc also compiles), with `hip/` or `metal/` beside it only if ever needed. Today GPU code lives in `src/backend/cuda/`, `src/ops/cuda/` and, for fused kernels, `src/models/<family>/cuda/` (`src/backend/README.md`, Source layout; decided 2026-11-25).

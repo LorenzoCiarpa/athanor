@@ -10,6 +10,7 @@ Within inference, the first five steps run on the CPU only. They produce a slow 
 | --- | --- | --- |
 | Name | athanor; binary `athanor`; prefix `ath_`; container extension `.ath` | decided |
 | Languages | C11 host code; CUDA C kernels compiled by nvcc and, through `compat.h`, by hipcc | decided |
+| Source layout | by layer, then by language: portable C at the root of a module, CUDA C in its `cuda/` folder (one source for nvcc and hipcc); `hip/` for kernels whose AMD form cannot share the source and `metal/` for a Metal port, only if needed (`src/backend/README.md`, Source layout) | decided 2026-11-25, before step 9, at the maintainer's request |
 | Dependencies | libc, libm, pthreads, POSIX, CUDA toolkit, ROCm; Python only for golden data | decided |
 | License | MIT | decided |
 | Model family | Qwen hybrid line (Qwen3.5 / 3.6 / 3.8) | decided |
@@ -62,8 +63,8 @@ Training memory on 16 GB, weights plus optimizer, before activations:
 | 3 | CPU reference ops and golden harness | `src/ops/*.c`, `src/backend/cpu.c`, `tests/golden/dump.py`, `tests/test_ops.c` | every op within tolerance of golden tensors on real weights |
 | 4 | CPU forward | `src/models/qwen35/forward.c` | logits match the reference implementation on fixed prompts |
 | 5 | Tokenizer, sampling, CPU chat | `src/text/bpe.c`, `unicode.h`, `src/models/qwen35/text.c` (`pretokenize`, `chat` with tool definitions, `parse`), `src/ops/sample.c` | exact token round-trip on a corpus; first chat, slow and correct; rendered prompts byte-identical to the reference chat template for a fixture set with and without tools; parser fixtures pass (added by CHANGE-001) |
-| 6 | GPU backend | `src/backend/gpu.cu`, `compat.h` | allocation, copies, streams, events, timing on CUDA |
-| 7 | GPU ops, one by one | `src/ops/*.cu` | every kernel matches its CPU reference |
+| 6 | GPU backend | `src/backend/gpu.cu`, `compat.h` (in `src/backend/cuda/` since 2026-11-25) | allocation, copies, streams, events, timing on CUDA |
+| 7 | GPU ops, one by one | `src/ops/*.cu` (in `src/ops/cuda/` since 2026-11-25) | every kernel matches its CPU reference |
 | 8 | Sequence state and engine | `src/infer/state.c`, `engine.c` | GPU chat in bf16; greedy output identical to reference for 256 tokens on 50 prompts |
 | 9 | Fast decode and bench | fused GEMV, graph capture, GPU sampling, `athanor bench` | decode tok/s ≥ llama.cpp at batch 1, same model, precision and GPU |
 | 10 | Fast prefill | tiled attention, chunked Gated DeltaNet, GEMM path | prefill within 15% of vLLM for a single request |

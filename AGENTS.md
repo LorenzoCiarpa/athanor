@@ -19,7 +19,7 @@ athanor is a single C engine that runs, quantizes, abliterates and trains one fa
 1. **Dependencies point down only**: `tools → pipelines (infer, quant, ablit, train, net) → model contract → models/<family> → ops → backend → core`. Pipelines never include anything from `src/models/`. Families never include pipeline headers.
 2. **No model names outside `src/models/`.** No `if (qwen)` anywhere else. If a pipeline needs model-specific information, extend the contract in `src/model/model.h` (a new role, flag, state kind or hook) and document it in `docs/ARCHITECTURE.md`.
 3. **No external libraries.** Allowed: libc, libm, pthreads, POSIX, the CUDA toolkit (runtime, cuBLASLt) and ROCm (HIP runtime, hipBLASLt). Anything else requires an explicit decision recorded in `docs/PLAN.md`. Python is allowed only under `tests/golden/` and `tools/dev/` and never at runtime.
-4. **Every op has three parts**: a CPU reference in `src/ops/<op>.c`, a GPU kernel in `src/ops/<op>.cu`, and a test in `tests/` that compares them, plus golden data where available. No op lands without all three (the GPU kernel may arrive in a later step, but the reference and test come first).
+4. **Every op has three parts**: a CPU reference in `src/ops/<op>.c`, a GPU kernel in `src/ops/cuda/<op>.cu`, and a test in `tests/` that compares them, plus golden data where available. No op lands without all three (the GPU kernel may arrive in a later step, but the reference and test come first).
 5. **Never guess model math.** Dimensions, eps, rope parameters, head counts and layer types come from `config.json` and from `docs/contract/<model>.md`. If the contract says **verify**, check the reference implementation, record what you found in the contract file, then write code.
 6. **Numerics are protected.** A change that alters outputs must state why, keep golden tests green or update tolerances with a written justification, and report KL vs bf16 before and after.
 7. **Placement never changes results.** Where a tensor lives (VRAM, RAM, disk) must not change outputs.
@@ -50,7 +50,7 @@ Never rewrite history in `STATUS.md`, `PLAN.md` or `PROGRAM.md`: mark items done
 - [ ] Signature in `src/ops/ops.h`, documented (shapes, dtypes, layout)
 - [ ] `<op>_ref` in `src/ops/<op>.c`: scalar, fp32 accumulation, obviously correct, never optimized
 - [ ] Tests vs hand-computed values in `tests/test_ops.c`, and vs golden data: a record in `tests/golden/dump.py`, a handler and a justified tolerance in `tests/test_golden.c` (`tests/README.md`)
-- [ ] GPU kernel in `src/ops/<op>.cu`, compiled for CUDA and HIP through `src/backend/compat.h`
+- [ ] GPU kernel in `src/ops/cuda/<op>.cu`, compiled for CUDA and HIP through `src/backend/cuda/compat.h`
 - [ ] Test GPU vs CPU reference on random and real inputs
 - [ ] Optional `<op>_fast` CPU path only if the op runs on CPU at runtime (MoE experts), tested vs `_ref`
 
@@ -82,6 +82,7 @@ Never rewrite history in `STATUS.md`, `PLAN.md` or `PROGRAM.md`: mark items done
 | Globals | none, except the static family registry and constant tables |
 | Headers | one header per module; include what you use; no circular includes |
 | Files | one concept per file; split a file that passes about 800 lines |
+| Source layout | by layer, then by language: portable C at the root of a module, GPU code in a folder named after its language (`cuda/`: CUDA C, also compiled by hipcc; `hip/` or `metal/` only if ever needed). `src/backend/README.md`, Source layout |
 | Comments | explain *why* and the math; reference the contract section for model ops |
 | Docs and code language | English |
 
