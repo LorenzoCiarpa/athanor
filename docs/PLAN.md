@@ -68,7 +68,7 @@ Training memory on 16 GB, weights plus optimizer, before activations:
 | 8 | Sequence state and engine | `src/infer/state.c`, `engine.c` | GPU chat in bf16; greedy output identical to reference for 256 tokens on 50 prompts |
 | 9 | Fast decode and bench | fused GEMV, graph capture, GPU sampling, `athanor bench` | decode tok/s ≥ llama.cpp at batch 1, same model, precision and GPU |
 | 10 | Fast prefill | tiled attention, chunked Gated DeltaNet, GEMM path | prefill within 15% of vLLM for a single request |
-| 11 | HIP build | Makefile `hip` target, `compat.h` coverage | all tests green on AMD; performance report published |
+| 11 | HIP build | Makefile `hip` target, `compat.h` coverage | all tests green on AMD; performance report published. Postponed 2026-11-25 at the maintainer's request until AMD hardware is available (§2); step 12 goes first |
 | 12 | MoE and tiering | `src/ops/moe.*`, `src/infer/tier.c`, CPU `_fast` expert path | Qwen3.6-35B-A3B decode ≥ Strata on the same machine and quantization |
 | 13 | Server and MTP | `src/net/*`, `src/infer/spec.c` | works with Claude Code, Codex CLI and OpenCode; speculative-decoding speedup reported; tool-calling conformance: multi-turn sessions with tool calls succeed with Claude Code, OpenCode and Codex CLI on a fixed task set (added by CHANGE-001) |
 | 14 | Long context | KV quantization, state snapshots for prefix reuse; persistent prefix snapshots on disk keyed by a hash of the token prefix (added by CHANGE-001) | 128k context on Qwen3.5-9B in 16 GB; resume after restart; snapshot size reported per context length |

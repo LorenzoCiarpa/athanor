@@ -418,7 +418,9 @@ Result (2026-11-23, Qwen3.5-0.8B revision `2fc0636`, gcc 15.2, glibc 2.43):
 
 ## Next step (preview)
 
-**Step 11: HIP build.** The same sources compiled by hipcc for AMD GPUs through `compat.h`: a Makefile target, hipBLASLt behind the matmul, the kernels written with NVIDIA's warp-level matrix instructions (`attn_mma.cu`) given an AMD form or left to their CUDA-core twins. Gate (`docs/PLAN.md`): all tests green on AMD, performance report published.
+**Step 12: MoE and tiering** (`docs/PLAN.md` §4), next after step 10: step 11 is postponed (log, 2026-11-25). Experts routed per token, the expert weights placed across VRAM, RAM and disk, a fast CPU path for the experts that stay in RAM. Gate (`docs/PLAN.md`): Qwen3.6-35B-A3B decode at least Strata's on the same machine and quantization.
+
+Postponed preview (written in step 10; the step waits for AMD hardware): **Step 11: HIP build.** The same sources compiled by hipcc for AMD GPUs through `compat.h`: a Makefile target, hipBLASLt behind the matmul, the kernels written with NVIDIA's warp-level matrix instructions (`attn_mma.cu`) given an AMD form or left to their CUDA-core twins. Gate (`docs/PLAN.md`): all tests green on AMD, performance report published.
 
 Superseded preview (written in step 9): **Step 10: fast prefill.** A prompt is a matrix product, not a series of vector products: tiled attention on tensor cores for long prompts, the chunked form of the Gated DeltaNet recurrence (the recurrent kernel of step 7 walks the prompt token by token), and the GEMM path tuned where cuBLASLt leaves time on the table. Gate (`docs/PLAN.md`): prefill within 15% of vLLM for a single request.
 
@@ -439,6 +441,17 @@ Superseded preview (written in step 3): **Step 4: CPU forward.** `src/models/qwe
 Superseded preview (written in step 2): **Step 3: CPU reference ops and golden harness.** `src/ops/*.c` references (scalar, fp32 accumulation) for every op in the contract, `src/backend/cpu.c`, `tests/golden/dump.py` against the pinned reference, `tests/test_ops.c`. Gate: every op within tolerance of golden tensors on real weights.
 
 Superseded preview (written in step 1): **Step 2: contract and family loading.** Write `src/model/model.h` as in `docs/ARCHITECTURE.md`, `registry.c`, and `src/models/qwen35/{config.c,weights.c}`: parse `config.json` into the layer schedule (which layers are Gated DeltaNet, which are full attention, MLP or MoE), bind every tensor to an `ath_param` with role, layer, expert and flags, and fail loudly on any unbound or missing tensor. `athanor inspect --roles` prints the result.
+
+## Possible later work
+
+Work measured and worth doing, not scheduled in a step. Each entry says where it comes from and what it is expected to give.
+
+- **The Gated DeltaNet of prompts on the tensor cores** (from step 10's comparison with vLLM). At 4096 tokens it takes 16.9 ms in athanor (fp32 on the CUDA cores) and 5.6 ms in vLLM (FlashInfer's `sm_120` kernels, operands in bf16 on the tensor cores): three quarters of the distance between the two at that length. Options: (a) operands rounded to bf16 as FlashInfer and flash-linear-attention do, about 10 ms less, a numerics change to check against step 8's gate and the forward records; (b) compensated precision, each fp32 operand split into two bf16 (x = hi + lo, three `mma` per product, about 16 bits of mantissa), about 5 to 7 ms less with errors much closer to fp32. Left as it is for now, at the maintainer's request (2026-11-25).
+- **Vectorized norms and elementwise kernels** (same comparison). The norms (with the fused residual add), SwiGLU and the attention gate write one bf16 per instruction; vLLM's write 16 bytes per lane: 4.3 against 1.4 ms (norms and RoPE) and 2.9 against 1.4 ms (SwiGLU and gate) at 4096 tokens. 16-byte loads and stores keep the bits: about 4 ms at 4096 tokens, more at 32k.
+- **Attention for prompts closer to FlashAttention-2's speed**: 6.2 against vLLM's 5.0 ms at 4096 tokens (81 TFLOPS at 32k), the largest item at 32k (about 320 of 784 ms).
+- **Merged projections** (qkv with z in the Gated DeltaNet, gate with up in the MLP, as vLLM loads them): fewer, larger GEMMs; the products were already at parity (39.0 against 38.5 ms), so a small gain, and it needs strided views in SwiGLU.
+
+The numbers: `docs/results/2026-11-25-step10-prefill/` and the vLLM profile in the log (2026-11-25). Together, the first two would bring a 4096-token prompt from 72 to about 57 to 58 ms of kernels, vLLM's forward pass alone.
 
 ## Open questions
 
@@ -577,4 +590,6 @@ Superseded preview (written in step 1): **Step 2: contract and family loading.**
   - The norm kernel and the Gated DeltaNet's recurrence are specialized at compile time (an inlined body, the kind or the rows per warp a constant of each wrapper; no templates): with step 10's changes the norm kernel had grown to 7,700 instructions and decode, which launches it some 80 times per token between the GEMV kernels, measured 1% slower than step 9 (found in the first measurement session, whose files are kept in the report's `first-session/`). Specialized, decode is 1.5% faster than step 9's build back to back.
   - The report's measurements pause a minute before each tool: a partial run between two sessions found every tool 2 to 3% slower, and the GPU's counters show software power capping under sustained load.
 - 2026-11-25: step 10 done (all acceptance criteria met, table above); pushed on `step10-fast-prefill`, which also carries step 9 (`step9-fast-decode`, not merged): merging either into `main` is the maintainer's call.
+- 2026-11-25: vLLM profiled on the 4096-token request (Nsight Systems, `--cuda-graph-trace=node`, `VLLM_ENABLE_V1_MULTIPROCESSING=0`), one forward pass: 57.3 ms of kernels in 60.2. Matrix products 39.0 ms (athanor 38.5), Gated DeltaNet 5.6 ms (FlashInfer `CPDeltaRule*Sm120`: T and MN precompute, prefill, fixup; athanor 16.9), attention 5.0 ms (FlashAttention split-KV; athanor 6.2), convolution 2.0 + fused post-convolution 1.9 ms (athanor 3.1), SwiGLU 1.3 ms, norms 1.4 ms (`fused_add_rmsnorm` 12 µs per call against athanor's 48: vectorized stores). The distance and what would close it: Possible later work.
+- 2026-11-25: step 11 (HIP build) postponed at the maintainer's request: there is no AMD GPU to run it on (`docs/PLAN.md` §2, AMD GPU: none yet). Step 12 comes next; step 11 returns when AMD hardware is available. Until then the HIP half of `compat.h` stays uncompiled, and the tensor-core kernels of step 10 have no AMD form (`docs/PLAN.md`, step table).
 
