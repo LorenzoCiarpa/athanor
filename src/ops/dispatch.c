@@ -92,7 +92,9 @@ ath_status ath_gdn_gates(const ath_device *d, const ath_tensor *a, const ath_ten
 }
 
 ath_status ath_gdn(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
-                   const ath_tensor *g, const ath_tensor *beta, float q_scale, ath_tensor *state, ath_tensor *out)
+                   const ath_tensor *g, const ath_tensor *beta, float q_scale, ath_tensor *state,
+                   ath_dev_arena *scratch, ath_tensor *out)
 {
-    return d ? ath_gdn_gpu(d, q, k, v, g, beta, q_scale, state, out) : ath_gdn_ref(q, k, v, g, beta, q_scale, state, out);
+    return d ? ath_gdn_gpu(d, q, k, v, g, beta, q_scale, state, scratch, out)
+             : ath_gdn_ref(q, k, v, g, beta, q_scale, state, out);
 }

@@ -50,6 +50,20 @@ ath_status ath_attn_launch(const ath_device *d, const ath_tensor *q, const ath_t
     return none("attn");
 }
 
+bool ath_attn_mma_fits(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
+                       const ath_tensor *out)
+{
+    (void)d, (void)q, (void)k, (void)v, (void)out;
+    return false;
+}
+
+ath_status ath_attn_mma_launch(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
+                               const ath_tensor *pos, float scale, ath_tensor *out)
+{
+    (void)d, (void)q, (void)k, (void)v, (void)pos, (void)scale, (void)out;
+    return none("attn");
+}
+
 ath_status ath_conv_launch(const ath_device *d, const ath_tensor *x, const ath_tensor *w, ath_tensor *state,
                            ath_act act, ath_tensor *out)
 {
@@ -121,4 +135,25 @@ ath_status ath_matmul_swiglu_launch(const ath_device *d, const ath_tensor *x, co
 {
     (void)d, (void)x, (void)wg, (void)wu, (void)out;
     return none("matmul_swiglu");
+}
+
+bool ath_gdn_chunk_fits(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
+                        const ath_tensor *g)
+{
+    (void)d, (void)q, (void)k, (void)v, (void)g;
+    return false;
+}
+
+size_t ath_gdn_chunk_bytes(const ath_tensor *q, const ath_tensor *v)
+{
+    (void)q, (void)v;
+    return 0;
+}
+
+ath_status ath_gdn_chunk_launch(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
+                                const ath_tensor *g, const ath_tensor *beta, float q_scale, ath_tensor *state,
+                                void *work, ath_tensor *out)
+{
+    (void)d, (void)q, (void)k, (void)v, (void)g, (void)beta, (void)q_scale, (void)state, (void)work, (void)out;
+    return none("gdn");
 }

@@ -122,7 +122,10 @@ static const tolerance gpu_tolerances[] = {
     {"gdn_gates",     "g",         1e-5,      1e-5},
     /* 75 tokens of updates summed in another order */
     {"gdn",           "state_out", 5e-5,      5e-5},
-    {"attn",          "out",       ULP,       5e-5},
+    /* native: a prompt takes the tensor cores (step 10), whose probabilities
+     * are bf16: each weight moves by 2^-8 at most (test_gpu_ops,
+     * gpu_attn_mma, checks the bound); 1.03 ulp measured */
+    {"attn",          "out",       2 * ULP,   5e-5},
 };
 
 static const tolerance *gpu_tolerance_of(const char *op, const char *slot)
@@ -676,7 +679,7 @@ static void run_gdn(ctx *c)
         NEED(sg, qg, kg, yg);
         GPU_RUN(ath_l2norm_gpu(&c->gpu->d, dev(c, q), eps, qg));
         GPU_RUN(ath_l2norm_gpu(&c->gpu->d, dev(c, k), eps, kg));
-        GPU_RUN(ath_gdn_gpu(&c->gpu->d, qg, kg, dev(c, v), dev(c, g), dev(c, beta), q_scale, sg, yg));
+        GPU_RUN(ath_gdn_gpu(&c->gpu->d, qg, kg, dev(c, v), dev(c, g), dev(c, beta), q_scale, sg, &c->gpu->mem, yg));
         gpu_compare(c, "out", yg, y);
         gpu_compare(c, "state_out", sg, state);
     }

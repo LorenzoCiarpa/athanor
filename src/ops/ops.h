@@ -206,6 +206,13 @@ ath_status ath_attn_ref(const ath_tensor *q, const ath_tensor *k, const ath_tens
  * [0, S) gets a row of NaN. */
 #define ATH_ATTN_SPLIT 64
 #define ATH_ATTN_SPLIT_MAX_T 8
+/* From ATH_ATTN_MMA_MIN_T queries on (prompts, step 10), with bf16 q, k, v
+ * and out, d == dv a multiple of 16 up to 256, on an NVIDIA GPU of compute
+ * capability 8 or more: FlashAttention on the tensor cores (attn_mma.cu).
+ * Scores and sums are fp32 as above, the probabilities that multiply the
+ * values are rounded to bf16 (tests/README.md, Prompt kernels); every call
+ * of this kind gives a query the same bits whatever the other queries. */
+#define ATH_ATTN_MMA_MIN_T 16
 ath_status ath_attn_gpu(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
                         const ath_tensor *pos, float scale, ath_dev_arena *scratch, ath_tensor *out);
 
@@ -259,11 +266,18 @@ ath_status ath_gdn_ref(const ath_tensor *q, const ath_tensor *k, const ath_tenso
                        const ath_tensor *g, const ath_tensor *beta, float q_scale,
                        ath_tensor *state, ath_tensor *out);
 /* GPU: dk <= ATH_GDN_MAX_DK. The recurrent form, as the reference: one step
- * per token (the chunked form for long prompts is step 10). */
+ * per token. With a scratch arena, from ATH_GDN_CHUNK_MIN_T tokens on, f32
+ * q, k and g and dk, dv up to 128 (prompts, step 10): the chunked form of
+ * the reference (torch_chunk_gated_delta_rule, chunks of 64 tokens), which
+ * computes the same recurrence in fp32 with another order of operations
+ * (tests/README.md, Prompt kernels). Every call of this kind gives the same
+ * bits for a prompt fed whole or in pieces whose lengths are multiples of
+ * 64. */
 #define ATH_GDN_MAX_DK 256
+#define ATH_GDN_CHUNK_MIN_T 64
 ath_status ath_gdn_gpu(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
                        const ath_tensor *g, const ath_tensor *beta, float q_scale, ath_tensor *state,
-                       ath_tensor *out);
+                       ath_dev_arena *scratch, ath_tensor *out);
 
 /* ---- dispatch.c (step 8): one entry point per op ------------------------------
  *
@@ -291,7 +305,8 @@ ath_status ath_scatter_rows(const ath_device *d, const ath_tensor *src, const at
 ath_status ath_gdn_gates(const ath_device *d, const ath_tensor *a, const ath_tensor *b, const ath_tensor *a_log,
                          const ath_tensor *dt_bias, ath_tensor *g, ath_tensor *beta);
 ath_status ath_gdn(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
-                   const ath_tensor *g, const ath_tensor *beta, float q_scale, ath_tensor *state, ath_tensor *out);
+                   const ath_tensor *g, const ath_tensor *beta, float q_scale, ath_tensor *state,
+                   ath_dev_arena *scratch, ath_tensor *out);
 
 /* ---- sample.c (step 5) ----------------------------------------------------- */
 

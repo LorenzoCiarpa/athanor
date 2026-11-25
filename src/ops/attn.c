@@ -96,8 +96,11 @@ ath_status ath_attn_gpu(const ath_device *d, const ath_tensor *q, const ath_tens
     if (q->shape[2] > ATH_ATTN_MAX_DV)
         return ops_fail(ATH_ERR_UNSUPPORTED, op, "head dim %lld > %d on the GPU", (long long)q->shape[2],
                         ATH_ATTN_MAX_DV);
-    /* split-K: the partial softmax of every piece of every query, from scratch */
     const int64_t T = q->shape[0], nh = q->shape[1], S = k->shape[0], dv = v->shape[2];
+    /* prompts: the tensor cores, where the kernel takes the tensors (step 10) */
+    if (T >= ATH_ATTN_MMA_MIN_T && ath_attn_mma_fits(d, q, k, v, out))
+        return ath_attn_mma_launch(d, q, k, v, pos, scale, out);
+    /* split-K: the partial softmax of every piece of every query, from scratch */
     float *part = NULL;
     ath_dev_arena_pos mark = {0};
     if (scratch && T <= ATH_ATTN_SPLIT_MAX_T && T > 0) {

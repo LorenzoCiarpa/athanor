@@ -230,7 +230,7 @@ ATH_TEST(gpu_argument_checks)
     ath_tensor gq = fake(ATH_DTYPE_F32, ATH_TIER_VRAM, SHAPE(1, 1, ATH_GDN_MAX_DK + 1));
     ath_tensor gv = fake(ATH_DTYPE_F32, ATH_TIER_VRAM, SHAPE(1, 1, 8)), gg = fake(ATH_DTYPE_F32, ATH_TIER_VRAM, SHAPE(1, 1));
     ath_tensor gs = fake(ATH_DTYPE_F32, ATH_TIER_VRAM, SHAPE(1, ATH_GDN_MAX_DK + 1, 8));
-    ATH_EXPECT_STATUS(ath_gdn_gpu(d, &gq, &gq, &gv, &gg, &gg, 1.0f, &gs, &gv), ATH_ERR_UNSUPPORTED);
+    ATH_EXPECT_STATUS(ath_gdn_gpu(d, &gq, &gq, &gv, &gg, &gg, 1.0f, &gs, NULL, &gv), ATH_ERR_UNSUPPORTED);
     ath_tensor rx = fake(ATH_DTYPE_F32, ATH_TIER_VRAM, SHAPE(1, 1, ATH_ROPE_MAX_DIM + 2));
     ath_tensor rp = fake(ATH_DTYPE_I32, ATH_TIER_VRAM, SHAPE(1));
     ATH_EXPECT_STATUS(ath_rope_gpu(d, &rx, &rp, ATH_ROPE_MAX_DIM + 2, 1e4f, &rx), ATH_ERR_UNSUPPORTED);
@@ -654,11 +654,14 @@ ATH_TEST(gpu_attn)
         attn_case(t_, &g, cfg[c][0], cfg[c][1], 1, 300, 6, 3, 100, 1024);  /* one token, a long cache */
     }
 
-    /* decode equals the last row of the prompt, bit for bit */
+    /* decode equals the last row of a prompt short enough not to take the
+     * tensor cores, bit for bit (the long prompts: gpu_attn_mma) */
     ath_tensor q = rand_t(&g, ATH_DTYPE_BF16, -1, 1, SHAPE(70, 8, 256)), k = rand_t(&g, ATH_DTYPE_BF16, -1, 1, SHAPE(70, 2, 256));
     ath_tensor v = rand_t(&g, ATH_DTYPE_BF16, -1, 1, SHAPE(70, 2, 256)), o = host(&g, ATH_DTYPE_BF16, SHAPE(70, 8, 256));
-    ath_tensor qd = up(&g, &q), kd = up(&g, &k), vd = up(&g, &v), od = up(&g, &o), q1, o1, last;
-    ATH_EXPECT_OK(ath_attn_gpu(&g.d, &qd, &kd, &vd, NULL, 0.0625f, NULL, &od));
+    ath_tensor qd = up(&g, &q), kd = up(&g, &k), vd = up(&g, &v), od = up(&g, &o), q1, o1, last, qs, os;
+    ATH_REQUIRE_OK(ath_tensor_slice(&qd, 0, 70 - (ATH_ATTN_MMA_MIN_T - 1), ATH_ATTN_MMA_MIN_T - 1, &qs));
+    ATH_REQUIRE_OK(ath_tensor_slice(&od, 0, 70 - (ATH_ATTN_MMA_MIN_T - 1), ATH_ATTN_MMA_MIN_T - 1, &os));
+    ATH_EXPECT_OK(ath_attn_gpu(&g.d, &qs, &kd, &vd, NULL, 0.0625f, NULL, &os));
     ATH_REQUIRE_OK(ath_tensor_slice(&qd, 0, 69, 1, &q1));
     ath_tensor o1h = host(&g, ATH_DTYPE_BF16, SHAPE(1, 8, 256));
     o1 = up(&g, &o1h);
@@ -683,6 +686,102 @@ ATH_TEST(gpu_attn)
     ATH_EXPECT_OK(ath_attn_gpu(&g.d, &q1, &kd, &vd, &pd, 0.0625f, &g.dev, &o2));
     ath_tensor nan_row = down(&g, &o2);
     ATH_EXPECT(isnan(ath_load_f32(nan_row.data, nan_row.dtype, 0)));
+    gpu_close(&g);
+}
+
+/* Prompts on the tensor cores (step 10). The probabilities are rounded to
+ * bf16 before they multiply the values (ops.h), which moves every weight by
+ * a relative 2^-8 at most: out = Σ w_j v_j with Σ w_j = 1 moves by at most
+ * 2^-8 Σ_j w_j |v_j − out| <= 2^-8 (A + |out|), A the same attention over
+ * |v|. Against the reference in fp32, plus the rounding of the output to
+ * bf16 (2^-8 |got|) and a little for the fp32 sums. The scale is larger than
+ * a model's, so that the softmax is peaked and a key taken or missed by
+ * mistake shows. */
+static void attn_mma_case(ath_test *t_, gpu *g, int64_t T, int64_t S, int64_t nh, int64_t nkv, int64_t d,
+                            const int32_t *p)
+{
+    ath_tensor q = rand_t(g, ATH_DTYPE_BF16, -1, 1, SHAPE(T, nh, d)), k = rand_t(g, ATH_DTYPE_BF16, -1, 1, SHAPE(S, nkv, d));
+    ath_tensor v = rand_t(g, ATH_DTYPE_BF16, -1, 1, SHAPE(S, nkv, d)), va = host(g, ATH_DTYPE_BF16, SHAPE(S, nkv, d));
+    for (int64_t i = 0; i < ath_tensor_numel(&v); i++)
+        ath_store_f32(va.data, ATH_DTYPE_BF16, i, fabsf(ath_load_f32(v.data, ATH_DTYPE_BF16, i)));
+    ath_tensor pos = host(g, ATH_DTYPE_I32, SHAPE(T));
+    if (p)
+        memcpy(pos.data, p, (size_t)T * sizeof *p);
+    ath_tensor want = host(g, ATH_DTYPE_F32, SHAPE(T, nh, d)), wabs = host(g, ATH_DTYPE_F32, SHAPE(T, nh, d));
+    const float scale = 0.25f;
+    ATH_REQUIRE_OK(ath_attn_ref(&q, &k, &v, p ? &pos : NULL, scale, &want));
+    ATH_REQUIRE_OK(ath_attn_ref(&q, &k, &va, p ? &pos : NULL, scale, &wabs));
+    ath_tensor oh = host(g, ATH_DTYPE_BF16, SHAPE(T, nh, d));
+    ath_tensor qd = up(g, &q), kd = up(g, &k), vd = up(g, &v), pd = up(g, &pos), od = up(g, &oh);
+    ATH_EXPECT_OK(ath_attn_gpu(&g->d, &qd, &kd, &vd, p ? &pd : NULL, scale, &g->dev, &od));
+    ath_tensor got = down(g, &od);
+    double worst = 0;
+    for (int64_t i = 0; i < ath_tensor_numel(&want); i++) {
+        const double w = ((const float *)want.data)[i], a = ((const float *)wabs.data)[i];
+        const double x = ath_load_f32(got.data, ATH_DTYPE_BF16, i);
+        const double bound = (a + fabs(w)) / 255 + fabs(x) / 256 + 1e-6;   /* 2^-8 / (1 - 2^-8), 2^-8 */
+        const double r = fabs(x - w) / bound;
+        if (!(r <= worst))
+            worst = isnan(r) ? INFINITY : r;
+    }
+    char what[96];
+    snprintf(what, sizeof what, "attn on tensor cores, T %lld S %lld heads %lld/%lld d %lld", (long long)T,
+             (long long)S, (long long)nh, (long long)nkv, (long long)d);
+    if (getenv("ATH_GPU_OPS_DETAIL") || worst > 1)
+        printf("    %-56s error %.2f of its bound\n", what, worst);
+    ATH_EXPECT(worst <= 1);
+}
+
+ATH_TEST(gpu_attn_mma)
+{
+    gpu g;
+    GPU_OR_SKIP(g);
+    attn_mma_case(t_, &g, 200, 200, 8, 2, 256, NULL);    /* the 0.8B heads, a prompt of 3 + tiles */
+    attn_mma_case(t_, &g, 130, 300, 8, 2, 256, NULL);    /* the last 130 of 300 positions        */
+    attn_mma_case(t_, &g, 64, 64, 4, 4, 128, NULL);      /* one tile, no grouping, d 128         */
+    attn_mma_case(t_, &g, 77, 77, 6, 2, 64, NULL);       /* d 64, rows past T in the last block   */
+    int32_t p[40];
+    for (int i = 0; i < 40; i++)
+        p[i] = (i * 97 + 13) % 1000;                      /* positions anywhere in a cache of 1000 */
+    attn_mma_case(t_, &g, 40, 1000, 8, 2, 256, p);
+
+    /* a prompt in pieces of at least ATH_ATTN_MMA_MIN_T queries, each over the
+     * whole cache with its positions, gives the bits of the prompt at once;
+     * decoding the last token gives the last row within the bound above */
+    const int64_t T = 150, nh = 8, nkv = 2, d = 256;
+    ath_tensor q = rand_t(&g, ATH_DTYPE_BF16, -1, 1, SHAPE(T, nh, d)), k = rand_t(&g, ATH_DTYPE_BF16, -1, 1, SHAPE(T, nkv, d));
+    ath_tensor v = rand_t(&g, ATH_DTYPE_BF16, -1, 1, SHAPE(T, nkv, d)), o = host(&g, ATH_DTYPE_BF16, SHAPE(T, nh, d));
+    ath_tensor ph = host(&g, ATH_DTYPE_I32, SHAPE(T));
+    for (int64_t t = 0; t < T; t++)
+        ((int32_t *)ph.data)[t] = (int32_t)t;
+    ath_tensor qd = up(&g, &q), kd = up(&g, &k), vd = up(&g, &v), pd = up(&g, &ph), all = up(&g, &o), parts = up(&g, &o);
+    ATH_EXPECT_OK(ath_attn_gpu(&g.d, &qd, &kd, &vd, &pd, 0.0625f, &g.dev, &all));
+    const int64_t cuts[] = {0, 16, 90, 150};
+    for (int i = 0; i < 3; i++) {
+        ath_tensor qp, pp, op;
+        ATH_REQUIRE_OK(ath_tensor_slice(&qd, 0, cuts[i], cuts[i + 1] - cuts[i], &qp));
+        ATH_REQUIRE_OK(ath_tensor_slice(&pd, 0, cuts[i], cuts[i + 1] - cuts[i], &pp));
+        ATH_REQUIRE_OK(ath_tensor_slice(&parts, 0, cuts[i], cuts[i + 1] - cuts[i], &op));
+        ATH_EXPECT_OK(ath_attn_gpu(&g.d, &qp, &kd, &vd, &pp, 0.0625f, &g.dev, &op));
+    }
+    ATH_EXPECT(same_bits(&g, &all, &parts));
+
+    /* a position outside the cache: a row of NaN, the other rows as before */
+    ((int32_t *)ph.data)[100] = (int32_t)T;
+    ath_tensor pbad = up(&g, &ph), bad = up(&g, &o);
+    ATH_EXPECT_OK(ath_attn_gpu(&g.d, &qd, &kd, &vd, &pbad, 0.0625f, &g.dev, &bad));
+    ath_tensor bh = down(&g, &bad), ah = down(&g, &all);
+    bool nan_row = true, others = true;
+    for (int64_t i = 0; i < T * nh * d; i++) {
+        const bool in_row = i / (nh * d) == 100;
+        const float x = ath_load_f32(bh.data, ATH_DTYPE_BF16, i);
+        if (in_row)
+            nan_row = nan_row && isnan(x);
+        else
+            others = others && ((uint16_t *)bh.data)[i] == ((uint16_t *)ah.data)[i];
+    }
+    ATH_EXPECT(nan_row);
+    ATH_EXPECT(others);
     gpu_close(&g);
 }
 
@@ -815,7 +914,7 @@ ATH_TEST(gpu_gdn)
             ath_tensor bd = up(&g, &in.beta), sd = up(&g, &in.state), out = up(&g, &want);
             const float q_scale = 1.0f / sqrtf((float)dk);
             ATH_REQUIRE_OK(ath_gdn_ref(&in.q, &in.k, &in.v, &in.g, &in.beta, q_scale, &in.state, &want));
-            ATH_EXPECT_OK(ath_gdn_gpu(&g.d, &qd, &kd, &vd, &gd, &bd, q_scale, &sd, &out));
+            ATH_EXPECT_OK(ath_gdn_gpu(&g.d, &qd, &kd, &vd, &gd, &bd, q_scale, &sd, NULL, &out));
             char what[96];
             snprintf(what, sizeof what, "gdn T %lld heads %lld/%lld dims %lld/%lld, %s", (long long)T, (long long)nk,
                      (long long)nv, (long long)dk, (long long)dv, dt_name(dts[c]));
@@ -830,7 +929,7 @@ ATH_TEST(gpu_gdn)
     ath_tensor o = host(&g, ATH_DTYPE_BF16, SHAPE(12, 4, 128));
     ath_tensor qd = up(&g, &in.q), kd = up(&g, &in.k), vd = up(&g, &in.v), gd = up(&g, &in.g), bd = up(&g, &in.beta);
     ath_tensor s_all = up(&g, &in.state), s_parts = up(&g, &in.state), o_all = up(&g, &o), o_parts = up(&g, &o);
-    ATH_EXPECT_OK(ath_gdn_gpu(&g.d, &qd, &kd, &vd, &gd, &bd, 0.088f, &s_all, &o_all));
+    ATH_EXPECT_OK(ath_gdn_gpu(&g.d, &qd, &kd, &vd, &gd, &bd, 0.088f, &s_all, NULL, &o_all));
     const int64_t cuts[] = {0, 5, 6, 12};
     for (int p = 0; p < 3; p++) {
         const int64_t t0 = cuts[p], n = cuts[p + 1] - cuts[p];
@@ -841,7 +940,64 @@ ATH_TEST(gpu_gdn)
         ATH_REQUIRE_OK(ath_tensor_slice(&gd, 0, t0, n, &a[3]));
         ATH_REQUIRE_OK(ath_tensor_slice(&bd, 0, t0, n, &a[4]));
         ATH_REQUIRE_OK(ath_tensor_slice(&o_parts, 0, t0, n, &a[5]));
-        ATH_EXPECT_OK(ath_gdn_gpu(&g.d, &a[0], &a[1], &a[2], &a[3], &a[4], 0.088f, &s_parts, &a[5]));
+        ATH_EXPECT_OK(ath_gdn_gpu(&g.d, &a[0], &a[1], &a[2], &a[3], &a[4], 0.088f, &s_parts, NULL, &a[5]));
+    }
+    ATH_EXPECT(same_bits(&g, &o_all, &o_parts));
+    ATH_EXPECT(same_bits(&g, &s_all, &s_parts));
+    gpu_close(&g);
+}
+
+/* The chunked form for prompts (step 10): from ATH_GDN_CHUNK_MIN_T tokens
+ * with a scratch arena. It computes the recurrence with another order of
+ * operations, in fp32 (tests/README.md, Prompt kernels). */
+ATH_TEST(gpu_gdn_chunk)
+{
+    gpu g;
+    GPU_OR_SKIP(g);
+    static const struct { int64_t T, nk, dk, nv, dv; } shapes[] = {
+        {64, 2, 128, 4, 128},     /* one chunk, two value heads per key head */
+        {200, 16, 128, 16, 128},  /* the 0.8B head counts, a partial last chunk */
+        {2100, 2, 128, 4, 128},   /* more than one round of chunks */
+        {100, 1, 100, 3, 100},    /* dims that are not multiples of 32 */
+        {70, 1, 64, 2, 96},       /* dk and dv apart */
+    };
+    const ath_dtype dts[] = {ATH_DTYPE_F32, ATH_DTYPE_BF16};
+    for (size_t s = 0; s < ATH_ARRAY_LEN(shapes); s++)
+        for (int c = 0; c < 2; c++) {
+            const int64_t T = shapes[s].T, nk = shapes[s].nk, dk = shapes[s].dk, nv = shapes[s].nv, dv = shapes[s].dv;
+            gdn_in in = gdn_inputs(&g, dts[c], T, nk, dk, nv, dv);
+            ath_tensor want = host(&g, dts[c], SHAPE(T, nv, dv));
+            ath_tensor qd = up(&g, &in.q), kd = up(&g, &in.k), vd = up(&g, &in.v), gd = up(&g, &in.g);
+            ath_tensor bd = up(&g, &in.beta), sd = up(&g, &in.state), out = up(&g, &want);
+            const float q_scale = 1.0f / sqrtf((float)dk);
+            ATH_REQUIRE_OK(ath_gdn_ref(&in.q, &in.k, &in.v, &in.g, &in.beta, q_scale, &in.state, &want));
+            ATH_EXPECT_OK(ath_gdn_gpu(&g.d, &qd, &kd, &vd, &gd, &bd, q_scale, &sd, &g.dev, &out));
+            char what[96];
+            snprintf(what, sizeof what, "gdn chunks T %lld heads %lld/%lld dims %lld/%lld, %s", (long long)T,
+                     (long long)nk, (long long)nv, (long long)dk, (long long)dv, dt_name(dts[c]));
+            EXPECT_CLOSE(g, what, out, want, 1e-4, 2);
+            snprintf(what, sizeof what, "gdn chunks state T %lld dims %lld/%lld, %s", (long long)T, (long long)dk,
+                     (long long)dv, dt_name(dts[c]));
+            EXPECT_CLOSE(g, what, sd, in.state, 1e-4, 0);
+        }
+
+    /* 256 tokens at once = 128 + 64 + 64: pieces of whole chunks, bit for bit */
+    gdn_in in = gdn_inputs(&g, ATH_DTYPE_BF16, 256, 2, 128, 4, 128);
+    ath_tensor o = host(&g, ATH_DTYPE_BF16, SHAPE(256, 4, 128));
+    ath_tensor qd = up(&g, &in.q), kd = up(&g, &in.k), vd = up(&g, &in.v), gd = up(&g, &in.g), bd = up(&g, &in.beta);
+    ath_tensor s_all = up(&g, &in.state), s_parts = up(&g, &in.state), o_all = up(&g, &o), o_parts = up(&g, &o);
+    ATH_EXPECT_OK(ath_gdn_gpu(&g.d, &qd, &kd, &vd, &gd, &bd, 0.088f, &s_all, &g.dev, &o_all));
+    const int64_t cuts[] = {0, 128, 192, 256};
+    for (int p = 0; p < 3; p++) {
+        const int64_t t0 = cuts[p], n = cuts[p + 1] - cuts[p];
+        ath_tensor a[6];
+        ATH_REQUIRE_OK(ath_tensor_slice(&qd, 0, t0, n, &a[0]));
+        ATH_REQUIRE_OK(ath_tensor_slice(&kd, 0, t0, n, &a[1]));
+        ATH_REQUIRE_OK(ath_tensor_slice(&vd, 0, t0, n, &a[2]));
+        ATH_REQUIRE_OK(ath_tensor_slice(&gd, 0, t0, n, &a[3]));
+        ATH_REQUIRE_OK(ath_tensor_slice(&bd, 0, t0, n, &a[4]));
+        ATH_REQUIRE_OK(ath_tensor_slice(&o_parts, 0, t0, n, &a[5]));
+        ATH_EXPECT_OK(ath_gdn_gpu(&g.d, &a[0], &a[1], &a[2], &a[3], &a[4], 0.088f, &s_parts, &g.dev, &a[5]));
     }
     ATH_EXPECT(same_bits(&g, &o_all, &o_parts));
     ATH_EXPECT(same_bits(&g, &s_all, &s_parts));
@@ -851,8 +1007,8 @@ ATH_TEST(gpu_gdn)
 static const ath_test_case tests[] = {
     ATH_TEST_ENTRY(gpu_argument_checks), ATH_TEST_ENTRY(gpu_embed),       ATH_TEST_ENTRY(gpu_matmul),      ATH_TEST_ENTRY(gpu_gemv), ATH_TEST_ENTRY(gpu_matmul_n), ATH_TEST_ENTRY(gpu_matmul_swiglu), ATH_TEST_ENTRY(gpu_scatter_rows), ATH_TEST_ENTRY(gpu_sample),
     ATH_TEST_ENTRY(gpu_norms),           ATH_TEST_ENTRY(gpu_rope),        ATH_TEST_ENTRY(gpu_elementwise),
-    ATH_TEST_ENTRY(gpu_attn),            ATH_TEST_ENTRY(gpu_conv),        ATH_TEST_ENTRY(gpu_gdn_gates),
-    ATH_TEST_ENTRY(gpu_gdn),
+    ATH_TEST_ENTRY(gpu_attn),            ATH_TEST_ENTRY(gpu_attn_mma),    ATH_TEST_ENTRY(gpu_conv),        ATH_TEST_ENTRY(gpu_gdn_gates),
+    ATH_TEST_ENTRY(gpu_gdn),             ATH_TEST_ENTRY(gpu_gdn_chunk),
 };
 
 int main(int argc, char **argv)

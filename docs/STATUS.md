@@ -6,11 +6,38 @@ This file is the overview. [`status_extended.md`](status_extended.md) goes one l
 
 ## Current step
 
-**Step 9: fast decode and bench** (see `docs/PLAN.md` §4). Started 2026-11-25 on branch `step9-fast-decode`, after the source layout change and the pipeline rule (log). **Done 2026-11-25** (pushed; merging into `main` is the maintainer's call); step 10 is next.
+**Step 10: fast prefill** (see `docs/PLAN.md` §4). Started 2026-11-25 on branch `step10-fast-prefill`, from `step9-fast-decode` (not merged into `main` yet: the maintainer's call).
+
+Goal: a prompt as matrix products. Step 9 left prefill slower than step 8: pp4096 at 8.6k tokens/s against llama.cpp's 45.4k. A profile of pp4096 (477 ms) gave attention 60% (each query walks its keys alone, on the CUDA cores), the Gated DeltaNet 28% (the recurrence, token by token), cuBLASLt's matrix products 8% (37 ms, about 110 TFLOPS, near the GPU's bf16 peak with fp32 accumulation) and the rest 3%. The gate of `docs/PLAN.md`: prefill tokens/s within 15% of vLLM's for a single request.
+
+### Tasks
+
+- [x] **10.1 The vLLM baseline.** vLLM at a recorded version in a virtual environment outside the repository (`~/opt`), on the same checkpoint in bf16, with the configuration its documentation recommends (its FlashInfer kernels downloaded, as it asks); single requests of 512, 4096 and 32768 tokens and one output token with `vllm bench latency` (prefix caching off), and the forward pass alone with `vllm bench forward`. Raw logs kept for the report.
+- [ ] **10.2 Tiled attention on the tensor cores.** For prompts in bf16: a block of 64 queries of one head walks tiles of 64 keys, scores and the weighted sum with `mma` (bf16 products, fp32 sums), the online softmax in fp32, keys past a query's position masked; positions as in step 9 (the whole cache, positions on the device).
+- [ ] **10.3 The chunked Gated DeltaNet.** The chunked form of the reference (`torch_chunk_gated_delta_rule`, chunks of 64 tokens), in fp32: in parallel over chunks the decays, the triangular solve and the matrices that do not depend on the state, then one pass over the chunks per head with the state; the recurrent kernel stays for decode and short pieces.
+- [ ] **10.4 The rest of a prompt.** What the profile shows after 10.2 and 10.3: the convolution, the norms, the copies and elementwise ops, the residual added in cuBLASLt's epilogue, the cuBLASLt plans cached per shape (moved here from task 9.2).
+- [ ] **10.5 Tests.** The new kernels against their references on random inputs and on the golden records, with tolerances justified in `tests/README.md`; pieces of a prompt against the prompt at once; the gates of step 8 on the new path; compute-sanitizer.
+- [ ] **10.6 Report and documentation.** The report under `docs/results/` with the raw logs of the three tools; READMEs, ARCHITECTURE, PROGRAM.md, this file and `status_extended.md`.
+
+### Acceptance criteria
+
+1. The gate: prefill tokens/s of a single request at 512, 4096 and 32768 tokens at least 85% of vLLM's, on the same checkpoint in bf16 on the RTX 5080; llama.cpp reported beside them; a report under `docs/results/` following `docs/BENCHMARKS.md`, with the raw logs of every tool.
+2. Numerics (invariant 6): the gates of step 8 still pass (50 prompts × 256 teacher-forced steps, 0 differences above each prompt's bf16 noise; the GPU forward records: pooled KL no larger than the bf16 reference's, greedy agreement above the noise, f32 within the step 4 tolerances), and the KL before and after is reported.
+3. Every new kernel matches its CPU reference within tolerances justified in `tests/README.md`, on random inputs and on the golden records.
+4. Decode keeps step 9's speed: tg128 at depth 0 at least llama.cpp's, as in step 9's report.
+5. The CPU forward pass is unchanged: every CPU number of `test_forward` and `test_text` as before.
+6. `make cuda test` green, also with `DEBUG=1`; `make test` green; compute-sanitizer clean on `test_engine` and `test_gpu_ops`; no warnings; `ldd` as in step 9.
+7. Documentation updated.
+
+## Completed steps
+
+### Step 9
+
+**Step 9: fast decode and bench** (see `docs/PLAN.md` §4). Started 2026-11-25 on branch `step9-fast-decode`, after the source layout change and the pipeline rule (log). **Done 2026-11-25** (pushed; merging into `main` is the maintainer's call); step 10 is next, started on a branch of its own from this one.
 
 Goal: decode at the speed of the memory. At batch 1 a token reads every weight once (1.5 GB for Qwen3.5-0.8B), about 1.6 ms at the RTX 5080's 960 GB/s; step 8 takes about 3.4 ms, the rest being fixed costs: some 520 kernel launches per token, a cuBLASLt plan and heuristic query rebuilt for each of 187 matmuls, and the logits copied to the host with a wait at every token. The gate of `docs/PLAN.md`: decode tokens/s at least llama.cpp's at batch 1, same model, precision and GPU.
 
-### Tasks
+#### Tasks
 
 - [x] **9.0 Before the first task.** Source layout by layer, then by language (`cuda/` folders); AGENTS.md invariant 11, pipelines hold no GPU code; ARCHITECTURE, Three names (log).
 - [x] **9.1 `athanor bench` and the baselines.** Decode tokens/s at batch 1 at context 0, 4k and 32k, prefill tokens/s at 512, 4k and 32k where it runs in reasonable time, TTFT, peak VRAM from the driver; warm-up, at least 5 measured runs, median with min and max; a JSON report with the fields of `docs/BENCHMARKS.md`. llama.cpp at a recorded commit, built for `sm_120`, on the same checkpoint converted to GGUF bf16, measured with `llama-bench` as its documentation recommends, raw logs kept. Nsight Systems from NVIDIA's redist archives for profiling. Measure step 8's engine first.
@@ -23,7 +50,7 @@ Goal: decode at the speed of the memory. At batch 1 a token reads every weight o
 - [x] **9.8 Tests.** The new kernels against their references, on random inputs and the golden records; positions and split-K attention; scatter; GPU sampling against `ath_sample_ref`; a replayed step against the same step run directly; the gates of step 8 on the new path; compute-sanitizer.
 - [x] **9.9 Report and documentation.** The report under `docs/results/` with raw logs; READMEs, ARCHITECTURE, PROGRAM.md, this file and `status_extended.md`.
 
-### Acceptance criteria
+#### Acceptance criteria
 
 1. The gate: `athanor bench` decodes at batch 1 and context 0 at least as many tokens per second as llama.cpp's `llama-bench` on the same checkpoint in bf16, on the RTX 5080; context 4k and 32k reported for both; a report under `docs/results/` following `docs/BENCHMARKS.md`, with the raw logs of both tools.
 2. Numerics (invariant 6): with the new kernels the gates of step 8 still pass (50 prompts × 256 teacher-forced steps, 0 differences above each prompt's bf16 noise; the GPU forward records: pooled KL no larger than the bf16 reference's, greedy agreement above the noise, f32 within the step 4 tolerances), and the KL before and after is reported.
@@ -46,8 +73,6 @@ Result (2026-11-25, RTX 5080 `sm_120`, driver 580.178.04 (CUDA 13.0), CUDA toolk
 | 7 | documentation | READMEs of `src/ops`, `src/backend`, `src/infer`, `src/model`, `src/models/qwen35`, `src/core`, `tools`, `tests`; `docs/ARCHITECTURE.md` (device batches, positions, the tree); `docs/program/PROGRAM.md` rows 6 and 8; `README.md`; the report; this file and `status_extended.md` |
 
 For the record, the chat: `athanor chat` answers at about 410 to 425 tokens/s on short answers (the first token from the prompt's logits, then the decoder).
-
-## Completed steps
 
 ### Step 8
 
@@ -381,7 +406,9 @@ Result (2026-11-23, Qwen3.5-0.8B revision `2fc0636`, gcc 15.2, glibc 2.43):
 
 ## Next step (preview)
 
-**Step 10: fast prefill.** A prompt is a matrix product, not a series of vector products: tiled attention on tensor cores for long prompts, the chunked form of the Gated DeltaNet recurrence (the recurrent kernel of step 7 walks the prompt token by token), and the GEMM path tuned where cuBLASLt leaves time on the table. Gate (`docs/PLAN.md`): prefill within 15% of vLLM for a single request.
+**Step 11: HIP build.** The same sources compiled by hipcc for AMD GPUs through `compat.h`: a Makefile target, hipBLASLt behind the matmul, the kernels written with NVIDIA's warp-level matrix instructions (`attn_mma.cu`) given an AMD form or left to their CUDA-core twins. Gate (`docs/PLAN.md`): all tests green on AMD, performance report published.
+
+Superseded preview (written in step 9): **Step 10: fast prefill.** A prompt is a matrix product, not a series of vector products: tiled attention on tensor cores for long prompts, the chunked form of the Gated DeltaNet recurrence (the recurrent kernel of step 7 walks the prompt token by token), and the GEMM path tuned where cuBLASLt leaves time on the table. Gate (`docs/PLAN.md`): prefill within 15% of vLLM for a single request.
 
 Superseded preview (written in step 8): **Step 9: fast decode and bench.** Decode at batch 1 reads every weight once per token, so its speed is the memory bandwidth: GEMV kernels of athanor's own for the matmuls of one token (fused where it pays), split-K attention for a long cache, graph capture so that a token is one launch, sampling on the GPU, and `athanor bench` with a report under `docs/results/` (`docs/BENCHMARKS.md`). Gate (`docs/PLAN.md`): decode tokens/s at least llama.cpp's at batch 1, same model, precision and GPU.
 

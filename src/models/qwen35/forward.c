@@ -289,7 +289,7 @@ static ath_status gated_deltanet(fwd *f, const ath_qwen35_layer *L, ath_tensor *
     ATH_CHECK(ath_gdn_gates(f->dev, &a, &b, W(f, L->a_log), W(f, L->dt_bias), &g, &beta));
     ATH_CHECK(wrap(f, &rec, ATH_DTYPE_F32, f->s->buf[L->recurrent], 3, nv, dk, dv));
     ATH_CHECK(tmp(f, &o, act, 3, T, nv, dv));
-    ATH_CHECK(ath_gdn(f->dev, &qn, &kn, &v, &g, &beta, (float)(1.0 / sqrt((double)dk)), &rec, &o));
+    ATH_CHECK(ath_gdn(f->dev, &qn, &kn, &v, &g, &beta, (float)(1.0 / sqrt((double)dk)), &rec, f->da, &o));
 
     /* gated RMSNorm per value head, then the output projection */
     ath_tensor o_rows, z_rows, on, on_flat;

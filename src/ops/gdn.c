@@ -127,11 +127,21 @@ ath_status ath_gdn_gates_gpu(const ath_device *d, const ath_tensor *a, const ath
 
 ath_status ath_gdn_gpu(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
                        const ath_tensor *g, const ath_tensor *beta, float q_scale, ath_tensor *state,
-                       ath_tensor *out)
+                       ath_dev_arena *scratch, ath_tensor *out)
 {
     ATH_CHECK(gdn_args(q, k, v, g, beta, state, out, OPS_GPU));
     if (q->shape[2] > ATH_GDN_MAX_DK)
         return ops_fail(ATH_ERR_UNSUPPORTED, gdn_op, "key head dim %lld > %d on the GPU", (long long)q->shape[2],
                         ATH_GDN_MAX_DK);
+    /* prompts: the chunked form, with its working memory from scratch (step 10) */
+    if (scratch && q->shape[0] >= ATH_GDN_CHUNK_MIN_T && ath_gdn_chunk_fits(d, q, k, v, g)) {
+        const ath_dev_arena_pos mark = ath_dev_arena_mark(scratch);
+        void *work = ath_dev_arena_alloc(scratch, ath_gdn_chunk_bytes(q, v), 0);
+        if (!work)
+            return ATH_ERR_NOMEM;
+        ath_status st = ath_gdn_chunk_launch(d, q, k, v, g, beta, q_scale, state, work, out);
+        ath_dev_arena_reset(scratch, mark);   /* the next work on the stream comes after the kernels */
+        return st;
+    }
     return ath_gdn_launch(d, q, k, v, g, beta, q_scale, state, out);
 }
