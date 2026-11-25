@@ -55,10 +55,10 @@ extern "C" ath_status ath_gdn_gates_launch(const ath_device *d, const ath_tensor
     return ath_gpu_launched("gates_kernel");
 }
 
-static __global__ void __launch_bounds__(GDN_WARPS *ATH_WARP)
-gdn_kernel(const void *q, int qdt, const void *k, int kdt, const void *v, int vdt, const void *g, int gdt,
-           const void *beta, int bdt, float q_scale, float l2_eps, float *state, void *out, int odt, int64_t T,
-           int64_t nk, int64_t dk, int64_t nv, int64_t dv, int64_t qs, int64_t ks, int64_t vs)
+static __device__ __forceinline__ void
+gdn_body(int rows_max, const void *q, int qdt, const void *k, int kdt, const void *v, int vdt, const void *g, int gdt,
+         const void *beta, int bdt, float q_scale, float l2_eps, float *state, void *out, int odt, int64_t T,
+         int64_t nk, int64_t dk, int64_t nv, int64_t dv, int64_t qs, int64_t ks, int64_t vs)
 {
     __shared__ float kq[2][ATH_GDN_MAX_DK];         /* the token's k and q, as given  */
     __shared__ float part[GDN_WARPS][ATH_WARP];      /* the warps' partial sums      */
@@ -74,6 +74,8 @@ gdn_kernel(const void *q, int qdt, const void *k, int kdt, const void *v, int vd
     float s[GDN_ROWS];
 #pragma unroll
     for (int r = 0; r < GDN_ROWS; r++) {
+        if (r >= rows_max)
+            break;
         const int64_t i = warp + (int64_t)r * GDN_WARPS;
         s[r] = live && i < dk ? S[i * dv + j] : 0.0f;
     }
@@ -101,6 +103,10 @@ gdn_kernel(const void *q, int qdt, const void *k, int kdt, const void *v, int vd
         float u = 0.0f;
 #pragma unroll
         for (int r = 0; r < GDN_ROWS; r++) {
+            if (r >= rows_max)
+                break;
+        if (r >= rows_max)
+            break;
             const int64_t i = warp + (int64_t)r * GDN_WARPS;
             if (i < dk) {
                 s[r] *= alpha;
@@ -116,6 +122,10 @@ gdn_kernel(const void *q, int qdt, const void *k, int kdt, const void *v, int vd
         float o = 0.0f;
 #pragma unroll
         for (int r = 0; r < GDN_ROWS; r++) {
+            if (r >= rows_max)
+                break;
+        if (r >= rows_max)
+            break;
             const int64_t i = warp + (int64_t)r * GDN_WARPS;
             if (i < dk) {
                 s[r] += (kq[0][i] * ik) * delta;
@@ -135,10 +145,33 @@ gdn_kernel(const void *q, int qdt, const void *k, int kdt, const void *v, int vd
     }
 #pragma unroll
     for (int r = 0; r < GDN_ROWS; r++) {
+        if (r >= rows_max)
+            break;
         const int64_t i = warp + (int64_t)r * GDN_WARPS;
         if (live && i < dk)
             S[i * dv + j] = s[r];
     }
+}
+
+/* The body with the rows a warp holds a constant: 32 for dk up to 128 (the
+ * family's heads), 64 up to ATH_GDN_MAX_DK. Half the code and registers for
+ * the common case; decode launches it 18 times per token (step 10). */
+static __global__ void __launch_bounds__(GDN_WARPS *ATH_WARP)
+gdn_kernel(const void *q, int qdt, const void *k, int kdt, const void *v, int vdt, const void *g, int gdt,
+           const void *beta, int bdt, float q_scale, float l2_eps, float *state, void *out, int odt, int64_t T,
+           int64_t nk, int64_t dk, int64_t nv, int64_t dv, int64_t qs, int64_t ks, int64_t vs)
+{
+    gdn_body(GDN_ROWS, q, qdt, k, kdt, v, vdt, g, gdt, beta, bdt, q_scale, l2_eps, state, out, odt, T, nk, dk, nv, dv,
+             qs, ks, vs);
+}
+
+static __global__ void __launch_bounds__(GDN_WARPS *ATH_WARP)
+gdn_kernel_128(const void *q, int qdt, const void *k, int kdt, const void *v, int vdt, const void *g, int gdt,
+               const void *beta, int bdt, float q_scale, float l2_eps, float *state, void *out, int odt, int64_t T,
+               int64_t nk, int64_t dk, int64_t nv, int64_t dv, int64_t qs, int64_t ks, int64_t vs)
+{
+    gdn_body(128 / GDN_WARPS, q, qdt, k, kdt, v, vdt, g, gdt, beta, bdt, q_scale, l2_eps, state, out, odt, T, nk, dk,
+             nv, dv, qs, ks, vs);
 }
 
 extern "C" ath_status ath_gdn_launch(const ath_device *d, const ath_tensor *q, const ath_tensor *k,
@@ -156,9 +189,9 @@ extern "C" ath_status ath_gdn_launch(const ath_device *d, const ath_tensor *q, c
     }
     ATH_CHECK(ath_gpu_use(d));
     const dim3 grid((unsigned)nv, (unsigned)col_blocks);
-    gdn_kernel<<<grid, GDN_WARPS * ATH_WARP, 0, k_stream(d)>>>(q->data, q->dtype, k->data, k->dtype, v->data, v->dtype,
-                                                               g->data, g->dtype, beta->data, beta->dtype, q_scale,
-                                                               l2_eps, (float *)state->data, out->data, out->dtype, T, nk, dk,
-                                                               nv, dv, q->stride[0], k->stride[0], v->stride[0]);
+    (dk <= 128 ? gdn_kernel_128 : gdn_kernel)<<<grid, GDN_WARPS * ATH_WARP, 0, k_stream(d)>>>(
+        q->data, q->dtype, k->data, k->dtype, v->data, v->dtype, g->data, g->dtype, beta->data, beta->dtype, q_scale,
+        l2_eps, (float *)state->data, out->data, out->dtype, T, nk, dk, nv, dv, q->stride[0], k->stride[0],
+        v->stride[0]);
     return ath_gpu_launched("gdn_kernel");
 }

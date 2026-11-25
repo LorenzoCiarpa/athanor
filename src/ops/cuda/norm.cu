@@ -40,20 +40,21 @@ static __device__ __forceinline__ float norm_one(int kind, float v, float inv, c
  * the warp); the sum goes over the row's lanes only, the same additions as
  * over the whole warp, whose other lanes added zeros. D % 8 == 0 and every
  * buffer on a 16-byte boundary (the launcher checks). */
-static __global__ void norm_warp(int kind, void *x, int xdt, const void *z, int zdt, const void *w, int wdt,
-                                 float w_offset, float eps, void *out, int odt, int64_t rows, int64_t D, int sub,
-                                 const void *y, int ydt)
+static __device__ __forceinline__ void norm_warp_body(int kind, int pmax, const void *x, int xdt, const void *z,
+                                                      int zdt, const void *w, int wdt, float w_offset, float eps,
+                                                      void *out, int odt, int64_t rows, int64_t D, int lsub,
+                                                      const void *y, int ydt, void *xw)
 {
-    const int lane = threadIdx.x % sub;
-    const int64_t r = ((int64_t)blockIdx.x * (NORM_THREADS / ATH_WARP) + threadIdx.x / ATH_WARP) * (ATH_WARP / sub) +
-                      (threadIdx.x % ATH_WARP) / sub;
+    const int sub = 1 << lsub, lane = threadIdx.x & (sub - 1);       /* sub lanes per row */
+    const int64_t r = ((int64_t)blockIdx.x * (NORM_THREADS / ATH_WARP) + threadIdx.x / ATH_WARP) * (ATH_WARP >> lsub) +
+                      ((threadIdx.x & (ATH_WARP - 1)) >> lsub);
     const bool live = r < rows;                       /* every lane takes part in the sums */
     const int64_t pieces = live ? D / 8 : 0, base = r * D;
     float v[NORM_PIECES][8], wv[NORM_PIECES][8], zv[NORM_PIECES][8], ss = 0.0f;
 #pragma unroll
     for (int j = 0; j < NORM_PIECES; j++) {
         const int64_t c = lane + (int64_t)j * sub;
-        if (c < pieces) {
+        if (j < pmax && c < pieces) {
             k_ld8(x, xdt, base / 8 + c, v[j]);
             if (y) {
                 /* x += y first, rounded to x's dtype as ath_add rounds it,
@@ -63,7 +64,7 @@ static __global__ void norm_warp(int kind, void *x, int xdt, const void *z, int 
 #pragma unroll
                 for (int i = 0; i < 8; i++) {
                     v[j][i] = k_round(xdt, v[j][i] + yv[i]);
-                    k_st(x, xdt, base + 8 * c + i, v[j][i]);
+                    k_st(xw, xdt, base + 8 * c + i, v[j][i]);
                 }
             }
             if (kind != ATH_NORM_L2)
@@ -74,17 +75,19 @@ static __global__ void norm_warp(int kind, void *x, int xdt, const void *z, int 
     }
 #pragma unroll
     for (int j = 0; j < NORM_PIECES; j++)
-        if (lane + (int64_t)j * sub < pieces)
+        if (j < pmax && lane + (int64_t)j * sub < pieces)
 #pragma unroll
             for (int i = 0; i < 8; i++)
                 ss += v[j][i] * v[j][i];
-    for (int m = sub / 2; m > 0; m >>= 1)
-        ss += ath_shfl_xor(ss, m);
+#pragma unroll
+    for (int m = ATH_WARP / 2; m > 0; m >>= 1)        /* the butterfly of k_warp_sum, within the row's lanes */
+        if (m < sub)
+            ss += ath_shfl_xor(ss, m);
     const float inv = 1.0f / sqrtf(ss / (kind == ATH_NORM_L2 ? 1.0f : (float)D) + eps);
 #pragma unroll
     for (int j = 0; j < NORM_PIECES; j++) {
         const int64_t c = lane + (int64_t)j * sub;
-        if (c >= pieces)
+        if (j >= pmax || c >= pieces)
             continue;
 #pragma unroll
         for (int i = 0; i < 8; i++) {
@@ -98,6 +101,34 @@ static __global__ void norm_warp(int kind, void *x, int xdt, const void *z, int 
             k_st(out, odt, base + 8 * c + i, y);
         }
     }
+}
+
+/* One kernel per kind, the body inlined with the kind a constant: each
+ * holds its own path only. The body with every kind's branches was 7,700
+ * instructions, more than the instruction cache holds, and decode launches
+ * the norms some 80 times per token between the GEMV kernels (step 10). */
+static __global__ void norm_warp_rms(const void *x, int xdt, const void *w, int wdt, float w_offset, float eps,
+                                     void *out, int odt, int64_t rows, int64_t D, int lsub, const void *y, int ydt,
+                                     void *xw)
+{
+    norm_warp_body(ATH_NORM_RMS, NORM_PIECES, x, xdt, NULL, ATH_DTYPE_F32, w, wdt, w_offset, eps, out, odt, rows, D, lsub, y, ydt,
+                   xw);
+}
+
+/* Gated rows of at most 32 pieces (256 elements: a value head), one piece
+ * per lane; longer ones take norm_kernel. */
+static __global__ void norm_warp_gated(const void *x, int xdt, const void *z, int zdt, const void *w, int wdt,
+                                       float eps, void *out, int odt, int64_t rows, int64_t D, int lsub)
+{
+    norm_warp_body(ATH_NORM_RMS_GATED, 1, x, xdt, z, zdt, w, wdt, 0.0f, eps, out, odt, rows, D, lsub, NULL,
+                   ATH_DTYPE_F32, NULL);
+}
+
+static __global__ void norm_warp_l2(const void *x, int xdt, float eps, void *out, int odt, int64_t rows, int64_t D,
+                                    int lsub)
+{
+    norm_warp_body(ATH_NORM_L2, NORM_PIECES, x, xdt, NULL, ATH_DTYPE_F32, NULL, ATH_DTYPE_F32, 0.0f, eps, out, odt, rows, D, lsub,
+                   NULL, ATH_DTYPE_F32, NULL);
 }
 
 static __global__ void norm_kernel(int kind, const void *x, int xdt, const void *z, int zdt, const void *w, int wdt,
@@ -127,6 +158,8 @@ static bool norm_warp_fits(const ath_tensor *x, const ath_tensor *z, const ath_t
 {
     const int64_t D = x->ndim > 0 ? x->shape[x->ndim - 1] : 1;
     const int64_t rows = D > 0 ? ath_tensor_numel(x) / D : 0;
+    if (z && D > 8 * ATH_WARP)
+        return false;                                  /* gated rows: one piece per lane (norm_warp_gated) */
     const bool aligned = (uintptr_t)x->data % 16 == 0 && (!w || (uintptr_t)w->data % 16 == 0) &&
                          (!z || (uintptr_t)z->data % 16 == 0) && (!y || (uintptr_t)y->data % 16 == 0);
     return D <= NORM_WARP_MAX && D % 8 == 0 && aligned && rows <= ((int64_t)1 << 30);
@@ -137,12 +170,20 @@ static ath_status norm_warp_launch(const ath_device *d, ath_norm_kind kind, ath_
                                    const ath_tensor *y)
 {
     const int64_t D = x->shape[x->ndim - 1], rows = ath_tensor_numel(x) / D;
-    const int sub = D / 8 > 16 ? ATH_WARP : D / 8 > 8 ? 16 : 8;   /* lanes per row */
-    const int64_t per_block = (NORM_THREADS / ATH_WARP) * (ATH_WARP / sub);
-    norm_warp<<<(unsigned)((rows + per_block - 1) / per_block), NORM_THREADS, 0, k_stream(d)>>>(
-        (int)kind, x->data, x->dtype, z ? z->data : NULL, z ? z->dtype : ATH_DTYPE_F32, w ? w->data : NULL,
-        w ? w->dtype : ATH_DTYPE_F32, w_offset, eps, out->data, out->dtype, rows, D, sub, y ? y->data : NULL,
-        y ? y->dtype : ATH_DTYPE_F32);
+    const int lsub = D / 8 > 16 ? 5 : D / 8 > 8 ? 4 : 3;           /* 32, 16 or 8 lanes per row */
+    const int64_t per_block = (NORM_THREADS / ATH_WARP) * (ATH_WARP >> lsub);
+    const unsigned blocks = (unsigned)((rows + per_block - 1) / per_block);
+    if (kind == ATH_NORM_RMS)
+        norm_warp_rms<<<blocks, NORM_THREADS, 0, k_stream(d)>>>(x->data, x->dtype, w->data, w->dtype, w_offset, eps,
+                                                                out->data, out->dtype, rows, D, lsub,
+                                                                y ? y->data : NULL, y ? y->dtype : ATH_DTYPE_F32,
+                                                                y ? x->data : NULL);
+    else if (kind == ATH_NORM_RMS_GATED)
+        norm_warp_gated<<<blocks, NORM_THREADS, 0, k_stream(d)>>>(x->data, x->dtype, z->data, z->dtype, w->data,
+                                                                  w->dtype, eps, out->data, out->dtype, rows, D, lsub);
+    else
+        norm_warp_l2<<<blocks, NORM_THREADS, 0, k_stream(d)>>>(x->data, x->dtype, eps, out->data, out->dtype, rows, D,
+                                                               lsub);
     return ath_gpu_launched("norm_warp");
 }
 
