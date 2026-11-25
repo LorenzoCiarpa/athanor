@@ -135,6 +135,16 @@ $(FAMILIES_H): FORCE
 
 $(BUILD)/obj/src/model/registry.o: $(FAMILIES_H)
 
+# The commit the binary is built from, for benchmark reports. The header is
+# written only when the line changes, so an unchanged tree does not relink.
+ATH_COMMIT := $(shell git describe --always --dirty --abbrev=12 2>/dev/null || echo unknown)
+VERSION_H  := $(BUILD)/gen/version.h
+$(VERSION_H): FORCE
+	@mkdir -p $(dir $@)
+	@echo '#define ATH_COMMIT "$(ATH_COMMIT)"' | cmp -s - $@ || echo '#define ATH_COMMIT "$(ATH_COMMIT)"' > $@
+
+$(BUILD)/obj/tools/bench.o: $(VERSION_H)
+
 FORCE:
 
 # AddressSanitizer reserves the address range the NVIDIA driver maps its

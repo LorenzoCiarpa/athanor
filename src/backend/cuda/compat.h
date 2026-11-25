@@ -43,6 +43,7 @@ typedef hipDeviceProp_t cudaDeviceProp;
 #define cudaGetDeviceCount           hipGetDeviceCount
 #define cudaGetDeviceProperties      hipGetDeviceProperties
 #define cudaDeviceGetAttribute       hipDeviceGetAttribute
+#define cudaDeviceGetPCIBusId        hipDeviceGetPCIBusId
 #define cudaSetDevice                hipSetDevice
 #define cudaDriverGetVersion         hipDriverGetVersion
 #define cudaRuntimeGetVersion        hipRuntimeGetVersion

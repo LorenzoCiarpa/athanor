@@ -61,6 +61,7 @@ ath_status ath_device_open(ath_device *d, int32_t index)
     d->l2_bytes = (uint64_t)p.l2CacheSize;
     d->driver_version = drv;
     d->runtime_version = rt;
+    ATH_GPU_CHECK(cudaDeviceGetPCIBusId(d->pci_bus_id, (int)sizeof d->pci_bus_id, index));
     if (d->warp != ATH_WARP) {
         ath_log(ATH_LOG_ERROR, "gpu: %s runs %d threads per warp; the kernels are written for %d", d->name,
                 d->warp, ATH_WARP);
@@ -84,6 +85,13 @@ ath_status ath_device_open(ath_device *d, int32_t index)
         return ATH_ERR_DEVICE;
     }
     d->blas = h;
+#if defined(__HIP_PLATFORM_AMD__)
+    int bv = 0;
+    hipblasLtGetVersion(h, &bv);
+    d->blas_version = bv;
+#else
+    d->blas_version = (int32_t)cublasLtGetVersion();
+#endif
     cudaError_t e = cudaMalloc(&d->blas_ws, ATH_BLAS_WORKSPACE);
     if (e != cudaSuccess) {
         d->blas_ws = NULL;

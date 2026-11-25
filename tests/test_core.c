@@ -11,6 +11,7 @@
 #include "core/file.h"
 #include "core/json.h"
 #include "core/safetensors.h"
+#include "core/sha256.h"
 #include "core/tensor.h"
 #include "core/threads.h"
 
@@ -984,6 +985,56 @@ ATH_TEST(pool_shared_by_threads)
     ath_arena_free(&a);
 }
 
+/* ---- sha256 --------------------------------------------------------------- */
+
+static void sha256_hex_of(const void *data, size_t n, size_t piece, char hex[65])
+{
+    ath_sha256 c;
+    ath_sha256_init(&c);
+    for (size_t off = 0; off < n; off += piece)
+        ath_sha256_update(&c, (const char *)data + off, n - off < piece ? n - off : piece);
+    uint8_t d[32];
+    ath_sha256_final(&c, d);
+    ath_sha256_hex(d, hex);
+}
+
+/* FIPS 180-4 examples (NIST CSRC) and a million 'a', fed whole and in
+ * pieces that straddle the 64-byte blocks. */
+ATH_TEST(sha256_vectors)
+{
+    static const char two_blocks[] = "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+    char hex[65];
+    sha256_hex_of("", 0, 1, hex);
+    ATH_EXPECT_STR_EQ(hex, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    sha256_hex_of("abc", 3, 3, hex);
+    ATH_EXPECT_STR_EQ(hex, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    const size_t pieces[] = {1, 7, 55, 56, 63, 64, 65, 1000};
+    for (size_t i = 0; i < sizeof pieces / sizeof *pieces; i++) {
+        sha256_hex_of(two_blocks, sizeof two_blocks - 1, pieces[i], hex);
+        ATH_EXPECT_STR_EQ(hex, "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+    }
+    static char million[1000000];
+    memset(million, 'a', sizeof million);
+    sha256_hex_of(million, sizeof million, 4093, hex);
+    ATH_EXPECT_STR_EQ(hex, "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+}
+
+ATH_TEST(sha256_file)
+{
+    char dir[] = "/tmp/ath_sha256_XXXXXX", path[ATH_PATH_MAX], hex[65];
+    ATH_REQUIRE(mkdtemp(dir) != NULL);
+    ATH_REQUIRE_OK(ath_path_join(path, sizeof path, dir, "abc"));
+    FILE *f = fopen(path, "wb");
+    ATH_REQUIRE(f != NULL);
+    fputs("abc", f);
+    fclose(f);
+    ATH_EXPECT_OK(ath_sha256_file(path, hex));
+    ATH_EXPECT_STR_EQ(hex, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    remove(path);
+    rmdir(dir);
+    ATH_EXPECT_STATUS(ath_sha256_file(path, hex), ATH_ERR_NOT_FOUND);
+}
+
 static const ath_test_case tests[] = {
     ATH_TEST_ENTRY(status_strings),
     ATH_TEST_ENTRY(check_propagates),
@@ -1009,6 +1060,8 @@ static const ath_test_case tests[] = {
     ATH_TEST_ENTRY(safetensors_real_model),
     ATH_TEST_ENTRY(pool_runs_every_task_once),
     ATH_TEST_ENTRY(pool_shared_by_threads),
+    ATH_TEST_ENTRY(sha256_vectors),
+    ATH_TEST_ENTRY(sha256_file),
 };
 
 int main(int argc, char **argv)

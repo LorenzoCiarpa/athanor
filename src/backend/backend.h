@@ -62,6 +62,8 @@ typedef struct {
     uint64_t l2_bytes;
     int32_t  driver_version;         /* 13000 for CUDA 13.0                           */
     int32_t  runtime_version;        /* the runtime this binary was built with         */
+    char     pci_bus_id[32];         /* domain:bus:device.function, "0000:01:00.0"     */
+    int32_t  blas_version;           /* the matmul library's own version number        */
     void    *stream[ATH_STREAM_COUNT];
     /* The vendor's dense matmul library (cuBLASLt; hipBLASLt from step 11)
      * and its workspace, used by the GPU matmul (src/ops/cuda/matmul.cu). One
