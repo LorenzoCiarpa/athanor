@@ -181,6 +181,8 @@ static ath_status run_tg(bench *b, const options *o, int64_t depth, double *secs
 {
     ATH_CHECK(ath_state_reset(&b->st, &b->m));
     ATH_CHECK(feed(b, b->ids, depth, o->chunk, false));
+    if (b->e)   /* a pass without logits returns once queued: the prompt must be done first */
+        ATH_CHECK(ath_stream_sync(&b->e->dev, ATH_STREAM_COMPUTE));
     int32_t tok = b->ids[depth];
     double t0 = now_s();
     for (int32_t i = 0; b->decoder && i < o->gen; i++)

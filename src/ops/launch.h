@@ -24,6 +24,8 @@ extern "C" {
 
 ath_status ath_embed_launch(const ath_device *d, const ath_tensor *table, const ath_tensor *ids, ath_tensor *out);
 ath_status ath_matmul_launch(const ath_device *d, const ath_tensor *x, const ath_tensor *w, ath_tensor *out);
+ath_status ath_matmul_n_launch(const ath_device *d, const ath_tensor *x, int n, const ath_tensor *const *w,
+                               ath_tensor *const *out);
 
 /* The three norms share one kernel (norm.cu). */
 typedef enum { ATH_NORM_RMS, ATH_NORM_RMS_GATED, ATH_NORM_L2 } ath_norm_kind;

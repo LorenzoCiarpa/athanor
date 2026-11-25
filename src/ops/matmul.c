@@ -150,3 +150,15 @@ ath_status ath_matmul_gpu(const ath_device *d, const ath_tensor *x, const ath_te
     ATH_CHECK(check(x, w, out, OPS_GPU, &N, &M, &K));
     return ath_matmul_launch(d, x, w, out);
 }
+
+ath_status ath_matmul_n_gpu(const ath_device *d, const ath_tensor *x, int n, const ath_tensor *const *w,
+                            ath_tensor *const *out)
+{
+    if (n < 1 || n > ATH_MATMUL_N_MAX || !w || !out)
+        return ops_fail(ATH_ERR_INVALID_ARG, op, "1 to %d weights", ATH_MATMUL_N_MAX);
+    for (int i = 0; i < n; i++) {
+        int64_t N, M, K;
+        ATH_CHECK(check(x, w[i], out[i], OPS_GPU, &N, &M, &K));
+    }
+    return ath_matmul_n_launch(d, x, n, w, out);
+}

@@ -90,3 +90,10 @@ ath_status ath_sample_launch(const ath_device *d, const ath_tensor *logits, cons
     (void)d, (void)logits, (void)p, (void)k, (void)u, (void)work, (void)out;
     return none("sample");
 }
+
+ath_status ath_matmul_n_launch(const ath_device *d, const ath_tensor *x, int n, const ath_tensor *const *w,
+                               ath_tensor *const *out)
+{
+    (void)d, (void)x, (void)n, (void)w, (void)out;
+    return none("matmul");
+}

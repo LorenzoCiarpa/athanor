@@ -1,7 +1,7 @@
 /* attn.cu: causal softmax attention with grouped-query heads on the GPU.
  * See ops.h and attn.c.
  *
- * The keys a query sees are taken in pieces of ATH_ATTN_SPLIT (256). Each
+ * The keys a query sees are taken in pieces of ATH_ATTN_SPLIT (64). Each
  * piece is reduced to a partial softmax, the recurrence at the heart of
  * FlashAttention:
  *
@@ -40,7 +40,8 @@
 #define ATTN_THREADS 128
 #define ATTN_TILE 32
 #define ATTN_PER_THREAD ((ATH_ATTN_MAX_DV + ATTN_THREADS - 1) / ATTN_THREADS)
-#define ATTN_MAX_GROUP 8         /* query heads one split block serves      */
+#define ATTN_MAX_GROUP 4         /* query heads one split block serves      */
+#define ATTN_VKEYS 4             /* keys whose values are loaded at once    */
 #define ATTN_KREG (ATH_ATTN_MAX_DV / ATH_WARP)
 
 /* The position of query t, or -1 if it is outside [0, S). */
@@ -105,23 +106,33 @@ static __device__ __forceinline__ void attn_piece(const float *qs, float *sc, in
                 acc[g][r] = __fmul_rn(acc[g][r], corr);
             m[g] = mt;
         }
-        for (int jj = 0; jj < n; jj++) {
-            const int64_t vb = ((t0 + jj) * nkv + kh) * dv;
-            float vv[ATTN_PER_THREAD];
+        /* the values of ATTN_VKEYS keys are loaded before any is used, so
+         * their loads are in flight together; the sums still go key by key */
+        for (int j0 = 0; j0 < n; j0 += ATTN_VKEYS) {
+            float vv[ATTN_VKEYS][ATTN_PER_THREAD];
 #pragma unroll
-            for (int r = 0; r < ATTN_PER_THREAD; r++) {
-                const int64_t i = tid + (int64_t)r * ATTN_THREADS;
-                vv[r] = i < dv ? k_ld(v, vdt, vb + i) : 0.0f;
+            for (int q = 0; q < ATTN_VKEYS; q++) {
+                const int64_t vb = ((t0 + j0 + q) * nkv + kh) * dv;
+#pragma unroll
+                for (int r = 0; r < ATTN_PER_THREAD; r++) {
+                    const int64_t i = tid + (int64_t)r * ATTN_THREADS;
+                    vv[q][r] = j0 + q < n && i < dv ? k_ld(v, vdt, vb + i) : 0.0f;
+                }
             }
 #pragma unroll
-            for (int g = 0; g < ATTN_MAX_GROUP; g++) {
-                if (g >= G)
+            for (int q = 0; q < ATTN_VKEYS; q++) {
+                if (j0 + q >= n)
                     break;
-                const float p = expf(__fsub_rn(sc[g * ATTN_TILE + jj], m[g]));
-                l[g] = __fadd_rn(l[g], p);
 #pragma unroll
-                for (int r = 0; r < ATTN_PER_THREAD; r++)
-                    acc[g][r] = __fmaf_rn(p, vv[r], acc[g][r]);
+                for (int g = 0; g < ATTN_MAX_GROUP; g++) {
+                    if (g >= G)
+                        break;
+                    const float p = expf(__fsub_rn(sc[g * ATTN_TILE + j0 + q], m[g]));
+                    l[g] = __fadd_rn(l[g], p);
+#pragma unroll
+                    for (int r = 0; r < ATTN_PER_THREAD; r++)
+                        acc[g][r] = __fmaf_rn(p, vv[q][r], acc[g][r]);
+                }
             }
         }
         __syncthreads();                    /* the next tile overwrites sc */

@@ -24,6 +24,8 @@
  */
 #include "ops/cuda/kernel.cuh"
 
+#include <string.h>
+
 /* ---- cuBLASLt --------------------------------------------------------------- */
 
 /* The alignment cuBLASLt may assume for a matrix: the largest power of two,
@@ -151,63 +153,66 @@ static __global__ void matmul_kernel(const void *x, int xdt, const void *w, int 
  * multiply-add per row, so the time is the time to read the weights. A
  * library GEMM tiles for reuse that is not there; this kernel only streams.
  *
- * One warp per output column m (row m of w): the lanes read the row in
- * 16-byte pieces (8 bf16), lane l the pieces l, l + 32, ..., four at a time
- * so that several loads are in flight, and multiply each piece with the
- * same 8 elements of every row of x (x is small and stays in the caches).
- * Each lane sums its products in fp32 in order of k, then the warp adds the
- * 32 sums (k_warp_sum): the order is fixed by K alone, so the result does
- * not depend on M, N or the launch, and a row gives the same bits whether
- * it comes alone or with others. */
-#define GEMV_ROWS 8      /* the most rows of x one launch takes      */
-#define GEMV_WARPS 8     /* warps per block, one output column each  */
-#define GEMV_UNROLL 4    /* 16-byte pieces each lane loads at a time */
+ * One warp per output column m (row m of w), or S = 2 or 4 warps for a
+ * long row, each a contiguous share of it (gemv_split): the lanes read the
+ * row in 16-byte pieces (8 bf16), lane l the pieces l, l + 32, ..., four at
+ * a time so that several loads are in flight, and multiply each piece with
+ * the same 8 elements of every row of x (x is small and stays in the
+ * caches). Each lane sums its products in fp32 in order of k, the warp adds
+ * the 32 sums (k_warp_sum), and the S warps' sums are added in order: the
+ * order is fixed by K alone, so the result does not depend on M, N or the
+ * launch, and a row gives the same bits whether it comes alone or with
+ * others. Several weights that share x (ath_matmul_n) are one launch. */
+#define GEMV_ROWS 8      /* the most rows of x one launch takes        */
+#define GEMV_WARPS 4     /* warps per block, one output column each    */
+#define GEMV_UNROLL 4    /* 16-byte pieces each lane loads at a time   */
 
-static __device__ __forceinline__ void k_unpack_bf16x8(uint4 u, float f[8])
-{
-    const uint32_t v[4] = {u.x, u.y, u.z, u.w};
-#pragma unroll
-    for (int i = 0; i < 4; i++) {
-        f[2 * i] = __uint_as_float(v[i] << 16);              /* element 2i: the low half */
-        f[2 * i + 1] = __uint_as_float(v[i] & 0xffff0000u);
-    }
-}
+/* The weights of one launch, which share x: matrix j has M[j] rows (output
+ * columns) and takes the warps first[j] … first[j + 1] − 1. */
+typedef struct {
+    const uint4 *w[ATH_MATMUL_N_MAX];
+    void        *out[ATH_MATMUL_N_MAX];
+    int          odt[ATH_MATMUL_N_MAX];
+    int64_t      M[ATH_MATMUL_N_MAX];
+    int64_t      first[ATH_MATMUL_N_MAX + 1];
+    int          n;
+} gemv_set;
 
-/* Elements 8c … 8c + 7 of row r of x (bf16 or f32), as floats. */
-static __device__ __forceinline__ void k_x8(const void *x, int xdt, int64_t K, int r, int64_t c, float f[8])
-{
-    if (xdt == ATH_DTYPE_BF16) {
-        k_unpack_bf16x8(((const uint4 *)x)[(r * K) / 8 + c], f);
-    } else {
-        const float4 a = ((const float4 *)x)[(r * K) / 4 + 2 * c], b = ((const float4 *)x)[(r * K) / 4 + 2 * c + 1];
-        f[0] = a.x, f[1] = a.y, f[2] = a.z, f[3] = a.w, f[4] = b.x, f[5] = b.y, f[6] = b.z, f[7] = b.w;
-    }
-}
+/* The warps that share one output column: long rows are split so that every
+ * lane has about four pieces to load, whatever K (step 9). It depends on K
+ * only, so a column's bits do not depend on the other columns. */
+static inline int gemv_split(int64_t K) { return K >= 3072 ? 4 : K >= 1536 ? 2 : 1; }
 
 static __global__ void __launch_bounds__(GEMV_WARPS * ATH_WARP)
-gemv_kernel(const void *x, int xdt, const uint4 *w, void *out, int odt, int N, int64_t M, int64_t K)
+gemv_kernel(const void *x, int xdt, gemv_set set, int N, int64_t K, int S)
 {
-    const int lane = threadIdx.x % ATH_WARP;
-    const int64_t m = (int64_t)blockIdx.x * GEMV_WARPS + threadIdx.x / ATH_WARP;
-    if (m >= M)
-        return;
-    const int64_t pieces = K / 8;
-    const uint4 *row = w + m * pieces;
+    __shared__ float part[GEMV_WARPS][GEMV_ROWS];
+    const int lane = threadIdx.x % ATH_WARP, warp = threadIdx.x / ATH_WARP;
+    const int64_t gm = (int64_t)blockIdx.x * (GEMV_WARPS / S) + warp / S;
+    const int share = warp % S;                       /* this warp's part of the row */
+    const bool live = gm < set.first[set.n];
+    int j = 0;
+    while (live && j + 1 < set.n && gm >= set.first[j + 1])
+        j++;
+    const int64_t m = live ? gm - set.first[j] : 0, M = set.M[j];
+    const int64_t pieces = K / 8, per = (pieces + S - 1) / S;
+    const int64_t c_begin = share * per, c_end = c_begin + per < pieces ? c_begin + per : pieces;
+    const uint4 *row = set.w[j] + m * pieces;
     float acc[GEMV_ROWS];
 #pragma unroll
     for (int r = 0; r < GEMV_ROWS; r++)
         acc[r] = 0.0f;
-    for (int64_t c0 = lane; c0 < pieces; c0 += (int64_t)ATH_WARP * GEMV_UNROLL) {
+    for (int64_t c0 = c_begin + lane; live && c0 < c_end; c0 += (int64_t)ATH_WARP * GEMV_UNROLL) {
         uint4 wv[GEMV_UNROLL];
 #pragma unroll
         for (int u = 0; u < GEMV_UNROLL; u++) {
             const int64_t c = c0 + (int64_t)u * ATH_WARP;
-            wv[u] = c < pieces ? row[c] : make_uint4(0, 0, 0, 0);
+            wv[u] = c < c_end ? row[c] : make_uint4(0, 0, 0, 0);
         }
 #pragma unroll
         for (int u = 0; u < GEMV_UNROLL; u++) {
             const int64_t c = c0 + (int64_t)u * ATH_WARP;
-            if (c >= pieces)
+            if (c >= c_end)
                 break;
             float wf[8];
             k_unpack_bf16x8(wv[u], wf);
@@ -215,7 +220,7 @@ gemv_kernel(const void *x, int xdt, const uint4 *w, void *out, int odt, int N, i
             for (int r = 0; r < GEMV_ROWS; r++) {
                 if (r < N) {
                     float xf[8];
-                    k_x8(x, xdt, K, r, c, xf);
+                    k_ld8(x, xdt, (r * K) / 8 + c, xf);
 #pragma unroll
                     for (int i = 0; i < 8; i++)
                         acc[r] += wf[i] * xf[i];
@@ -223,14 +228,28 @@ gemv_kernel(const void *x, int xdt, const uint4 *w, void *out, int odt, int N, i
             }
         }
     }
+    /* each warp's sum, then the parts of a column in order */
 #pragma unroll
     for (int r = 0; r < GEMV_ROWS; r++) {
         if (r < N) {
-            const float s = k_warp_sum(acc[r]);
-            if (lane == 0)
-                k_st(out, odt, r * M + m, s);
+            const float v = k_warp_sum(acc[r]);
+            if (S == 1) {
+                if (live && lane == 0)
+                    k_st(set.out[j], set.odt[j], r * M + m, v);
+            } else if (lane == 0) {
+                part[warp][r] = v;
+            }
         }
     }
+    if (S == 1)
+        return;
+    __syncthreads();
+    if (!live || share != 0 || lane >= N)
+        return;
+    float v = 0.0f;
+    for (int p = 0; p < S; p++)
+        v += part[warp + p][lane];
+    k_st(set.out[j], set.odt[j], (int64_t)lane * M + m, v);
 }
 
 /* The GEMV kernel takes the product: few rows, bf16 weights, rows of 16-byte
@@ -240,6 +259,45 @@ static bool gemv_fits(const ath_tensor *x, const ath_tensor *w, int64_t N, int64
     return N <= GEMV_ROWS && w->dtype == ATH_DTYPE_BF16 && K % 8 == 0 &&
            (x->dtype == ATH_DTYPE_BF16 || x->dtype == ATH_DTYPE_F32) && (uintptr_t)w->data % 16 == 0 &&
            (uintptr_t)x->data % 16 == 0;
+}
+
+static ath_status gemv_launch(const ath_device *d, const ath_tensor *x, const gemv_set *set, int64_t N, int64_t K)
+{
+    const int S = gemv_split(K), per_block = GEMV_WARPS / S;
+    const int64_t blocks = (set->first[set->n] + per_block - 1) / per_block;
+    gemv_kernel<<<(unsigned)blocks, GEMV_WARPS * ATH_WARP, 0, k_stream(d)>>>(x->data, x->dtype, *set, (int)N, K, S);
+    return ath_gpu_launched("gemv_kernel");
+}
+
+static void gemv_add(gemv_set *set, const ath_tensor *w, ath_tensor *out)
+{
+    const int j = set->n++;
+    set->w[j] = (const uint4 *)w->data;
+    set->out[j] = out->data;
+    set->odt[j] = out->dtype;
+    set->M[j] = w->shape[0];
+    set->first[j + 1] = set->first[j] + w->shape[0];
+}
+
+extern "C" ath_status ath_matmul_n_launch(const ath_device *d, const ath_tensor *x, int n, const ath_tensor *const *w,
+                                          ath_tensor *const *out)
+{
+    const int64_t K = x->shape[x->ndim - 1];
+    const int64_t N = K > 0 ? ath_tensor_numel(x) / K : 0;
+    bool fit = N > 0;
+    for (int i = 0; i < n; i++)
+        fit = fit && w[i]->shape[0] > 0 && gemv_fits(x, w[i], N, K);
+    if (!fit) {
+        for (int i = 0; i < n; i++)
+            ATH_CHECK(ath_matmul_launch(d, x, w[i], out[i]));
+        return ATH_OK;
+    }
+    ATH_CHECK(ath_gpu_use(d));
+    gemv_set set;
+    memset(&set, 0, sizeof set);
+    for (int i = 0; i < n; i++)
+        gemv_add(&set, w[i], out[i]);
+    return gemv_launch(d, x, &set, N, K);
 }
 
 extern "C" ath_status ath_matmul_launch(const ath_device *d, const ath_tensor *x, const ath_tensor *w,
@@ -253,10 +311,10 @@ extern "C" ath_status ath_matmul_launch(const ath_device *d, const ath_tensor *x
         return ath_memset(d, out->data, 0, ath_tensor_nbytes(out), ATH_STREAM_COMPUTE);
     ATH_CHECK(ath_gpu_use(d));
     if (gemv_fits(x, w, N, K)) {
-        const int64_t blocks = (M + GEMV_WARPS - 1) / GEMV_WARPS;
-        gemv_kernel<<<(unsigned)blocks, GEMV_WARPS * ATH_WARP, 0, k_stream(d)>>>(
-            x->data, x->dtype, (const uint4 *)w->data, out->data, out->dtype, (int)N, M, K);
-        return ath_gpu_launched("gemv_kernel");
+        gemv_set set;
+        memset(&set, 0, sizeof set);
+        gemv_add(&set, w, out);
+        return gemv_launch(d, x, &set, N, K);
     }
     const bool bf16_in = x->dtype == ATH_DTYPE_BF16 && w->dtype == ATH_DTYPE_BF16;
     const bool f32_all = x->dtype == ATH_DTYPE_F32 && w->dtype == ATH_DTYPE_F32 && out->dtype == ATH_DTYPE_F32;

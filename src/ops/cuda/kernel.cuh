@@ -55,6 +55,30 @@ static __device__ __forceinline__ void k_st(void *p, int dt, int64_t i, float v)
         ((float *)p)[i] = v;
 }
 
+/* 8 bf16 of one 16-byte load, as floats (element 2i is the low half of
+ * word i). */
+static __device__ __forceinline__ void k_unpack_bf16x8(uint4 u, float f[8])
+{
+    const uint32_t v[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        f[2 * i] = __uint_as_float(v[i] << 16);
+        f[2 * i + 1] = __uint_as_float(v[i] & 0xffff0000u);
+    }
+}
+
+/* Elements 8e … 8e + 7 of a bf16 or f32 buffer on a 16-byte boundary, in
+ * one or two 16-byte loads. */
+static __device__ __forceinline__ void k_ld8(const void *p, int dt, int64_t e, float f[8])
+{
+    if (dt == ATH_DTYPE_BF16) {
+        k_unpack_bf16x8(((const uint4 *)p)[e], f);
+    } else {
+        const float4 a = ((const float4 *)p)[2 * e], b = ((const float4 *)p)[2 * e + 1];
+        f[0] = a.x, f[1] = a.y, f[2] = a.z, f[3] = a.w, f[4] = b.x, f[5] = b.y, f[6] = b.z, f[7] = b.w;
+    }
+}
+
 /* The value v takes once stored as dt. */
 static __device__ __forceinline__ float k_round(int dt, float v)
 {

@@ -439,6 +439,36 @@ ATH_TEST(gpu_sample)
     gpu_close(&g);
 }
 
+/* Several weights sharing x (step 9): one GEMV launch, the bits of one
+ * call per weight; and with too many rows for the GEMV kernel, the same. */
+ATH_TEST(gpu_matmul_n)
+{
+    gpu g;
+    GPU_OR_SKIP(g);
+    static const int64_t Ms[] = {6144, 2048, 16, 16};
+    static const ath_dtype odts[] = {ATH_DTYPE_BF16, ATH_DTYPE_F32, ATH_DTYPE_BF16, ATH_DTYPE_F32};
+    for (int64_t N = 1; N <= 12; N += 11)
+        for (int n = 1; n <= ATH_MATMUL_N_MAX; n++) {
+            const int64_t K = 1024;
+            ath_tensor x = rand_t(&g, ATH_DTYPE_BF16, -1, 1, SHAPE(N, K)), xd = up(&g, &x);
+            ath_tensor wd[ATH_MATMUL_N_MAX], od[ATH_MATMUL_N_MAX], sd[ATH_MATMUL_N_MAX];
+            const ath_tensor *wp[ATH_MATMUL_N_MAX];
+            ath_tensor *op[ATH_MATMUL_N_MAX];
+            for (int i = 0; i < n; i++) {
+                ath_tensor w = rand_t(&g, ATH_DTYPE_BF16, -1, 1, SHAPE(Ms[i], K)), o = host(&g, odts[i], SHAPE(N, Ms[i]));
+                wd[i] = up(&g, &w), od[i] = up(&g, &o), sd[i] = up(&g, &o);
+                wp[i] = &wd[i], op[i] = &od[i];
+                ATH_EXPECT_OK(ath_matmul_gpu(&g.d, &xd, &wd[i], &sd[i]));
+            }
+            ATH_EXPECT_OK(ath_matmul_n_gpu(&g.d, &xd, n, wp, op));
+            for (int i = 0; i < n; i++)
+                ATH_EXPECT(same_bits(&g, &od[i], &sd[i]));
+        }
+    ath_tensor x = rand_t(&g, ATH_DTYPE_BF16, -1, 1, SHAPE(1, 8)), xd = up(&g, &x);
+    ATH_EXPECT_STATUS(ath_matmul_n_gpu(&g.d, &xd, ATH_MATMUL_N_MAX + 1, NULL, NULL), ATH_ERR_INVALID_ARG);
+    gpu_close(&g);
+}
+
 /* ---- norms ----------------------------------------------------------------------- */
 
 ATH_TEST(gpu_norms)
@@ -793,7 +823,7 @@ ATH_TEST(gpu_gdn)
 }
 
 static const ath_test_case tests[] = {
-    ATH_TEST_ENTRY(gpu_argument_checks), ATH_TEST_ENTRY(gpu_embed),       ATH_TEST_ENTRY(gpu_matmul),      ATH_TEST_ENTRY(gpu_gemv), ATH_TEST_ENTRY(gpu_scatter_rows), ATH_TEST_ENTRY(gpu_sample),
+    ATH_TEST_ENTRY(gpu_argument_checks), ATH_TEST_ENTRY(gpu_embed),       ATH_TEST_ENTRY(gpu_matmul),      ATH_TEST_ENTRY(gpu_gemv), ATH_TEST_ENTRY(gpu_matmul_n), ATH_TEST_ENTRY(gpu_scatter_rows), ATH_TEST_ENTRY(gpu_sample),
     ATH_TEST_ENTRY(gpu_norms),           ATH_TEST_ENTRY(gpu_rope),        ATH_TEST_ENTRY(gpu_elementwise),
     ATH_TEST_ENTRY(gpu_attn),            ATH_TEST_ENTRY(gpu_conv),        ATH_TEST_ENTRY(gpu_gdn_gates),
     ATH_TEST_ENTRY(gpu_gdn),

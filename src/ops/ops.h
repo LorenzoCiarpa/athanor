@@ -96,6 +96,15 @@ ath_status ath_matmul_fast(const ath_tensor *x, const ath_tensor *w, ath_tensor 
  * own kernel, slower, for the other combinations (src/ops/cuda/matmul.cu). */
 ath_status ath_matmul_gpu(const ath_device *d, const ath_tensor *x, const ath_tensor *w, ath_tensor *out);
 
+/* Several weights that share their input (step 9): out[i] = x · w[i]ᵀ for
+ * i < n <= ATH_MATMUL_N_MAX, with the results of n calls of ath_matmul,
+ * bit for bit. On the GPU a few rows of x against bf16 weights take one
+ * GEMV launch for all of them: the projections of one layer's input are
+ * read in one pass. The CPU (in dispatch) runs ath_matmul_fast on each. */
+#define ATH_MATMUL_N_MAX 4
+ath_status ath_matmul_n_gpu(const ath_device *d, const ath_tensor *x, int n, const ath_tensor *const *w,
+                            ath_tensor *const *out);
+
 /* ---- norm.c ---------------------------------------------------------------- */
 
 /* RMSNorm over the last dimension:
@@ -176,7 +185,7 @@ ath_status ath_attn_ref(const ath_tensor *q, const ath_tensor *k, const ath_tens
  * cache), and the result has the same bits as without. Positions in device
  * memory cannot be checked by the host: a query whose position is outside
  * [0, S) gets a row of NaN. */
-#define ATH_ATTN_SPLIT 256
+#define ATH_ATTN_SPLIT 64
 #define ATH_ATTN_SPLIT_MAX_T 8
 ath_status ath_attn_gpu(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
                         const ath_tensor *pos, float scale, ath_dev_arena *scratch, ath_tensor *out);
@@ -253,6 +262,8 @@ ath_status ath_rope(const ath_device *d, const ath_tensor *x, const ath_tensor *
 ath_status ath_swiglu(const ath_device *d, const ath_tensor *gate, const ath_tensor *up, ath_tensor *out);
 ath_status ath_sigmoid_mul(const ath_device *d, const ath_tensor *x, const ath_tensor *gate, ath_tensor *out);
 ath_status ath_add(const ath_device *d, const ath_tensor *a, const ath_tensor *b, ath_tensor *out);
+ath_status ath_matmul_n(const ath_device *d, ath_pool *pool, const ath_tensor *x, int n, const ath_tensor *const *w,
+                        ath_tensor *const *out);
 ath_status ath_attn(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
                     const ath_tensor *pos, float scale, ath_dev_arena *scratch, ath_tensor *out);
 ath_status ath_conv(const ath_device *d, const ath_tensor *x, const ath_tensor *w, ath_tensor *state, ath_act act,

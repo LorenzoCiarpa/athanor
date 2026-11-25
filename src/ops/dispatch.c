@@ -62,6 +62,18 @@ ath_status ath_attn(const ath_device *d, const ath_tensor *q, const ath_tensor *
     return d ? ath_attn_gpu(d, q, k, v, pos, scale, scratch, out) : ath_attn_ref(q, k, v, pos, scale, out);
 }
 
+ath_status ath_matmul_n(const ath_device *d, ath_pool *pool, const ath_tensor *x, int n, const ath_tensor *const *w,
+                        ath_tensor *const *out)
+{
+    if (d)
+        return ath_matmul_n_gpu(d, x, n, w, out);
+    if (n < 1 || n > ATH_MATMUL_N_MAX || !w || !out)
+        return ATH_ERR_INVALID_ARG;
+    for (int i = 0; i < n; i++)
+        ATH_CHECK(ath_matmul_fast(x, w[i], out[i], pool));
+    return ATH_OK;
+}
+
 ath_status ath_scatter_rows(const ath_device *d, const ath_tensor *src, const ath_tensor *idx, ath_tensor *dst)
 {
     return d ? ath_scatter_rows_gpu(d, src, idx, dst) : ath_scatter_rows_ref(src, idx, dst);
