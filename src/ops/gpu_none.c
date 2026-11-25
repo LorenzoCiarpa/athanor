@@ -109,3 +109,16 @@ ath_status ath_matmul_add_launch(const ath_device *d, const ath_tensor *x, const
     (void)d, (void)x, (void)w, (void)out;
     return none("matmul_add");
 }
+
+bool ath_gemv_swiglu_fits(const ath_tensor *x, const ath_tensor *wg, const ath_tensor *wu)
+{
+    (void)x, (void)wg, (void)wu;
+    return false;
+}
+
+ath_status ath_matmul_swiglu_launch(const ath_device *d, const ath_tensor *x, const ath_tensor *wg,
+                                    const ath_tensor *wu, ath_tensor *out)
+{
+    (void)d, (void)x, (void)wg, (void)wu, (void)out;
+    return none("matmul_swiglu");
+}

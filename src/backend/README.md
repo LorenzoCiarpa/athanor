@@ -12,7 +12,7 @@ Device runtimes. The GPU runtime landed in step 6, for CUDA, written once for NV
 | `devarena.c` | linear allocation in device memory: blocks from the runtime, mark and reset, block records in a host arena | 6 |
 | `cpu.c` | CPU feature detection (`cpuid`) for an instruction-set-specific path | when one lands (`docs/proposals/cpu-matmul-avx512.md`) |
 
-The cuBLASLt handle joined `backend.h` with its first user, the GPU matmul (step 7); graph capture joins it with fast decode (step 9).
+The cuBLASLt handle joined `backend.h` with its first user, the GPU matmul (step 7); graph capture joined it with fast decode (step 9, Graphs below). `ath_device` also records the PCI bus id and the cuBLASLt version for benchmark reports.
 
 ## Building
 
@@ -63,6 +63,10 @@ ATH_CHECK(ath_stream_sync(&d, ATH_STREAM_COMPUTE));
 - **Device arena.** Small and frequent device allocations go through `ath_dev_arena`, so that the runtime's slow allocator is called once per block (256 MiB by default).
 - **The matmul library.** `ath_device_open` also creates a cuBLASLt handle and a 32 MiB workspace (`ATH_BLAS_WORKSPACE`, what cuBLASLt's documentation recommends from Hopper on); `ath_device_close` frees them. One workspace per device is enough because every op runs on the compute stream, one after the other.
 - **Kernel launchers** (`src/ops/cuda/*.cu`) include `cuda/gpu.h`: `ath_gpu_use` makes the device current, the kernels go on `ath_gpu_stream(d, ATH_STREAM_COMPUTE)`, and `ath_gpu_launched` reports an invalid launch at once; a fault while a kernel runs is reported by the next call that waits for the stream.
+
+## Graphs (step 9)
+
+`ath_graph_begin(d, s)` starts recording the work queued on stream s, `ath_graph_end` stops and prepares it (CUDA stream capture, thread-local mode; HIP graphs through `compat.h`), `ath_graph_launch` runs all of it with one call. The recorded work keeps every argument, addresses included, so what changes between replays must be read from memory by the work itself: the decoder (`src/infer/README.md`) copies the token, its position and a uniform number from pinned memory as the graph's first step. While a stream is being recorded nothing may wait for it and nothing is allocated through the runtime: the device arenas' blocks exist before (the decoder runs its first step directly). `ath_graph_end` also ends a recording that failed halfway, which leaves the stream usable.
 
 ## Streams
 

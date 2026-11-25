@@ -184,6 +184,20 @@ typedef struct {
  * only, so a column's bits do not depend on the other columns. */
 static inline int gemv_split(int64_t K) { return K >= 3072 ? 4 : K >= 1536 ? 2 : 1; }
 
+/* 16 bytes of weights, read once per token: past L1, so that x stays there. */
+static __device__ __forceinline__ uint4 k_ld_stream(const uint4 *p)
+{
+#if defined(__HIP_PLATFORM_AMD__)
+    return __builtin_nontemporal_load(p);
+#else
+    uint4 r;
+    asm("ld.global.nc.L1::no_allocate.v4.u32 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w)
+                 : "l"(p));
+    return r;
+#endif
+}
+
 /* Output element e of matrix j: the sum rounded to the output's dtype, and
  * with set.add, then added to what is there and rounded again (ath_add). */
 static __device__ __forceinline__ void gemv_store(const gemv_set *set, int j, int64_t e, float v)
@@ -221,14 +235,14 @@ static __device__ __forceinline__ void gemv_body(const void *x, int xdt, const g
 #pragma unroll
     for (int u = 0; u < GEMV_UNROLL; u++) {
         const int64_t c = c_begin + lane + (int64_t)u * ATH_WARP;
-        wv[u] = live && c < c_end ? row[c] : make_uint4(0, 0, 0, 0);
+        wv[u] = live && c < c_end ? k_ld_stream(row + c) : make_uint4(0, 0, 0, 0);
     }
     for (int64_t c0 = c_begin + lane; live && c0 < c_end; c0 += step) {
         if (c0 != c_begin + lane)
 #pragma unroll
             for (int u = 0; u < GEMV_UNROLL; u++) {
                 const int64_t c = c0 + (int64_t)u * ATH_WARP;
-                wv[u] = c < c_end ? row[c] : make_uint4(0, 0, 0, 0);
+                wv[u] = c < c_end ? k_ld_stream(row + c) : make_uint4(0, 0, 0, 0);
             }
 #pragma unroll
         for (int u = 0; u < GEMV_UNROLL; u++) {
@@ -379,4 +393,67 @@ extern "C" ath_status ath_matmul_add_launch(const ath_device *d, const ath_tenso
     gemv_add(&set, w, out);
     set.add = true;
     return gemv_launch(d, x, &set, N, K);
+}
+
+/* Gate and up of a SwiGLU MLP for one row of x (step 9): a warp per column
+ * m of both, out[m] = silu(g) · u with g and u rounded to out's dtype first,
+ * which is what ath_matmul_n into two tensors and then ath_swiglu give, bit
+ * for bit (each sum in gemv_one's order; one 16-byte piece per lane at a
+ * time). The two products are not written. */
+static __global__ void __launch_bounds__(GEMV_WARPS * ATH_WARP)
+gemv_swiglu(const void *x, int xdt, const uint4 *wg, const uint4 *wu, void *out, int odt, int64_t M, int64_t K)
+{
+    const int lane = threadIdx.x % ATH_WARP;
+    const int64_t m = (int64_t)blockIdx.x * GEMV_WARPS + threadIdx.x / ATH_WARP;
+    if (m >= M)
+        return;
+    const int64_t pieces = K / 8, step = (int64_t)ATH_WARP * GEMV_UNROLL;
+    const uint4 *rg = wg + m * pieces, *ru = wu + m * pieces;
+    float ag = 0.0f, au = 0.0f;
+    for (int64_t c0 = lane; c0 < pieces; c0 += step) {
+        uint4 gv[GEMV_UNROLL], uv[GEMV_UNROLL];
+#pragma unroll
+        for (int u = 0; u < GEMV_UNROLL; u++) {
+            const int64_t c = c0 + (int64_t)u * ATH_WARP;
+            gv[u] = c < pieces ? k_ld_stream(rg + c) : make_uint4(0, 0, 0, 0);
+            uv[u] = c < pieces ? k_ld_stream(ru + c) : make_uint4(0, 0, 0, 0);
+        }
+#pragma unroll
+        for (int u = 0; u < GEMV_UNROLL; u++) {
+            const int64_t c = c0 + (int64_t)u * ATH_WARP;
+            if (c >= pieces)
+                break;
+            float xf[8], gf[8], uf[8];
+            k_ld8(x, xdt, c, xf);
+            k_unpack_bf16x8(gv[u], gf);
+            k_unpack_bf16x8(uv[u], uf);
+#pragma unroll
+            for (int i = 0; i < 8; i++)
+                ag += gf[i] * xf[i];
+#pragma unroll
+            for (int i = 0; i < 8; i++)
+                au += uf[i] * xf[i];
+        }
+    }
+    ag = k_warp_sum(ag);
+    au = k_warp_sum(au);
+    if (lane == 0)
+        k_st(out, odt, m, k_silu(k_round(odt, ag)) * k_round(odt, au));
+}
+
+extern "C" bool ath_gemv_swiglu_fits(const ath_tensor *x, const ath_tensor *wg, const ath_tensor *wu)
+{
+    const int64_t K = x->shape[x->ndim - 1];
+    return K > 0 && ath_tensor_numel(x) == K && gemv_split(K) == 1 && gemv_fits(x, wg, 1, K) &&
+           gemv_fits(x, wu, 1, K) && wg->shape[0] == wu->shape[0];
+}
+
+extern "C" ath_status ath_matmul_swiglu_launch(const ath_device *d, const ath_tensor *x, const ath_tensor *wg,
+                                               const ath_tensor *wu, ath_tensor *out)
+{
+    const int64_t K = x->shape[x->ndim - 1], M = wg->shape[0];
+    ATH_CHECK(ath_gpu_use(d));
+    gemv_swiglu<<<(unsigned)((M + GEMV_WARPS - 1) / GEMV_WARPS), GEMV_WARPS * ATH_WARP, 0, k_stream(d)>>>(
+        x->data, x->dtype, (const uint4 *)wg->data, (const uint4 *)wu->data, out->data, out->dtype, M, K);
+    return ath_gpu_launched("gemv_swiglu");
 }

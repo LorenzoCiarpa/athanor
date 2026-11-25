@@ -112,6 +112,14 @@ ath_status ath_matmul_gpu(const ath_device *d, const ath_tensor *x, const ath_te
  * measured and dropped: the blocks' prologue cost more than the norm
  * kernel it saved.) */
 bool       ath_matmul_fits_gemv(const ath_tensor *x, const ath_tensor *w);
+/* GPU fusion of a SwiGLU MLP's first half for one row of x (step 9):
+ * out = silu(x · wgᵀ) · (x · wuᵀ), each product rounded to out's dtype
+ * first: the bits of ath_matmul_n into two tensors of out's dtype followed
+ * by ath_swiglu, without writing the two. ATH_ERR_UNSUPPORTED where
+ * ath_matmul_swiglu_fits is false. */
+bool       ath_matmul_swiglu_fits(const ath_tensor *x, const ath_tensor *wg, const ath_tensor *wu);
+ath_status ath_matmul_swiglu_gpu(const ath_device *d, const ath_tensor *x, const ath_tensor *wg, const ath_tensor *wu,
+                                 ath_tensor *out);
 ath_status ath_matmul_add_gpu(const ath_device *d, const ath_tensor *x, const ath_tensor *w, ath_tensor *out);
 ath_status ath_matmul_n_gpu(const ath_device *d, const ath_tensor *x, int n, const ath_tensor *const *w,
                             ath_tensor *const *out);

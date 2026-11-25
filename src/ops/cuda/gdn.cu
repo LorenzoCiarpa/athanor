@@ -4,19 +4,23 @@
  * Gates: one thread per (token, value head), the reference's expressions.
  *
  * Recurrence: the columns of a head's state S [dk, dv] never interact
- * (gdn.c), so each column is one warp's job. Lane l keeps rows l, l + 32,
- * ... of the column in registers for all the tokens of the call and the
- * state goes back to memory once at the end; per token the warp decays the
- * column, reads u = Sᵀk (k_warp_sum), writes β (v − u) along k and reads the
- * output with the query (k_warp_sum again). A block holds GDN_WARPS
- * neighbouring columns of one head, so its loads of a state row are
- * contiguous. Tokens run one after the other, as the recurrence requires;
+ * (gdn.c). A block takes 32 neighbouring columns of one head, a lane per
+ * column, so that every row of the state it reads or writes is one
+ * contiguous 128-byte access (step 9; a warp per column read rows 512 bytes
+ * apart). The GDN_WARPS warps split the rows of the columns: each keeps its
+ * rows in registers for all the tokens of the call, and the state goes
+ * back to memory once at the end. Per token every warp decays its rows and
+ * adds its part of u = Sᵀk, the parts are added in warp order, then each
+ * warp writes β (v − u) along k into its rows and adds its part of the
+ * output with the query, added in warp order again. The order of every sum
+ * is fixed by dk, so feeding tokens in pieces gives the bits of feeding them
+ * at once. Tokens run one after the other, as the recurrence requires;
  * the chunked form that parallelizes a long prompt is step 10.
  */
 #include "ops/cuda/kernel.cuh"
 
-#define GDN_WARPS 8
-#define GDN_ROWS (ATH_GDN_MAX_DK / ATH_WARP)   /* state rows per lane */
+#define GDN_WARPS 4
+#define GDN_ROWS (ATH_GDN_MAX_DK / GDN_WARPS)   /* state rows per warp */
 
 /* torch.nn.functional.softplus with beta 1 and threshold 20. */
 static __device__ __forceinline__ float k_softplus(float x)
@@ -54,53 +58,70 @@ gdn_kernel(const void *q, int qdt, const void *k, int kdt, const void *v, int vd
            const void *beta, int bdt, float q_scale, float *state, void *out, int odt, int64_t T, int64_t nk,
            int64_t dk, int64_t nv, int64_t dv)
 {
-    const int lane = threadIdx.x % ATH_WARP;
-    const int64_t h = blockIdx.x;
-    const int64_t j = (int64_t)blockIdx.y * GDN_WARPS + threadIdx.x / ATH_WARP;   /* this warp's column */
-    if (j >= dv)
-        return;                                    /* the whole warp: no block-wide barrier below */
-    const int64_t kh = h / (nv / nk);              /* query/key head of value head h */
+    __shared__ float kq[2][ATH_GDN_MAX_DK];         /* the token's k, and q · q_scale */
+    __shared__ float part[GDN_WARPS][ATH_WARP];      /* the warps' partial sums      */
+    const int lane = threadIdx.x % ATH_WARP, warp = threadIdx.x / ATH_WARP;
+    const int64_t h = blockIdx.x, j = (int64_t)blockIdx.y * ATH_WARP + lane;   /* this lane's column */
+    const bool live = j < dv;
+    const int64_t kh = h / (nv / nk);               /* query/key head of value head h */
     float *S = state + h * dk * dv;
 
+    /* rows warp, warp + GDN_WARPS, ... of the column, in registers for the
+     * whole call; a row of the block's 32 columns is one 128-byte load */
     float s[GDN_ROWS];
 #pragma unroll
     for (int r = 0; r < GDN_ROWS; r++) {
-        const int64_t i = lane + (int64_t)r * ATH_WARP;
-        s[r] = i < dk ? S[i * dv + j] : 0.0f;
+        const int64_t i = warp + (int64_t)r * GDN_WARPS;
+        s[r] = live && i < dk ? S[i * dv + j] : 0.0f;
     }
     for (int64_t t = 0; t < T; t++) {
         const int64_t qk = (t * nk + kh) * dk, tv = t * nv + h;
+        for (int64_t i = threadIdx.x; i < dk; i += blockDim.x) {
+            kq[0][i] = k_ld(k, kdt, qk + i);
+            kq[1][i] = k_ld(q, qdt, qk + i) * q_scale;
+        }
         const float alpha = expf(k_ld(g, gdt, tv)), b = k_ld(beta, bdt, tv);
-        float kk[GDN_ROWS], qq[GDN_ROWS], u = 0.0f;
+        __syncthreads();
+        /* u = Sᵀk over this warp's rows, then over the warps in order */
+        float u = 0.0f;
 #pragma unroll
         for (int r = 0; r < GDN_ROWS; r++) {
-            const int64_t i = lane + (int64_t)r * ATH_WARP;
-            kk[r] = qq[r] = 0.0f;
+            const int64_t i = warp + (int64_t)r * GDN_WARPS;
             if (i < dk) {
-                kk[r] = k_ld(k, kdt, qk + i);
-                qq[r] = k_ld(q, qdt, qk + i) * q_scale;
                 s[r] *= alpha;
-                u += s[r] * kk[r];
+                u += s[r] * kq[0][i];
             }
         }
-        u = k_warp_sum(u);
-        const float delta = (k_ld(v, vdt, tv * dv + j) - u) * b;
+        part[warp][lane] = u;
+        __syncthreads();
+        u = part[0][lane];
+        for (int w = 1; w < GDN_WARPS; w++)
+            u += part[w][lane];
+        const float delta = live ? (k_ld(v, vdt, tv * dv + j) - u) * b : 0.0f;
         float o = 0.0f;
 #pragma unroll
         for (int r = 0; r < GDN_ROWS; r++) {
-            if (lane + (int64_t)r * ATH_WARP < dk) {
-                s[r] += kk[r] * delta;
-                o += s[r] * qq[r];
+            const int64_t i = warp + (int64_t)r * GDN_WARPS;
+            if (i < dk) {
+                s[r] += kq[0][i] * delta;
+                o += s[r] * kq[1][i];
             }
         }
-        o = k_warp_sum(o);
-        if (lane == 0)
+        __syncthreads();                             /* every warp has read part */
+        part[warp][lane] = o;
+        __syncthreads();
+        if (warp == 0 && live) {
+            o = part[0][lane];
+            for (int w = 1; w < GDN_WARPS; w++)
+                o += part[w][lane];
             k_st(out, odt, tv * dv + j, o);
+        }
+        __syncthreads();                             /* kq and part are rewritten next */
     }
 #pragma unroll
     for (int r = 0; r < GDN_ROWS; r++) {
-        const int64_t i = lane + (int64_t)r * ATH_WARP;
-        if (i < dk)
+        const int64_t i = warp + (int64_t)r * GDN_WARPS;
+        if (live && i < dk)
             S[i * dv + j] = s[r];
     }
 }
@@ -112,7 +133,7 @@ extern "C" ath_status ath_gdn_launch(const ath_device *d, const ath_tensor *q, c
     const int64_t T = q->shape[0], nk = q->shape[1], dk = q->shape[2], nv = v->shape[1], dv = v->shape[2];
     if (nv == 0 || dv == 0 || T == 0)
         return ATH_OK;
-    const int64_t col_blocks = (dv + GDN_WARPS - 1) / GDN_WARPS;
+    const int64_t col_blocks = (dv + ATH_WARP - 1) / ATH_WARP;
     if (nv > INT32_MAX || col_blocks > 65535) {
         ath_log(ATH_LOG_ERROR, "gdn: %lld heads of %lld columns, more than one launch holds", (long long)nv,
                 (long long)dv);

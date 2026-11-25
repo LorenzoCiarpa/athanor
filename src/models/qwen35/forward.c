@@ -186,16 +186,33 @@ static ath_status attention(fwd *f, const ath_qwen35_layer *L, ath_tensor *x)
      * into the cache at their positions */
     ath_tensor qn, kn, qn3, kn3, qr, k_new;
     ATH_CHECK(view(&k, &k_rows, 2, T * nkv, hd, 0));
-    ATH_CHECK(tmp(f, &qn, act, 2, T * nh, hd, 0));
-    ATH_CHECK(tmp(f, &kn, act, 2, T * nkv, hd, 0));
-    ATH_CHECK(ath_rmsnorm(f->dev, &q_rows, W(f, L->q_norm), 1.0f, f->eps, &qn));
-    ATH_CHECK(ath_rmsnorm(f->dev, &k_rows, W(f, L->k_norm), 1.0f, f->eps, &kn));
-    ATH_CHECK(view(&qn, &qn3, 3, T, nh, hd));
-    ATH_CHECK(view(&kn, &kn3, 3, T, nkv, hd));
-    ATH_CHECK(tmp(f, &qr, act, 3, T, nh, hd));
-    ATH_CHECK(tmp(f, &k_new, act, 3, T, nkv, hd));
-    ATH_CHECK(ath_rope(f->dev, &qn3, &f->pos, c->rope_dim, (float)c->rope_theta, &qr));
-    ATH_CHECK(ath_rope(f->dev, &kn3, &f->pos, c->rope_dim, (float)c->rope_theta, &k_new));
+    if (T == 1) {
+        /* one token: the normalized q and k side by side, so that one RoPE
+         * call rotates both (the same values, step 9) */
+        const size_t es = ath_dtype_size(act);
+        ath_tensor qkn, qkn3, qkr;
+        ATH_CHECK(tmp(f, &qkn, act, 2, nh + nkv, hd, 0));
+        ATH_CHECK(wrap(f, &qn, act, qkn.data, 2, nh, hd, 0));
+        ATH_CHECK(wrap(f, &kn, act, (char *)qkn.data + (size_t)(nh * hd) * es, 2, nkv, hd, 0));
+        ATH_CHECK(ath_rmsnorm(f->dev, &q_rows, W(f, L->q_norm), 1.0f, f->eps, &qn));
+        ATH_CHECK(ath_rmsnorm(f->dev, &k_rows, W(f, L->k_norm), 1.0f, f->eps, &kn));
+        ATH_CHECK(view(&qkn, &qkn3, 3, 1, nh + nkv, hd));
+        ATH_CHECK(tmp(f, &qkr, act, 3, 1, nh + nkv, hd));
+        ATH_CHECK(ath_rope(f->dev, &qkn3, &f->pos, c->rope_dim, (float)c->rope_theta, &qkr));
+        ATH_CHECK(wrap(f, &qr, act, qkr.data, 3, 1, nh, hd));
+        ATH_CHECK(wrap(f, &k_new, act, (char *)qkr.data + (size_t)(nh * hd) * es, 3, 1, nkv, hd));
+    } else {
+        ATH_CHECK(tmp(f, &qn, act, 2, T * nh, hd, 0));
+        ATH_CHECK(tmp(f, &kn, act, 2, T * nkv, hd, 0));
+        ATH_CHECK(ath_rmsnorm(f->dev, &q_rows, W(f, L->q_norm), 1.0f, f->eps, &qn));
+        ATH_CHECK(ath_rmsnorm(f->dev, &k_rows, W(f, L->k_norm), 1.0f, f->eps, &kn));
+        ATH_CHECK(view(&qn, &qn3, 3, T, nh, hd));
+        ATH_CHECK(view(&kn, &kn3, 3, T, nkv, hd));
+        ATH_CHECK(tmp(f, &qr, act, 3, T, nh, hd));
+        ATH_CHECK(tmp(f, &k_new, act, 3, T, nkv, hd));
+        ATH_CHECK(ath_rope(f->dev, &qn3, &f->pos, c->rope_dim, (float)c->rope_theta, &qr));
+        ATH_CHECK(ath_rope(f->dev, &kn3, &f->pos, c->rope_dim, (float)c->rope_theta, &k_new));
+    }
     ATH_CHECK(ath_scatter_rows(f->dev, &k_new, &f->pos, &kc));
     ATH_CHECK(ath_scatter_rows(f->dev, &v_new, &f->pos, &vc));
 
@@ -293,6 +310,14 @@ static ath_status mlp(fwd *f, const ath_qwen35_layer *L, ath_tensor *x)
     ATH_CHECK(tmp(f, &up, f->act, 2, T, I, 0));
     ATH_CHECK(tmp(f, &h, f->act, 2, T, I, 0));
     const ath_tensor *pw[] = {W(f, L->gate_proj), W(f, L->up_proj)};
+    if (f->dev && ath_matmul_swiglu_fits(x, pw[0], pw[1])) {
+        /* one token on a GPU: gate, up and SwiGLU in one launch (step 9) */
+        ath_tensor xn;
+        ATH_CHECK(tmp(f, &xn, f->act, 2, T, f->c->hidden, 0));
+        ATH_CHECK(ath_rmsnorm(f->dev, x, W(f, L->post_norm), 1.0f, f->eps, &xn));
+        ATH_CHECK(ath_matmul_swiglu_gpu(f->dev, &xn, pw[0], pw[1], &h));
+        return matmul_add(f, &h, W(f, L->down_proj), x);
+    }
     ath_tensor *po[] = {&gate, &up};
     ATH_CHECK(norm_matmuls(f, x, L->post_norm, 2, pw, po));
     ATH_CHECK(ath_swiglu(f->dev, &gate, &up, &h));

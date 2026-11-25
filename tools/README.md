@@ -7,8 +7,9 @@ One binary, `athanor`, with subcommands. `athanor.c` holds only the dispatch tab
 | `athanor.c` | dispatch table, global `--help`, arena-backed stdout buffer, exit codes |
 | `commands.h` | subcommand entry points (`ath_cmd_<name>`) and exit codes: 0 success, 1 failure, 2 usage |
 | `inspect.c` | `athanor inspect` |
-| `chat.c` | `athanor chat` (step 5; on the GPU since step 8) |
+| `chat.c` | `athanor chat` (step 5; on the GPU since step 8, through the decoder since step 9) |
 | `devices.c` | `athanor devices` (step 6) |
+| `bench.c` | `athanor bench` (step 9): ppN and tgN@dD as llama-bench names them, median of measured runs, the JSON report of `docs/BENCHMARKS.md` |
 | `dev/` | development-only helpers, never built into `athanor` |
 
 | Subcommand | Purpose | Step |
@@ -97,3 +98,14 @@ Development-only helpers (Python allowed): Unicode table generation, golden data
 | `check_nvcc.sh` | `make cuda`'s check that the nvcc in `CUDA_HOME` exists and is recent enough for `CUDA_ARCH` (12.8 for `sm_120`) |
 | `gen_unicode.py` | generates `src/text/unicode_tables.h` (character classes and NFC data) from Python's `unicodedata`, with the normalization limited to what the reference tokenizer applies; run with the golden environment (`src/text/README.md`) |
 | `check_alloc.sh`, `alloc_trace.c` | run a command under an `LD_PRELOAD` shim that reports every `malloc`/`calloc`/`realloc`, and fail if any caller is not `ath_arena_alloc` or if the command itself fails. `make check-alloc` runs it on `athanor inspect` with and without `--roles`. Needs a C compiler and `addr2line` |
+
+## `athanor bench` (step 9)
+
+```
+athanor bench models/Qwen3.5-0.8B -p 512,4096 -n 128 -d 0,4096,32768 -r 5 --json report.json
+```
+
+- `ppN`: a prompt of N tokens into an empty state, in pieces of `--chunk` (2048); prefill tokens/s and the time to the first token (the prompt and the choice of the first token).
+- `tgN@dD`: N tokens decoded one at a time, greedy, after a prompt of D tokens; decode tokens/s. On a GPU through the decoder (`src/infer/README.md`); `--direct` runs step 8's way, one forward call per token with the logits on the host. The prompt is finished before the clock starts.
+- Token ids are pseudo-random (`--seed`), as llama-bench's. Every test runs `--warmup` times unmeasured, then `--reps` times measured from a reset state: the median with min and max.
+- `--json` writes the report `docs/BENCHMARKS.md` asks for: the hardware (GPU, PCIe link, driver, CPU, RAM, storage), the software (the commit, from `build/gen/version.h`, the compiler, runtime and cuBLASLt versions), the model files with their SHA-256 and Hugging Face revision (`--no-hash` skips the hashes), the workload, the method, every run, and memory from the driver and the kernel.

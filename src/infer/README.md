@@ -4,7 +4,7 @@ The inference engine. Decode at batch 1 is limited by memory bandwidth, so the g
 
 | File | Content | Step |
 | --- | --- | --- |
-| `engine.h`, `engine.c` | a model on a GPU: the device opened, every param the forward pass reads copied there once, the `ath_exec` a GPU pass needs (device, weights, scratch), sequence states on the device; later placement, warm-up (graph capture) and the prefill/decode loop | 8 (load, states, exec), 9–10 |
+| `engine.h`, `engine.c` | a model on a GPU: the device opened, every param the forward pass reads copied there once, the `ath_exec` a GPU pass needs (device, weights, scratch), sequence states on the device; the decoder, one token at a time in a recorded graph with the choice on the device (step 9); later placement | 8 (load, states, exec), 9 (decoder) |
 | `state.c` | paged KV cache, snapshots for prefix reuse; on-disk persistence of prefix snapshots (hash of token prefix → KV pages + recurrent and conv state), with a size budget and LRU eviction. The plain state of one sequence on a device is `ath_state_init_gpu` in `src/model/state.c` (step 8), next to the host one | 13, 14 |
 | `sched.c` | request queue, small continuous batching for the server | 13 |
 | `tier.c` | MoE expert placement across VRAM, pinned RAM, RAM and disk; usage statistics; copy-or-compute-on-CPU cost model; router-ahead prefetch | 12 |
@@ -49,3 +49,11 @@ ath_engine_close(&e);
 - **Memory.** Three device arenas: the weights for the engine's life, the states, and the scratch memory of one pass, released after every call.
 - **One sequence per batch.** Batches of several sequences, paged KV memory, graph capture and sampling on the GPU come with fast decode and the server (steps 9 and 13).
 - **Checked** by `tests/test_engine.c` (the copies byte for byte, states on the device, sequences in pieces, and the gate: greedy generation against the reference on 50 prompts of 256 tokens) and by the GPU runs of `tests/test_forward.c` (`tests/README.md`, Engine).
+
+## The decoder (step 9)
+
+`ath_decoder` runs one token at a time on the engine's device. A step is the forward pass of the token as a device batch (`ATH_BATCH_DEVICE`: token, position and logits in device memory, so nothing in the pass depends on how many tokens the state holds) followed by the choice of the next token on the GPU (`ath_sample_gpu`, greedy or top-k up to 64; otherwise the logits are copied to pinned memory and `ath_sample_ref` chooses on the host). The first step runs that work directly, which also sizes the scratch memory; the second records it in a graph (`ath_graph`, `src/backend/README.md`); every later step writes the token, its position and the uniform number into pinned memory, launches the graph and reads 4 bytes back. A replayed step advances `n_past` as `ath_model_forward` would.
+
+- **One launch per token.** Some 300 kernels, recorded once. The step 8 decode launched them one by one from the host and waited for the logits at every token.
+- **The same bits.** A replayed step gives the logits of the same step run directly (`tests/test_engine.c`, `engine_decoder`), and the tokens `ath_sample_ref` chooses with the same uniform numbers.
+- **What may change between steps.** The state may be reset or copied into, and other forward calls on it may come between steps: its buffers and the engine's scratch memory stay where they are, which is what the recording relies on. Another state or another sampler needs another decoder.

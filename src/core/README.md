@@ -12,6 +12,7 @@ The bottom layer: memory, tensors, files, parsing, threads. No GPU code and no k
 | `buf.h`, `buf.c` | `ath_buf`: a growable byte buffer in an arena, always NUL-terminated (rendered prompts, decoded text, JSON) | 5 |
 | `safetensors.h`, `safetensors.c` | single and multi-shard readers, zero-copy views; writer added in phase 4 for checkpoint export | 1 |
 | `threads.c/.h` | fixed pthread pool for CPU work: `ath_pool_init`, `ath_pool_run` (fork and join, tasks assigned statically, runs from several threads take turns), `ath_pool_free`; first user `ath_matmul_fast`; later experts, dequantization, I/O completion | 4 |
+| `sha256.h`, `sha256.c` | SHA-256 (FIPS 180-4), streaming and of a whole file through its mapping; the weight files of benchmark reports (step 9), later the keys of on-disk prefix snapshots (step 14) | 9 |
 | `rng.h`, `rng.c` | `ath_rng`: xoshiro256** seeded by splitmix64, the same sequence for the same seed on every machine; the state belongs to the caller. First user: sampling in `athanor chat` | 5 |
 
 ## Conventions

@@ -402,8 +402,12 @@ fast_rows(const void *q, int qdt, const void *k, int kdt, const void *v, int vdt
     const int lane = threadIdx.x % ATH_WARP, warp = threadIdx.x / ATH_WARP;
     const int64_t th = blockIdx.x, t = th / nh, kh = th % nh / (nh / nkv);
     const int64_t last = attn_last(pos, S, T, t);
-    for (int64_t i = threadIdx.x; i < d; i += ATTN_THREADS)
-        qs[i] = k_ld(q, qdt, th * d + i);
+#pragma unroll
+    for (int r = 0; r < FAST_DIM / ATTN_THREADS; r++) {
+        const int64_t i = threadIdx.x + (int64_t)r * ATTN_THREADS;
+        if (i < d)
+            qs[i] = k_ld(q, qdt, th * d + i);
+    }
     __syncthreads();
     float m = -INFINITY, l = 0.0f, acc[ATTN_PER_THREAD];
 #pragma unroll
@@ -436,8 +440,12 @@ fast_split(const void *q, int qdt, const void *k, int kdt, const void *v, int vd
     if (j0 > last)
         return;
     const int64_t j1 = j0 + ATH_ATTN_SPLIT < last + 1 ? j0 + ATH_ATTN_SPLIT : last + 1;
-    for (int64_t i = threadIdx.x; i < G * d; i += ATTN_THREADS)
-        qs[i] = k_ld(q, qdt, (t * nh + h0) * d + i);
+#pragma unroll
+    for (int r = 0; r < ATTN_MAX_GROUP * FAST_DIM / ATTN_THREADS; r++) {   /* the loads at once */
+        const int64_t i = threadIdx.x + (int64_t)r * ATTN_THREADS;
+        if (i < G * d)
+            qs[i] = k_ld(q, qdt, (t * nh + h0) * d + i);
+    }
     __syncthreads();
     float m[ATTN_MAX_GROUP], l[ATTN_MAX_GROUP], ap[ATTN_MAX_GROUP][8];
     fast_piece(qs, sc, xch, st, G, k, kdt, v, vdt, nkv, kh, d, dv, scale, j0, j1, m, l, ap);

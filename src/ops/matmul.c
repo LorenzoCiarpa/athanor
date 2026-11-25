@@ -176,3 +176,19 @@ ath_status ath_matmul_add_gpu(const ath_device *d, const ath_tensor *x, const at
         return ops_fail(ATH_ERR_UNSUPPORTED, op, "matmul_add: shapes the GEMV kernel does not take");
     return ath_matmul_add_launch(d, x, w, out);
 }
+
+bool ath_matmul_swiglu_fits(const ath_tensor *x, const ath_tensor *wg, const ath_tensor *wu)
+{
+    return x && wg && wu && x->data && wg->data && wu->data && x->ndim >= 1 && ath_gemv_swiglu_fits(x, wg, wu);
+}
+
+ath_status ath_matmul_swiglu_gpu(const ath_device *d, const ath_tensor *x, const ath_tensor *wg, const ath_tensor *wu,
+                                 ath_tensor *out)
+{
+    int64_t N, M, K;
+    ATH_CHECK(check(x, wg, out, OPS_GPU, &N, &M, &K));
+    ATH_CHECK(check(x, wu, out, OPS_GPU, &N, &M, &K));
+    if (!ath_gemv_swiglu_fits(x, wg, wu))
+        return ops_fail(ATH_ERR_UNSUPPORTED, op, "matmul_swiglu: shapes the kernel does not take");
+    return ath_matmul_swiglu_launch(d, x, wg, wu, out);
+}

@@ -141,6 +141,7 @@ typedef struct {
     ath_tokenizer    tok;
     ath_pool         pool;
     ath_engine      *engine;        /* NULL on the CPU                               */
+    ath_decoder     *dec;           /* the engine's decoder of state (step 9)         */
     ath_exec         exec;          /* where the forward pass runs                   */
     ath_state        state, snap;
     ath_tokens       seen;          /* the tokens the state holds                    */
@@ -302,17 +303,27 @@ static ath_status turn(session *s, history *h, ath_arena *tmp)
     int32_t ne, n_gen = 0;
     int32_t room = o->ctx - (int32_t)s->seen.n;
     int32_t limit = o->max_tokens < room ? o->max_tokens : room;
-    for (; n_gen < limit; n_gen++) {
-        int32_t next;
+    /* the first token from the prompt's logits; then, on a GPU, the decoder
+     * runs each token and chooses the next on the device (one u per token
+     * chosen, as on the CPU) */
+    int32_t next = 0;
+    if (limit > 0)
         ATH_CHECK(ath_sample_ref(&s->logits, &o->sampler, ath_rng_uniform(&s->rng), s->scratch, &next));
+    for (; n_gen < limit; n_gen++) {
+        if (n_gen > 0 && !s->dec)
+            ATH_CHECK(ath_sample_ref(&s->logits, &o->sampler, ath_rng_uniform(&s->rng), s->scratch, &next));
         if (next == s->eos[0] || next == s->eos[1])
             break;
         size_t len;
         const char *piece = ath_tokenizer_token(&s->tok, next, &len);
         ATH_CHECK(ath_model_parse(&s->m, &ps, piece, len, ev, 64, &ne));
         show(s, &ans, ev, ne, h->a);
-        if (n_gen + 1 < limit)
+        if (n_gen + 1 < limit && s->dec) {
+            ATH_CHECK(ath_tokens_push(&s->seen, next));
+            ATH_CHECK(ath_decoder_step(s->dec, next, ath_rng_uniform(&s->rng), &next));
+        } else if (n_gen + 1 < limit) {
             ATH_CHECK(feed(s, &next, 0, 1, true));
+        }
     }
     ATH_CHECK(ath_model_parse(&s->m, &ps, NULL, 0, ev, 64, &ne));
     show(s, &ans, ev, ne, h->a);
@@ -533,6 +544,12 @@ int ath_cmd_chat(ath_arena *a, int argc, char **argv)
         st = ath_engine_state(s->engine, &s->state, act, o.ctx, a);
         if (st == ATH_OK && !o.prompt)
             st = ath_engine_state(s->engine, &s->snap, act, o.ctx, a);
+        if (st == ATH_OK) {
+            ath_decoder *dec = ath_arena_zalloc(a, sizeof *dec, _Alignof(ath_decoder));
+            st = dec ? ath_decoder_open(dec, s->engine, &s->state, &o.sampler, a) : ATH_ERR_NOMEM;
+            if (st == ATH_OK)
+                s->dec = dec;
+        }
         if (st == ATH_OK && o.stats)
             fprintf(stderr, "athanor chat: on %s, %.2f GiB of weights\n", s->engine->dev.name,
                     (double)s->engine->weight_bytes / 1073741824.0);
@@ -554,6 +571,8 @@ int ath_cmd_chat(ath_arena *a, int argc, char **argv)
     } else {
         fprintf(stderr, "athanor chat: %s\n", ath_status_str(st));
     }
+    if (s->dec)
+        ath_decoder_close(s->dec);
     if (s->engine)
         ath_engine_close(s->engine);
     ath_model_close(&s->m);

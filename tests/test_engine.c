@@ -242,9 +242,14 @@ ATH_TEST(engine_pieces)
         const double vs_cpu = score(gpu[r], cpu, NT * V), vs_whole = score(gpu[r], gpu[0], NT * V);
         printf("    GPU %-14s against the CPU %.2e, against the GPU at once %.2e%s\n", runs[r].name, vs_cpu, vs_whole,
                r && memcmp(gpu[r], gpu[0], sizeof gpu[0]) == 0 ? " (the same bits)" : "");
-        /* the random tiny model is ill-conditioned (test_forward.c); 9.8e-6 measured */
+        /* the random tiny model is ill-conditioned (test_forward.c): 9.8e-6
+         * measured against the CPU in step 8. Against the GPU at once,
+         * 1.22e-5 since step 9: pieces of up to 8 tokens take the GEMV kernel
+         * and the decode fusions, the whole prompt cuBLASLt, and the random
+         * network amplifies the difference of their roundings; the real
+         * checkpoint's gates are the measure (tests/README.md, Engine) */
         ATH_EXPECT(vs_cpu <= 1e-4);
-        ATH_EXPECT(vs_whole <= 1e-5);
+        ATH_EXPECT(vs_whole <= 5e-5);
     }
     ath_arena_free(&scratch);
     ath_engine_close(&e);

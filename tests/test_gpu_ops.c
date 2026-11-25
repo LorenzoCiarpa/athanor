@@ -469,6 +469,32 @@ ATH_TEST(gpu_matmul_n)
     gpu_close(&g);
 }
 
+/* Gate, up and SwiGLU in one launch (step 9): the bits of the two ops. */
+ATH_TEST(gpu_matmul_swiglu)
+{
+    gpu g;
+    GPU_OR_SKIP(g);
+    static const ath_dtype dts[] = {ATH_DTYPE_BF16, ATH_DTYPE_F32};
+    for (size_t i = 0; i < ATH_ARRAY_LEN(dts); i++) {
+        const int64_t K = 1024, M = 3584;
+        ath_tensor x = rand_t(&g, ATH_DTYPE_BF16, -1, 1, SHAPE(1, K)), xd = up(&g, &x);
+        ath_tensor wg = rand_t(&g, ATH_DTYPE_BF16, -1, 1, SHAPE(M, K)), wu = rand_t(&g, ATH_DTYPE_BF16, -1, 1, SHAPE(M, K));
+        ath_tensor o = host(&g, dts[i], SHAPE(1, M));
+        ath_tensor wgd = up(&g, &wg), wud = up(&g, &wu), gd = up(&g, &o), ud = up(&g, &o), hd = up(&g, &o), fd = up(&g, &o);
+        const ath_tensor *wp[] = {&wgd, &wud};
+        ath_tensor *op[] = {&gd, &ud};
+        ATH_REQUIRE(ath_matmul_swiglu_fits(&xd, &wgd, &wud));
+        ATH_EXPECT_OK(ath_matmul_n_gpu(&g.d, &xd, 2, wp, op));
+        ATH_EXPECT_OK(ath_swiglu_gpu(&g.d, &gd, &ud, &hd));
+        ATH_EXPECT_OK(ath_matmul_swiglu_gpu(&g.d, &xd, &wgd, &wud, &fd));
+        ATH_EXPECT(same_bits(&g, &fd, &hd));
+    }
+    ath_tensor x2 = rand_t(&g, ATH_DTYPE_BF16, -1, 1, SHAPE(2, 64)), w2 = rand_t(&g, ATH_DTYPE_BF16, -1, 1, SHAPE(8, 64));
+    ath_tensor x2d = up(&g, &x2), w2d = up(&g, &w2);
+    ATH_EXPECT(!ath_matmul_swiglu_fits(&x2d, &w2d, &w2d));   /* two rows: not this kernel */
+    gpu_close(&g);
+}
+
 /* ---- norms ----------------------------------------------------------------------- */
 
 ATH_TEST(gpu_norms)
@@ -823,7 +849,7 @@ ATH_TEST(gpu_gdn)
 }
 
 static const ath_test_case tests[] = {
-    ATH_TEST_ENTRY(gpu_argument_checks), ATH_TEST_ENTRY(gpu_embed),       ATH_TEST_ENTRY(gpu_matmul),      ATH_TEST_ENTRY(gpu_gemv), ATH_TEST_ENTRY(gpu_matmul_n), ATH_TEST_ENTRY(gpu_scatter_rows), ATH_TEST_ENTRY(gpu_sample),
+    ATH_TEST_ENTRY(gpu_argument_checks), ATH_TEST_ENTRY(gpu_embed),       ATH_TEST_ENTRY(gpu_matmul),      ATH_TEST_ENTRY(gpu_gemv), ATH_TEST_ENTRY(gpu_matmul_n), ATH_TEST_ENTRY(gpu_matmul_swiglu), ATH_TEST_ENTRY(gpu_scatter_rows), ATH_TEST_ENTRY(gpu_sample),
     ATH_TEST_ENTRY(gpu_norms),           ATH_TEST_ENTRY(gpu_rope),        ATH_TEST_ENTRY(gpu_elementwise),
     ATH_TEST_ENTRY(gpu_attn),            ATH_TEST_ENTRY(gpu_conv),        ATH_TEST_ENTRY(gpu_gdn_gates),
     ATH_TEST_ENTRY(gpu_gdn),
