@@ -152,7 +152,7 @@ static ath_status feed(bench *b, const int32_t *ids, int64_t n, int32_t chunk, b
 {
     for (int64_t i = 0; i < n; i += chunk) {
         int64_t k = n - i < chunk ? n - i : chunk;
-        ath_batch bt = {ids + i, (int32_t)k, want && i + k == n ? &b->logits : NULL};
+        ath_batch bt = {.tokens = ids + i, .n_tokens = (int32_t)k, .logits = want && i + k == n ? &b->logits : NULL};
         ATH_CHECK(ath_model_forward(&b->m, &bt, &b->st, NULL, b->scratch, &b->exec));
     }
     return ATH_OK;
@@ -178,7 +178,7 @@ static ath_status run_tg(bench *b, const options *o, int64_t depth, double *secs
     int32_t tok = b->ids[depth];
     double t0 = now_s();
     for (int32_t i = 0; i < o->gen; i++) {
-        ath_batch bt = {&tok, 1, &b->logits};
+        ath_batch bt = {.tokens = &tok, .n_tokens = 1, .logits = &b->logits};
         ATH_CHECK(ath_model_forward(&b->m, &bt, &b->st, NULL, b->scratch, &b->exec));
         ATH_CHECK(ath_sample_ref(&b->logits, &b->greedy, 0.0, b->scratch, &tok));
     }

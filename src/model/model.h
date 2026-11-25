@@ -247,7 +247,18 @@ typedef struct {
     int32_t        n_tokens;
     ath_tensor    *logits;  /* NULL (no output), or f32 [n_tokens, vocab_size] (every
                              * token) or [1, vocab_size] (the last token only)            */
+    const int32_t *pos;     /* ATH_BATCH_DEVICE: [n_tokens] positions; NULL otherwise    */
+    uint32_t       flags;   /* ATH_BATCH_*                                               */
 } ath_batch;
+
+/* A batch whose tokens, positions and logits are in the memory of the
+ * device the pass runs on (step 9). The pass then copies nothing between
+ * the host and the device and does not wait for the device: everything it
+ * does is queued on the compute stream, so the call can be captured in a
+ * graph and replayed (backend.h, ath_graph). The positions must equal
+ * n_past, n_past + 1, ... when the work runs, and the token ids must be in
+ * the vocabulary: the host cannot read them to check. */
+#define ATH_BATCH_DEVICE 1u
 
 /* Callbacks from inside the forward pass. Every member may be NULL; the
  * tensors are valid during the call only and must not be written. */
@@ -366,8 +377,11 @@ ath_status ath_state_copy(ath_state *dst, const ath_state *src, const ath_model 
  * host memory, where x->pool lends threads to the CPU work and the results
  * are the same, bit for bit, with any number of threads; a GPU exec for a
  * state on that device (ATH_ERR_INVALID_ARG otherwise). On a GPU the
- * logits, in host memory as always, are ready when the call returns; a
- * batch without logits returns as soon as its work is queued. */
+ * logits, in host memory, are ready when the call returns; a batch without
+ * logits returns as soon as its work is queued. A device batch
+ * (ATH_BATCH_DEVICE, GPU only) has its tokens, positions and logits on the
+ * device and returns as soon as its work is queued; its token ids and
+ * positions are the caller's to guarantee. */
 ath_status ath_model_forward(const ath_model *m, const ath_batch *b, ath_state *s, const ath_hooks *h,
                              ath_arena *scratch, const ath_exec *x);
 

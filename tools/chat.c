@@ -168,7 +168,7 @@ static ath_status feed(session *s, const int32_t *ids, size_t from, size_t to, b
         ATH_CHECK(ath_tokens_push(&s->seen, ids[i]));
     if (from == to)
         return ATH_OK;
-    ath_batch b = {ids + from, (int32_t)(to - from), want ? &s->logits : NULL};
+    ath_batch b = {.tokens = ids + from, .n_tokens = (int32_t)(to - from), .logits = want ? &s->logits : NULL};
     return ath_model_forward(&s->m, &b, &s->state, NULL, s->scratch, &s->exec);
 }
 

@@ -181,20 +181,20 @@ ATH_TEST(engine_state)
     float la[V], lb[V];
     ath_tensor ta = f32_tensor(la, 1, V), tb = f32_tensor(lb, 1, V);
     ATH_REQUIRE_OK(ath_engine_state(&e, &c, ATH_DTYPE_BF16, 8, &t.a));
-    ATH_REQUIRE_OK(ath_model_forward(m, &(ath_batch){toks, 4, NULL}, &s, NULL, &scratch, &e.exec));
+    ATH_REQUIRE_OK(ath_model_forward(m, &(ath_batch){.tokens = toks, .n_tokens = 4, .logits = NULL}, &s, NULL, &scratch, &e.exec));
     ATH_REQUIRE_OK(ath_state_copy(&c, &s, m));
-    ATH_REQUIRE_OK(ath_model_forward(m, &(ath_batch){toks + 4, 2, &ta}, &s, NULL, &scratch, &e.exec));
-    ATH_REQUIRE_OK(ath_model_forward(m, &(ath_batch){toks + 4, 2, &tb}, &c, NULL, &scratch, &e.exec));
+    ATH_REQUIRE_OK(ath_model_forward(m, &(ath_batch){.tokens = toks + 4, .n_tokens = 2, .logits = &ta}, &s, NULL, &scratch, &e.exec));
+    ATH_REQUIRE_OK(ath_model_forward(m, &(ath_batch){.tokens = toks + 4, .n_tokens = 2, .logits = &tb}, &c, NULL, &scratch, &e.exec));
     ATH_EXPECT(c.n_past == 6 && memcmp(la, lb, sizeof la) == 0);
 
     /* a pass runs where its state is */
     ATH_REQUIRE_OK(ath_state_init(&h, m, ATH_DTYPE_BF16, 8, &t.a));
-    ATH_EXPECT_STATUS(ath_model_forward(m, &(ath_batch){toks, 1, NULL}, &s, NULL, &scratch, NULL), ATH_ERR_INVALID_ARG);
-    ATH_EXPECT_STATUS(ath_model_forward(m, &(ath_batch){toks, 1, NULL}, &h, NULL, &scratch, &e.exec),
+    ATH_EXPECT_STATUS(ath_model_forward(m, &(ath_batch){.tokens = toks, .n_tokens = 1, .logits = NULL}, &s, NULL, &scratch, NULL), ATH_ERR_INVALID_ARG);
+    ATH_EXPECT_STATUS(ath_model_forward(m, &(ath_batch){.tokens = toks, .n_tokens = 1, .logits = NULL}, &h, NULL, &scratch, &e.exec),
                       ATH_ERR_INVALID_ARG);
     ath_exec half = e.exec;
     half.weights = NULL;
-    ATH_EXPECT_STATUS(ath_model_forward(m, &(ath_batch){toks, 1, NULL}, &s, NULL, &scratch, &half), ATH_ERR_INVALID_ARG);
+    ATH_EXPECT_STATUS(ath_model_forward(m, &(ath_batch){.tokens = toks, .n_tokens = 1, .logits = NULL}, &s, NULL, &scratch, &half), ATH_ERR_INVALID_ARG);
     ATH_EXPECT_STATUS(ath_state_copy(&h, &s, m), ATH_ERR_INVALID_ARG);
 
     ath_arena_free(&scratch);
@@ -227,7 +227,7 @@ ATH_TEST(engine_pieces)
     ath_state s;
     ath_tensor lc = f32_tensor(cpu, NT, V);
     ATH_REQUIRE_OK(ath_state_init(&s, m, ATH_DTYPE_F32, NT, &t.a));
-    ATH_REQUIRE_OK(ath_model_forward(m, &(ath_batch){toks, NT, &lc}, &s, NULL, &scratch, NULL));
+    ATH_REQUIRE_OK(ath_model_forward(m, &(ath_batch){.tokens = toks, .n_tokens = NT, .logits = &lc}, &s, NULL, &scratch, NULL));
     for (int r = 0; r < 3; r++) {
         ath_state g;
         ATH_REQUIRE_OK(ath_engine_state(&e, &g, ATH_DTYPE_F32, NT, &t.a));
@@ -235,7 +235,7 @@ ATH_TEST(engine_pieces)
         for (int i = 0; i < runs[r].n; i++) {
             const int n = runs[r].sizes[i];
             ath_tensor l = f32_tensor(gpu[r] + done * V, n, V);
-            ATH_REQUIRE_OK(ath_model_forward(m, &(ath_batch){toks + done, n, &l}, &g, NULL, &scratch, &e.exec));
+            ATH_REQUIRE_OK(ath_model_forward(m, &(ath_batch){.tokens = toks + done, .n_tokens = n, .logits = &l}, &g, NULL, &scratch, &e.exec));
             done += n;
         }
         const double vs_cpu = score(gpu[r], cpu, NT * V), vs_whole = score(gpu[r], gpu[0], NT * V);
@@ -361,7 +361,7 @@ ATH_TEST(generate_golden)
         ath_json_to_double(ath_json_get(p, "noise"), &own);
 
         ATH_REQUIRE_OK(ath_state_reset(&s, &m));
-        ATH_REQUIRE_OK(ath_model_forward(&m, &(ath_batch){prompt, (int32_t)np, &logits}, &s, NULL, &scratch, &e->exec));
+        ATH_REQUIRE_OK(ath_model_forward(&m, &(ath_batch){.tokens = prompt, .n_tokens = (int32_t)np, .logits = &logits}, &s, NULL, &scratch, &e->exec));
         int64_t first_diff = -1;
         const ath_json *mj = ath_json_first(margins);
         for (int64_t k = 0; k < S; k++, mj = mj->next) {
@@ -389,7 +389,7 @@ ATH_TEST(generate_golden)
             }
             if (k + 1 < S) {   /* the reference's token: teacher forcing */
                 const double t0 = now();
-                ATH_REQUIRE_OK(ath_model_forward(&m, &(ath_batch){&ref[k], 1, &logits}, &s, NULL, &scratch, &e->exec));
+                ATH_REQUIRE_OK(ath_model_forward(&m, &(ath_batch){.tokens = &ref[k], .n_tokens = 1, .logits = &logits}, &s, NULL, &scratch, &e->exec));
                 t_decode += now() - t0;
                 tokens_run++;
             }

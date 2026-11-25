@@ -169,8 +169,10 @@ static ath_status check_logits(const ath_model *m, const ath_batch *b)
         return bad(ATH_ERR_INVALID_ARG, "logits: no data");
     if (l->dtype != ATH_DTYPE_F32)
         return bad(ATH_ERR_TYPE, "logits: dtype %s; expected f32", ath_dtype_name(l->dtype));
-    if (l->tier != ATH_TIER_RAM && l->tier != ATH_TIER_PINNED)
-        return bad(ATH_ERR_UNSUPPORTED, "logits: tensor in %s; expected host memory", ath_tier_name(l->tier));
+    const bool on_dev = b->flags & ATH_BATCH_DEVICE;
+    if (on_dev ? l->tier != ATH_TIER_VRAM : l->tier != ATH_TIER_RAM && l->tier != ATH_TIER_PINNED)
+        return bad(ATH_ERR_UNSUPPORTED, "logits: tensor in %s; expected %s memory", ath_tier_name(l->tier),
+                   on_dev ? "device" : "host");
     if (l->ndim != 2 || l->shape[1] != m->vocab_size || (l->shape[0] != b->n_tokens && l->shape[0] != 1) ||
         !ath_tensor_is_contiguous(l))
         return bad(ATH_ERR_INVALID_ARG, "logits: expected a contiguous [%d, %d] or [1, %d] tensor",
@@ -192,7 +194,12 @@ ath_status ath_model_forward(const ath_model *m, const ath_batch *b, ath_state *
     if (s->n_past < 0 || b->n_tokens > s->capacity - s->n_past)
         return bad(ATH_ERR_RANGE, "%d tokens after %d do not fit in a state of %d", b->n_tokens, s->n_past,
                    s->capacity);
-    for (int32_t i = 0; i < b->n_tokens; i++)
+    if (b->flags & ~ATH_BATCH_DEVICE)
+        return bad(ATH_ERR_INVALID_ARG, "unknown batch flags 0x%x", b->flags);
+    if ((b->flags & ATH_BATCH_DEVICE) ? !b->pos || !x || !x->dev : b->pos != NULL)
+        return bad(ATH_ERR_INVALID_ARG, "positions are given with a device batch (ATH_BATCH_DEVICE), on a GPU, "
+                                        "and only then");
+    for (int32_t i = 0; !(b->flags & ATH_BATCH_DEVICE) && i < b->n_tokens; i++)
         if (b->tokens[i] < 0 || b->tokens[i] >= m->vocab_size)
             return bad(ATH_ERR_RANGE, "token %d at index %d is outside the vocabulary [0, %d)", b->tokens[i], i,
                        m->vocab_size);
