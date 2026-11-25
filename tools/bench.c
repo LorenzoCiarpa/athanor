@@ -65,6 +65,9 @@ void ath_cmd_bench_usage(FILE *out)
             "  --chunk <n>           prompt tokens per forward call (default 2048)\n"
             "  --device <cpu|gpu>    where the model runs (default: gpu if there is one)\n"
             "  --threads <n>         CPU threads (default: all)\n"
+            "  --prompt-ids <file>   token ids (comma- or space-separated) as the prompt instead of\n"
+            "                        pseudo-random ones: ppN runs them, and tgM decodes M tokens\n"
+            "                        greedily after them, as other engines measure a given prompt\n"
             "  --experts <n>         MoE: routed experts per layer kept in device memory\n"
             "                        (default: as many as fit; the rest run on the CPU)\n"
             "  --seed <n>            seed of the token ids (default 1)\n"
@@ -77,6 +80,7 @@ void ath_cmd_bench_usage(FILE *out)
 
 typedef struct {
     const char *model, *device, *json;
+    const char *prompt_ids;   /* a file of token ids: the prompt of both tests (step 12) */
     int64_t     prompts[MAX_LIST], depths[MAX_LIST];
     int32_t     n_prompts, n_depths;
     int32_t     gen, reps, warmup, chunk, threads;
@@ -412,6 +416,20 @@ static ath_status write_report(const bench *b, const options *o, const result *r
                              b->decoder ? "decoder: one recorded graph per token, the choice on the GPU (step 9)"
                                         : "one forward call per token, logits to the host, ath_sample_ref (step 8)",
                              b->e ? "gpu" : "cpu"));
+    if (o->prompt_ids) {
+        ATH_CHECK(ath_buf_puts(j, ",\n  \"prompt_ids\": "));
+        ATH_CHECK(ath_json_write_str(j, o->prompt_ids, strlen(o->prompt_ids)));
+    }
+    if (b->e && b->e->tier) {   /* where the routed experts were (step 12) */
+        const ath_placement *t = b->e->tier;
+        ATH_CHECK(ath_buf_printf(j,
+                                 ",\n  \"experts\": {\"per_layer\": %lld, \"in_device_memory\": %d, "
+                                 "\"bytes_each\": %llu, \"host_bytes\": %llu, \"moved\": %llu, \"period\": %d, "
+                                 "\"moves\": %d, \"cpu_threads\": %d}",
+                                 (long long)t->n_experts, t->slots, (unsigned long long)t->expert_bytes,
+                                 (unsigned long long)t->host_bytes, (unsigned long long)t->moved, t->o.period,
+                                 t->o.moves, ath_pool_threads(&t->pool)));
+    }
     ATH_CHECK(ath_buf_printf(j,
                              ",\n  \"method\": {\"warmup_runs\": %d, \"measured_runs\": %d, \"statistic\": "
                              "\"median, with min and max\", \"timer\": \"CLOCK_MONOTONIC around whole calls; "
@@ -482,6 +500,8 @@ static int parse(int argc, char **argv, options *o)
             o->threads = (int32_t)x;
         else if (!strcmp(a, "--experts") && v && parse_int(v, 0, 1 << 20, &x))
             o->experts = (int32_t)x;
+        else if (!strcmp(a, "--prompt-ids") && v)
+            o->prompt_ids = v;
         else if (!strcmp(a, "--seed") && v && parse_int(v, 0, INT64_MAX, &x))
             o->seed = (uint64_t)x;
         else if (!strcmp(a, "--device") && v && (!strcmp(v, "cpu") || !strcmp(v, "gpu")))
@@ -523,6 +543,36 @@ int ath_cmd_bench(ath_arena *a, int argc, char **argv)
 
     /* the largest context a test needs */
     int64_t ctx = 1;
+    /* --prompt-ids: one prompt of those tokens, and decoding after all but the
+     * last (whose step gives the first token generated) */
+    int32_t *pids = NULL;
+    int64_t n_pids = 0;
+    if (o.prompt_ids) {
+        ath_file f;
+        if (ath_file_open(&f, o.prompt_ids) != ATH_OK || !f.size) {
+            fprintf(stderr, "athanor bench: cannot read %s\n", o.prompt_ids);
+            return ATH_EXIT_FAILURE;
+        }
+        pids = ath_arena_alloc(a, f.size * sizeof *pids, 64);
+        const char *c = f.data, *end = c + f.size;
+        while (pids && c < end) {
+            while (c < end && (*c < '0' || *c > '9'))
+                c++;
+            int64_t v = 0;
+            bool any = false;
+            while (c < end && *c >= '0' && *c <= '9')
+                v = v * 10 + (*c++ - '0'), any = true;
+            if (any)
+                pids[n_pids++] = (int32_t)v;
+        }
+        ath_file_close(&f);
+        if (!pids || n_pids < 2) {
+            fprintf(stderr, "athanor bench: %s holds fewer than 2 token ids\n", o.prompt_ids);
+            return ATH_EXIT_FAILURE;
+        }
+        o.n_prompts = 1, o.prompts[0] = n_pids;
+        o.n_depths = 1, o.depths[0] = n_pids - 1;
+    }
     for (int32_t i = 0; i < o.n_prompts; i++)
         ctx = o.prompts[i] + 1 > ctx ? o.prompts[i] + 1 : ctx;
     for (int32_t i = 0; o.gen > 0 && i < o.n_depths; i++)
@@ -567,6 +617,12 @@ int ath_cmd_bench(ath_arena *a, int argc, char **argv)
         ath_rng_init(&rng, o.seed);
         for (int64_t i = 0; st == ATH_OK && i < ctx; i++)
             b.ids[i] = (int32_t)(ath_rng_u64(&rng) % (uint64_t)b.m.vocab_size);
+        for (int64_t i = 0; st == ATH_OK && i < n_pids; i++) {
+            if (pids[i] < 0 || pids[i] >= b.m.vocab_size)
+                st = ATH_ERR_RANGE;
+            else
+                b.ids[i] = pids[i];
+        }
     }
 
     result *res = ath_arena_zalloc(a, sizeof *res * (size_t)(MAX_LIST * 2), _Alignof(result));
