@@ -149,12 +149,14 @@ static __device__ __forceinline__ void prep_rows(float (*tile)[XP], float *inv, 
     }
 }
 
-static __global__ void __launch_bounds__(PT)
-gdn_prep(const void *q, int qdt, const void *k, int kdt, const void *v, int vdt, const float *g, const void *beta,
-         int bdt, float q_scale, float l2_eps, int64_t T, int64_t c0, int64_t nk, int dk, int64_t nv, int dv,
-         int64_t qs, int64_t ks, int64_t vs, float *Qp, float *W, float *U, float *OU, float *gam, float *ikg)
+/* One chunk (bx, of the round's) and value head (by). */
+static __device__ __forceinline__ void
+prep_body(unsigned char *smem, int bx, int by, const void *q, int qdt, const void *k, int kdt, const void *v, int vdt,
+          const float *g, const void *beta, int bdt, float q_scale, float l2_eps, int64_t T, int64_t c0, int64_t nk,
+          int dk, int64_t nv, int dv, int64_t qs, int64_t ks, int64_t vs, float *Qp, float *W, float *U, float *OU,
+          float *gam, float *ikg)
 {
-    extern __shared__ __align__(16) float pm[];
+    float *pm = (float *)smem;
     float (*x0)[XP] = (float (*)[XP])pm;
     float (*x1)[XP] = (float (*)[XP])(pm + GC * XP);
     float (*aa)[GC] = (float (*)[GC])(pm + GC * XP);                  /* A, where the queries were */
@@ -164,9 +166,9 @@ gdn_prep(const void *q, int qdt, const void *k, int kdt, const void *v, int vdt,
     float *iq = be + GC, *ik = iq + GC;                               /* 1 / |q|, 1 / |k| per row  */
     float (*xt)[16][16] = (float (*)[16][16])(ik + GC);               /* blocks of T being built   */
     const int tid = threadIdx.x, lane = tid % ATH_WARP, w = tid / ATH_WARP;
-    const int64_t c = c0 + blockIdx.x, h = blockIdx.y, kh = h / (nv / nk), t0 = c * GC;
+    const int64_t c = c0 + bx, h = by, kh = h / (nv / nk), t0 = c * GC;
     const int n = (int)(T - t0 < GC ? T - t0 : GC);
-    const int64_t out = ((int64_t)blockIdx.x * nv + h) * GC;     /* this chunk's rows in the round's scratch */
+    const int64_t out = ((int64_t)bx * nv + h) * GC;              /* this chunk's rows in the round's scratch */
 
     /* the keys into x0, the queries into x1, normalized; rows past n
      * (padding) and columns past dk zeros. bf16 rows travel by cp.async, all
@@ -441,18 +443,18 @@ static __device__ __forceinline__ void scan_keys(float *x, const void *k, int es
     }
 }
 
-static __global__ void __launch_bounds__(ST)
-gdn_scan(const void *k, int kdt, const float *Qp, const float *W, const float *U, const float *OU, const float *gam,
-         const float *ikg, float *state, void *out, int odt, int64_t T, int64_t c0, int64_t nc, int64_t nk, int dk,
-         int64_t nv, int dv, int64_t ks)
+/* One value head (bx) and block of GV state columns (by). */
+static __device__ __forceinline__ void
+scan_body(unsigned char *scan_smem, int bx, int by, const void *k, int kdt, const float *Qp, const float *W,
+          const float *U, const float *OU, const float *gam, const float *ikg, float *state, void *out, int odt,
+          int64_t T, int64_t c0, int64_t nc, int64_t nk, int dk, int64_t nv, int dv, int64_t ks)
 {
-    extern __shared__ __align__(16) unsigned char scan_smem[];
     float *const xb0 = (float *)scan_smem;                              /* two operand tiles, */
 #define XB(i) (xb0 + (i) * TILE)                                        /* so the compiler sees shared memory */
     float (*sm)[GV] = (float (*)[GV])(xb0 + 2 * TILE);                   /* S [GD][GV]        */
     float (*dl)[GV] = sm + GD;                                           /* e^(γ_last − γ) Δ [GC][GV] */
     const int lane = threadIdx.x % ATH_WARP, w = threadIdx.x / ATH_WARP, lr = lane / 8, lc = lane % 8;
-    const int64_t h = blockIdx.x, kh = h / (nv / nk), j0 = (int64_t)blockIdx.y * GV;
+    const int64_t h = bx, kh = h / (nv / nk), j0 = (int64_t)by * GV;
     const int jn = (int)(dv - j0 < GV ? dv - j0 : GV);            /* live columns of this block */
     float *S = state + h * dk * dv;
 
@@ -603,6 +605,47 @@ gdn_scan(const void *k, int kdt, const float *Qp, const float *W, const float *U
 
 #define PREP_SMEM (PREP_FLOATS * sizeof(float))
 #define SCAN_SMEM (2 * TILE * sizeof(float) + sizeof(float[GD + GC][GV]))
+#define ROUND_SMEM (PREP_SMEM > SCAN_SMEM ? PREP_SMEM : SCAN_SMEM)
+#if PT != ST
+#error "prep and scan blocks share one launch: the same number of threads"
+#endif
+
+/* What a launch of gdn_round needs: the op's tensors, and the scratch of
+ * the round it scans and of the round it prepares (two buffers in turn). */
+typedef struct {
+    const void *q, *k, *v, *beta;
+    const float *g;
+    float *state;
+    void *out;
+    int qdt, kdt, vdt, bdt, odt, dk, dv;
+    float q_scale, l2_eps;
+    int64_t T, nk, nv, qs, ks, vs;
+} gdn_ops;
+
+typedef struct {
+    float *Qp, *W, *U, *OU, *gam, *ik;
+    int64_t c0, n;                                    /* the round's first chunk, its chunks */
+} gdn_round_buf;
+
+/* The scan of one round and the prep of the next in one launch (step 10):
+ * the scan's blocks first, one per value head and column block, so that
+ * they start at once; the prep blocks fill the multiprocessors the scan
+ * leaves free, then the rest when it ends. Either part may be empty. */
+static __global__ void __launch_bounds__(PT)
+gdn_round(gdn_ops a, gdn_round_buf s, int nscan, gdn_round_buf p)
+{
+    extern __shared__ __align__(16) unsigned char gsm[];
+    const int b = blockIdx.x;
+    if (b < nscan)
+        scan_body(gsm, (int)(b % a.nv), (int)(b / a.nv), a.k, a.kdt, s.Qp, s.W, s.U, s.OU, s.gam, s.ik, a.state, a.out,
+                  a.odt, a.T, s.c0, s.n, a.nk, a.dk, a.nv, a.dv, a.ks);
+    else {
+        const int pb = b - nscan;
+        prep_body(gsm, (int)(pb % p.n), (int)(pb / p.n), a.q, a.qdt, a.k, a.kdt, a.v, a.vdt, a.g, a.beta, a.bdt,
+                  a.q_scale, a.l2_eps, a.T, p.c0, a.nk, a.dk, a.nv, a.dv, a.qs, a.ks, a.vs, p.Qp, p.W, p.U, p.OU,
+                  p.gam, p.ik);
+    }
+}
 
 /* Scratch for one round: W and Q'' [chunks, nv, GC, dk], U and O_U
  * [chunks, nv, GC, dv], γ and 1 / |k| [chunks, nv, GC]. */
@@ -631,10 +674,11 @@ static int64_t round_chunks(const ath_device *d, int64_t nc, int64_t nv)
     return nc < r ? nc : r;
 }
 
+/* Two rounds' scratch: one being scanned while the next is prepared. */
 extern "C" size_t ath_gdn_chunk_bytes(const ath_device *d, const ath_tensor *q, const ath_tensor *v)
 {
     const int64_t nc = (q->shape[0] + GC - 1) / GC, nv = v->shape[1];
-    return round_floats(round_chunks(d, nc, nv), nv, q->shape[2], v->shape[2]) * sizeof(float);
+    return 2 * round_floats(round_chunks(d, nc, nv), nv, q->shape[2], v->shape[2]) * sizeof(float);
 }
 
 extern "C" ath_status ath_gdn_chunk_launch(const ath_device *d, const ath_tensor *q, const ath_tensor *k,
@@ -651,23 +695,42 @@ extern "C" ath_status ath_gdn_chunk_launch(const ath_device *d, const ath_tensor
         return ATH_ERR_UNSUPPORTED;
     }
     ATH_CHECK(ath_gpu_use(d));
-    if (cudaFuncSetAttribute(gdn_prep, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)PREP_SMEM) != cudaSuccess ||
-        cudaFuncSetAttribute(gdn_scan, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SCAN_SMEM) != cudaSuccess)
+    if (cudaFuncSetAttribute(gdn_round, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)ROUND_SMEM) != cudaSuccess)
         return ath_gpu_launched("gdn chunks (shared memory)");
-    const int64_t rc = round_chunks(d, nc, nv);
-    float *Wb = (float *)work, *Qb = Wb + rc * nv * GC * dk, *Ub = Qb + rc * nv * GC * dk;
-    float *Ob = Ub + rc * nv * GC * dv, *gb = Ob + rc * nv * GC * dv, *ib = gb + rc * nv * GC;
-    for (int64_t c0 = 0; c0 < nc; c0 += rc) {
-        const int64_t n = nc - c0 < rc ? nc - c0 : rc;
-        gdn_prep<<<dim3((unsigned)n, (unsigned)nv), PT, PREP_SMEM, k_stream(d)>>>(
-            q->data, q->dtype, k->data, k->dtype, v->data, v->dtype, (const float *)g->data, beta->data, beta->dtype,
-            q_scale, l2_eps, T, c0, nk, (int)dk, nv, (int)dv, q->stride[0], k->stride[0], v->stride[0], Qb, Wb, Ub, Ob,
-            gb, ib);
-        ATH_CHECK(ath_gpu_launched("gdn_prep"));
-        gdn_scan<<<dim3((unsigned)nv, (unsigned)((dv + GV - 1) / GV)), ST, SCAN_SMEM, k_stream(d)>>>(
-            k->data, k->dtype, Qb, Wb, Ub, Ob, gb, ib, (float *)state->data, out->data, out->dtype, T, c0, n, nk,
-            (int)dk, nv, (int)dv, k->stride[0]);
-        ATH_CHECK(ath_gpu_launched("gdn_scan"));
+    const gdn_ops ops = {
+        .q = q->data, .k = k->data, .v = v->data, .beta = beta->data, .g = (const float *)g->data,
+        .state = (float *)state->data, .out = out->data, .qdt = q->dtype, .kdt = k->dtype, .vdt = v->dtype,
+        .bdt = beta->dtype, .odt = out->dtype, .dk = (int)dk, .dv = (int)dv, .q_scale = q_scale, .l2_eps = l2_eps,
+        .T = T, .nk = nk, .nv = nv, .qs = q->stride[0], .ks = k->stride[0], .vs = v->stride[0],
+    };
+    /* rounds of rc chunks; round r in buffer r % 2 */
+    const int64_t rc = round_chunks(d, nc, nv), rounds = (nc + rc - 1) / rc;
+    const size_t per = round_floats(rc, nv, dk, dv);
+    gdn_round_buf buf[2];
+    for (int i = 0; i < 2; i++) {
+        float *base = (float *)work + i * per;
+        buf[i].W = base, buf[i].Qp = base + rc * nv * GC * dk, buf[i].U = buf[i].Qp + rc * nv * GC * dk;
+        buf[i].OU = buf[i].U + rc * nv * GC * dv, buf[i].gam = buf[i].OU + rc * nv * GC * dv;
+        buf[i].ik = buf[i].gam + rc * nv * GC;
+    }
+    const int nscan_blocks = (int)(nv * ((dv + GV - 1) / GV));
+    for (int64_t r = 0; r <= rounds; r++) {
+        /* launch r scans round r − 1 and prepares round r */
+        gdn_round_buf s = buf[(r + 1) % 2], p = buf[r % 2];
+        int nscan = 0;
+        int64_t nprep = 0;
+        if (r > 0) {
+            s.c0 = (r - 1) * rc, s.n = nc - s.c0 < rc ? nc - s.c0 : rc;
+            nscan = nscan_blocks;
+        }
+        if (r < rounds) {
+            p.c0 = r * rc, p.n = nc - p.c0 < rc ? nc - p.c0 : rc;
+            nprep = p.n * nv;
+        } else {
+            p.c0 = 0, p.n = 1;
+        }
+        gdn_round<<<(unsigned)(nscan + nprep), PT, ROUND_SMEM, k_stream(d)>>>(ops, s, nscan, p);
+        ATH_CHECK(ath_gpu_launched("gdn_round"));
     }
     return ATH_OK;
 }
