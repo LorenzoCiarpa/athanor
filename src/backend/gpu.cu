@@ -201,6 +201,18 @@ ath_status ath_copy(const ath_device *d, void *dst, const void *src, size_t byte
     return ATH_OK;
 }
 
+ath_status ath_copy_2d(const ath_device *d, void *dst, size_t dpitch, const void *src, size_t spitch, size_t width,
+                       size_t rows, ath_stream s)
+{
+    if (!stream_ok(s) || dpitch < width || spitch < width || (width && rows && (!dst || !src)))
+        return ATH_ERR_INVALID_ARG;
+    ATH_CHECK(ath_gpu_use(d));
+    if (!width || !rows)
+        return ATH_OK;
+    ATH_GPU_CHECK(cudaMemcpy2DAsync(dst, dpitch, src, spitch, width, rows, cudaMemcpyDefault, ath_gpu_stream(d, s)));
+    return ATH_OK;
+}
+
 ath_status ath_memset(const ath_device *d, void *dst, int value, size_t bytes, ath_stream s)
 {
     if (!stream_ok(s) || (bytes && !dst))

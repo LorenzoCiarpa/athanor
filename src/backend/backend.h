@@ -119,6 +119,13 @@ void       ath_pinned_free(const ath_device *d, void *ptr);
  * the addresses (unified virtual addressing). Asynchronous, as above. */
 ath_status ath_copy(const ath_device *d, void *dst, const void *src, size_t bytes, ath_stream s);
 
+/* Copy `rows` rows of `width` bytes, row r from src + r · spitch to
+ * dst + r · dpitch, on stream s: a strided slice (columns of a matrix)
+ * gathered into contiguous memory, or the other way round, in one call.
+ * Pointers as for ath_copy; pitches at least width. */
+ath_status ath_copy_2d(const ath_device *d, void *dst, size_t dpitch, const void *src, size_t spitch, size_t width,
+                       size_t rows, ath_stream s);
+
 /* Set `bytes` of device memory to the byte `value`, on stream s. */
 ath_status ath_memset(const ath_device *d, void *dst, int value, size_t bytes, ath_stream s);
 

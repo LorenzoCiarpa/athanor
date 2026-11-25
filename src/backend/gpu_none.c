@@ -59,6 +59,13 @@ ath_status ath_copy(const ath_device *d, void *dst, const void *src, size_t byte
     return ATH_ERR_UNSUPPORTED;
 }
 
+ath_status ath_copy_2d(const ath_device *d, void *dst, size_t dpitch, const void *src, size_t spitch, size_t width,
+                       size_t rows, ath_stream s)
+{
+    (void)d, (void)dst, (void)dpitch, (void)src, (void)spitch, (void)width, (void)rows, (void)s;
+    return ATH_ERR_UNSUPPORTED;
+}
+
 ath_status ath_memset(const ath_device *d, void *dst, int value, size_t bytes, ath_stream s)
 {
     (void)d, (void)dst, (void)value, (void)bytes, (void)s;

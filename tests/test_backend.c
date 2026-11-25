@@ -128,6 +128,21 @@ ATH_TEST(copies_and_memset)
         ok = ok && pin_out[i] == 0xAB;
     ATH_EXPECT(ok);
 
+    /* a 2D copy: columns 3..14 of 37 rows of 50 bytes gathered on the device,
+     * then scattered back into rows of 20 bytes at offset 5 on the host */
+    fill(pin_in, 37 * 50, 9);
+    memset(pin_out, 0, 37 * 20);
+    ATH_EXPECT_OK(ath_copy(&d, dev_a, pin_in, 37 * 50, ATH_STREAM_COMPUTE));
+    ATH_EXPECT_OK(ath_copy_2d(&d, dev_b, 12, dev_a + 3, 50, 12, 37, ATH_STREAM_COMPUTE));
+    ATH_EXPECT_OK(ath_copy_2d(&d, pin_out + 5, 20, dev_b, 12, 12, 37, ATH_STREAM_COMPUTE));
+    ATH_EXPECT_OK(ath_stream_sync(&d, ATH_STREAM_COMPUTE));
+    ok = true;
+    for (int r = 0; r < 37; r++)
+        for (int c = 0; c < 20; c++)
+            ok = ok && pin_out[r * 20 + c] == (c >= 5 && c < 17 ? pin_in[r * 50 + 3 + c - 5] : 0);
+    ATH_EXPECT(ok);
+    ATH_EXPECT_STATUS(ath_copy_2d(&d, dev_b, 11, dev_a, 50, 12, 37, ATH_STREAM_COMPUTE), ATH_ERR_INVALID_ARG);
+
     /* arguments */
     ATH_EXPECT_OK(ath_copy(&d, dev_a, pin_in, 0, ATH_STREAM_COMPUTE));
     ATH_EXPECT_STATUS(ath_copy(&d, dev_a, pin_in, 1, ATH_STREAM_COUNT), ATH_ERR_INVALID_ARG);

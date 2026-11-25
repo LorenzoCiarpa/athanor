@@ -52,6 +52,7 @@ typedef hipDeviceProp_t cudaDeviceProp;
 #define cudaHostAlloc                hipHostMalloc
 #define cudaFreeHost                 hipHostFree
 #define cudaMemcpyAsync              hipMemcpyAsync
+#define cudaMemcpy2DAsync            hipMemcpy2DAsync
 #define cudaMemsetAsync              hipMemsetAsync
 #define cudaStreamCreateWithFlags    hipStreamCreateWithFlags
 #define cudaStreamDestroy            hipStreamDestroy
