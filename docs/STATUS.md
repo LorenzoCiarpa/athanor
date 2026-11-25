@@ -6,11 +6,42 @@ This file is the overview. [`status_extended.md`](status_extended.md) goes one l
 
 ## Current step
 
-**Step 8: sequence state and engine** (see `docs/PLAN.md` §4). Started 2026-11-25 on branch `step8-engine`. **Done 2026-11-25** (pushed and merged into `main` at the maintainer's request); step 9 is next.
+**Step 9: fast decode and bench** (see `docs/PLAN.md` §4). Started 2026-11-25 on branch `step9-fast-decode`, after the source layout change and the pipeline rule (log).
+
+Goal: decode at the speed of the memory. At batch 1 a token reads every weight once (1.5 GB for Qwen3.5-0.8B), about 1.6 ms at the RTX 5080's 960 GB/s; step 8 takes about 3.4 ms, the rest being fixed costs: some 520 kernel launches per token, a cuBLASLt plan and heuristic query rebuilt for each of 187 matmuls, and the logits copied to the host with a wait at every token. The gate of `docs/PLAN.md`: decode tokens/s at least llama.cpp's at batch 1, same model, precision and GPU.
+
+### Tasks
+
+- [x] **9.0 Before the first task.** Source layout by layer, then by language (`cuda/` folders); AGENTS.md invariant 11, pipelines hold no GPU code; ARCHITECTURE, Three names (log).
+- [ ] **9.1 `athanor bench` and the baselines.** Decode tokens/s at batch 1 at context 0, 4k and 32k, prefill tokens/s at 512, 4k and 32k where it runs in reasonable time, TTFT, peak VRAM from the driver; warm-up, at least 5 measured runs, median with min and max; a JSON report with the fields of `docs/BENCHMARKS.md`. llama.cpp at a recorded commit, built for `sm_120`, on the same checkpoint converted to GGUF bf16, measured with `llama-bench` as its documentation recommends, raw logs kept. Nsight Systems from NVIDIA's redist archives for profiling. Measure step 8's engine first.
+- [ ] **9.2 GEMV.** athanor's own kernels for the matmuls of a few rows (bf16 weights read once with wide loads, fp32 accumulation); several weights that share an input in one launch where it pays; the cuBLASLt plans of the other shapes built once and cached per device.
+- [ ] **9.3 Positions on the device.** The forward pass stops depending on `n_past` through kernel arguments, so that one decode step can be captured and replayed: `ath_attn` takes the queries' positions (query t sees keys 0 … pos[t]) over the whole cache, a new op `ath_scatter_rows` writes the new keys and values at their positions, and the positions come from a device tensor. The CPU forward pass gives the same bits as before.
+- [ ] **9.4 Split-K attention for decode.** The keys of a long cache split over several blocks, the partial softmax states combined by a second kernel; the query heads that share a key head read each key once.
+- [ ] **9.5 GPU sampling.** `ath_sample(d, ...)`: the next token from logits in device memory, written to device memory; greedy, and temperature with top-k up to a fixed maximum, top-p and min-p, by the rules and in the double arithmetic of `ath_sample_ref`.
+- [ ] **9.6 Graph capture.** `ath_graph_*` in the backend (CUDA graphs; HIP graphs through `compat.h`); a device batch in the contract (tokens, positions and logits in device memory: the pass makes no copy and no wait); a decoder in `src/infer/` that captures one decode step (forward pass and sampling) once per state and sampler and replays it per token.
+- [ ] **9.7 `athanor chat` and `athanor bench` on the decoder.**
+- [ ] **9.8 Tests.** The new kernels against their references, on random inputs and the golden records; positions and split-K attention; scatter; GPU sampling against `ath_sample_ref`; a replayed step against the same step run directly; the gates of step 8 on the new path; compute-sanitizer.
+- [ ] **9.9 Report and documentation.** The report under `docs/results/` with raw logs; READMEs, ARCHITECTURE, PROGRAM.md, this file and `status_extended.md`.
+
+### Acceptance criteria
+
+1. The gate: `athanor bench` decodes at batch 1 and context 0 at least as many tokens per second as llama.cpp's `llama-bench` on the same checkpoint in bf16, on the RTX 5080; context 4k and 32k reported for both; a report under `docs/results/` following `docs/BENCHMARKS.md`, with the raw logs of both tools.
+2. Numerics (invariant 6): with the new kernels the gates of step 8 still pass (50 prompts × 256 teacher-forced steps, 0 differences above each prompt's bf16 noise; the GPU forward records: pooled KL no larger than the bf16 reference's, greedy agreement above the noise, f32 within the step 4 tolerances), and the KL before and after is reported.
+3. Every new or changed kernel matches its CPU reference within tolerances justified in `tests/README.md`, on random inputs and on the golden records.
+4. A replayed decode step gives the logits of the same step run directly, bit for bit; GPU sampling chooses `ath_sample_ref`'s token on the same logits and uniform number (greedy always; sampling on random cases, ties included).
+5. The CPU forward pass is unchanged: every CPU number of `test_forward` and `test_text` as before.
+6. `make cuda test` green, also with `DEBUG=1`; `make test` green; compute-sanitizer clean on `test_engine` and `test_gpu_ops`; no warnings; `ldd` as in step 8.
+7. Documentation updated.
+
+## Completed steps
+
+### Step 8
+
+**Step 8: sequence state and engine** (see `docs/PLAN.md` §4). Started 2026-11-25 on branch `step8-engine`. **Done 2026-11-25** (pushed and merged into `main` at the maintainer's request); step 9 is next. Merged into `main` (fast-forward) on 2026-11-25, at the maintainer's request.
 
 Goal: the model on the GPU. The forward pass runs there from the kernels of step 7, with the weights copied once and the state of a sequence in device memory, through the same contract and the same family code as on the CPU; `athanor chat` uses it. The gate of `docs/PLAN.md`: a GPU chat in bf16, and greedy output identical to the reference for 256 tokens on 50 prompts. "Identical" is read as the step 4 and 5 gates read it: at every step where the fp32 reference's top-2 margin exceeds the bf16 noise, since below it rounding alone can flip a greedy choice (the bf16 reference itself flips some).
 
-### Tasks
+#### Tasks
 
 - [x] **8.1 Strided copies.** `ath_copy_2d` in the backend, for the slices the forward pass gathers into contiguous tensors.
 - [x] **8.2 Op entry points.** `ath_<op>(d, ...)` in `src/ops/dispatch.c`: the GPU kernel on device d, the reference (`ath_matmul_fast` for the matmul) without one.
@@ -22,7 +53,7 @@ Goal: the model on the GPU. The forward pass runs there from the kernels of step
 - [x] **8.8 Tests.** `tests/test_engine.c` (the engine, states on the device, pieces, the gate); the forward records on the GPU in `tests/test_forward.c`; `ath_copy_2d` in `tests/test_backend.c`.
 - [x] **8.9 Documentation.**
 
-### Acceptance criteria
+#### Acceptance criteria
 
 1. `athanor chat` runs on the GPU in bf16, by default when the build and the machine have one, with the conversation's state reused across turns as on the CPU.
 2. The gate: on 50 prompts of 256 tokens, the engine's greedy token in bf16 equals the fp32 reference's at every step whose top-2 margin exceeds the bf16 noise.
@@ -45,8 +76,6 @@ Result (2026-11-25, RTX 5080 `sm_120`, driver 580.178.04 (CUDA 13.0), CUDA toolk
 | 7 | documentation | `docs/ARCHITECTURE.md` (the contract on two devices), READMEs of `src/model`, `src/models/qwen35`, `src/infer`, `src/ops`, `src/backend`, `tools`, `tests`, `tests/golden`; `README.md`; `docs/program/PROGRAM.md` row 9; this file and `status_extended.md` |
 
 For the record (no performance claim; `docs/BENCHMARKS.md`): greedy decoding of Qwen3.5-0.8B in bf16 runs at about 282 to 290 tokens/s on the GPU (`test_engine`, `athanor chat --stats`), against 8.5 on the CPU with 8 threads. Nothing is tuned yet: a kernel launch per op, a cuBLASLt heuristic query per matmul, logits copied back every token. Step 9 is about that.
-
-## Completed steps
 
 ### Step 7
 
@@ -338,7 +367,9 @@ Result (2026-11-23, Qwen3.5-0.8B revision `2fc0636`, gcc 15.2, glibc 2.43):
 
 ## Next step (preview)
 
-**Step 9: fast decode and bench.** Decode at batch 1 reads every weight once per token, so its speed is the memory bandwidth: GEMV kernels of athanor's own for the matmuls of one token (fused where it pays), split-K attention for a long cache, graph capture so that a token is one launch, sampling on the GPU, and `athanor bench` with a report under `docs/results/` (`docs/BENCHMARKS.md`). Gate (`docs/PLAN.md`): decode tokens/s at least llama.cpp's at batch 1, same model, precision and GPU.
+**Step 10: fast prefill.** A prompt is a matrix product, not a series of vector products: tiled attention on tensor cores for long prompts, the chunked form of the Gated DeltaNet recurrence (the recurrent kernel of step 7 walks the prompt token by token), and the GEMM path tuned where cuBLASLt leaves time on the table. Gate (`docs/PLAN.md`): prefill within 15% of vLLM for a single request.
+
+Superseded preview (written in step 8): **Step 9: fast decode and bench.** Decode at batch 1 reads every weight once per token, so its speed is the memory bandwidth: GEMV kernels of athanor's own for the matmuls of one token (fused where it pays), split-K attention for a long cache, graph capture so that a token is one launch, sampling on the GPU, and `athanor bench` with a report under `docs/results/` (`docs/BENCHMARKS.md`). Gate (`docs/PLAN.md`): decode tokens/s at least llama.cpp's at batch 1, same model, precision and GPU.
 
 Superseded preview (written in step 7): **Step 8: sequence state and engine.** The forward pass on the GPU: the weights uploaded once, the state of a sequence (KV cache, conv and recurrent state) in device memory, the ops chosen by where the tensors live (the dispatching entry point per op joins `ops.h` with this first caller), and an engine in `src/infer/` that runs prompts and decodes with the GPU forward pass; `athanor chat` on the GPU in bf16. Gate (`docs/PLAN.md`): GPU chat in bf16; greedy output identical to the reference for 256 tokens on 50 prompts.
 
