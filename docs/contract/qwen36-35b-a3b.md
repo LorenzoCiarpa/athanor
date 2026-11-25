@@ -71,4 +71,8 @@ So the layer computes the same function with its value heads permuted. Only the 
   - GPU, bf16: up to 0.116 apart, and the greedy token is the same at every position.
   
   The one value that differs is A: the converter computed −exp(A_log) with torch, athanor with libm's or CUDA's expf. The reference computes it with torch, as the converter did.
-- **The value reorder** is checked by the MoE model's forward records against the reference (task 12.8). The reference script reads the GGUF and undoes every transform: it subtracts 1 from the norms, takes log(−A), permutes the value heads back to grouped, and dequantizes Q8_0 exactly in f32.
+- **The value reorder, and everything else**, by the MoE model's forward records against the reference (`tests/golden/moe.py`, step 12). The script reads the GGUF and undoes every transform: it subtracts 1 from the norms, takes log(−A), permutes the value heads back to grouped, and dequantizes Q8_0 exactly in f32. It runs transformers' modules one layer at a time, in fp32 and in bf16, on 4 prompts (234 positions).
+  - athanor on the GPU with f32 activations: KL 1e-12, logits within 9.6e-6, residual stream within 3.5e-5. Every transform reads back right.
+  - With bf16 activations: pooled KL 1.811e-3 against the bf16 reference's 2.970e-3, and the same greedy token wherever the top-2 margin exceeds the bf16 noise.
+
+  The bf16 reference rounds the dequantized weights to bf16; athanor keeps them exact.

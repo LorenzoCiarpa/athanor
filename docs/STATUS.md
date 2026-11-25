@@ -6,7 +6,7 @@ This file is the overview. [`status_extended.md`](status_extended.md) goes one l
 
 ## Current step
 
-**Step 12: MoE and tiering** (see `docs/PLAN.md` §4). Started 2026-11-25 on branch `step12-moe-tiering`, from `main` (steps 1–10). Step 11 is postponed (log).
+**Step 12: MoE and tiering** (see `docs/PLAN.md` §4). Started 2026-11-25 on branch `step12-moe-tiering`, from `main` (steps 1–10). Step 11 is postponed (log). **Done 2026-11-25** (pushed; merging into `main` is the maintainer's call).
 
 Goal: a model larger than the GPU. Qwen3.6-35B-A3B has 35B parameters, of which 3B are active per token. Each of its 40 layers routes a token to 8 of 256 experts plus a shared expert. In Q8_0 it weighs 37.8 GB: 2.6 GB of attention, Gated DeltaNet, shared experts, embeddings and output head, and 34.2 GB of routed experts (3.34 MB each). The GPU has 16 GB and the machine has 59 GiB of RAM. So the experts live in RAM, the GPU keeps the most-used ones, and the CPU computes the others where they are, in parallel with the GPU. At batch 1 a token reads about 320 experts, about 1.07 GB. The gate of `docs/PLAN.md` is Qwen3.6-35B-A3B decode at least Strata's on the same machine and quantization.
 
@@ -27,7 +27,7 @@ Goal: a model larger than the GPU. Qwen3.6-35B-A3B has 35B parameters, of which 
 
 ### Tasks
 
-- [ ] **12.1 The Strata baseline.**
+- [x] **12.1 The Strata baseline.**
   - Strata at a recorded commit, built in `~/opt` with CUDA 13.5 for `sm_120`, pointed at the same GGUF (no second copy: 44 GB of disk are free).
   - Decode tokens/s at batch 1 at contexts 0 and 4096, with MTP off and on, as its documentation recommends; raw logs kept.
   - llama.cpp on the same file, with experts on the CPU and the rest of VRAM filled.
@@ -63,13 +63,13 @@ Goal: a model larger than the GPU. Qwen3.6-35B-A3B has 35B parameters, of which 
   - In decode, per MoE layer the GPU computes the cached experts while the CPU computes the others from RAM. In a prompt, the experts that are not cached are streamed to the GPU.
   - The contract gains what a pass needs to find each expert's copy (`docs/ARCHITECTURE.md`). Pipelines stay free of GPU code (invariant 11).
 - [x] **12.7 Decode on the MoE model.** The decoder of step 9 (one replay per token) with the CPU's share inside the step; `athanor chat` and `athanor bench` on Qwen3.6-35B-A3B.
-- [ ] **12.8 Tests and numerics.**
+- [x] **12.8 Tests and numerics.**
   - A tiny Qwen3.5-MoE written as a Q8_0 GGUF by `tests/golden/`, with the reference's outputs in fp32 and bf16.
   - The forward records of Qwen3.6-35B-A3B from a reference that streams the GGUF's dequantized layers through transformers' modules: fp32 and bf16, the step 4 gate.
   - Placement invariance bit for bit: all experts in VRAM, none, and the cache in several states.
   - Qwen3.5-0.8B unchanged.
   - compute-sanitizer.
-- [ ] **12.9 Report and documentation.** The report under `docs/results/` with the raw logs; READMEs, ARCHITECTURE, PROGRAM.md, the contract, this file and `status_extended.md`.
+- [x] **12.9 Report and documentation.** The report under `docs/results/` with the raw logs; READMEs, ARCHITECTURE, PROGRAM.md, the contract, this file and `status_extended.md`.
 
 ### Acceptance criteria
 
@@ -90,6 +90,18 @@ Goal: a model larger than the GPU. Qwen3.6-35B-A3B has 35B parameters, of which 
    - The CPU numbers of `test_forward` and `test_text` as before.
 6. **Build and tests.** `make cuda test` green, also with `DEBUG=1`; `make test` green; compute-sanitizer clean on the new kernels and on `test_engine`; no warnings; `ldd` as in step 10.
 7. **Documentation updated.**
+
+Result (2026-11-25, RTX 5080 `sm_120`, Ryzen 7 9800X3D, 59 GiB; driver 580.178.04 (CUDA 13.0), CUDA toolkit 13.5.0, cuBLASLt 13.10, gcc 15.2; Strata `2af30cc`; llama.cpp `5220a2d`; reference transformers 5.24.0):
+
+| # | Criterion | Result |
+| --- | --- | --- |
+| 1 | the gate | Qwen3.6-35B-A3B Q8_0, decode of 128 tokens after the same prompt ids. Short prompt (33 tokens): athanor 94.1 tokens/s (median of 5, min 88.1, max 96.4); Strata with MTP off 29.7, 24.9 and 30.1 at context 8192, its best setting (23.0, 27.0, 27.7 at its default 32,768). Ratio 3.13 to its best run. 4096-token prompt: 80.3 against 22.3 and 25.9 (3.10). Strata with MTP on: 38.8 and 33.4, and 33.9 (athanor 2.4 times). llama.cpp (`-ncmoe 27`), pseudo-random ids: 59.5 at depth 0 and 58.8 at 4096; athanor 102.6 and 69.6 (1.72 and 1.18 times). Prefill, reported: athanor 109 to 209 tokens/s, Strata 3,140 to 3,198 at 4096 (it streams experts to the GPU; Possible later work), llama.cpp 650 at 512. Report with raw logs: `docs/results/2026-11-25-step12-moe/` |
+| 2 | numerics | Qwen3.6-35B-A3B against transformers' modules run one layer at a time over the same GGUF (`tests/golden/moe.py`, 4 prompts, 234 positions). GPU bf16: pooled KL 1.811e-3 against the bf16 reference's 2.970e-3 (ratio 0.61), 0 greedy differences at the 180 positions above the noise. GPU f32: KL 1e-12, logits within 9.6e-6, residual within 3.5e-5. The tiny MoE model (safetensors, random weights; criterion amended, log): f32 KL 3e-13, logits within 5.7e-6, residual within 5.1e-6, CPU and GPU; bf16 greedy right above the noise. Qwen3.5-0.8B from its bf16 GGUF: the safetensors' logits bit for bit on the CPU in bf16 |
+| 3 | invariant 7 | Qwen3.6-35B-A3B: 0 of 12,912,640 logits differ between 73 (as many as fit), 0 and 24 experts per layer in VRAM over a 40-token prompt and 12 decoder steps, with the slots updated after every step (1,367 and 841 moves). The op level (`gpu_moe_split`): the split between GPU and CPU in chunks, and a captured graph replayed after experts moved (half, all to the CPU, all to the GPU), give the reference's bits. Experts other than Q8_0 are never split (refused), so the tiny bf16 model runs with every expert on the device |
+| 4 | kernels against references | Q8_0 matmul (GEMV, prompt tiles, other K), embedding: the reference's bits; routed experts: reference, CPU fast path (AVX-512 and one lane) and GPU (Q8_0 and Q8_0_R16 copies) the same bits; router: the same choices, weights within a bf16 ulp; combination within 1e-6; `ath_q8_expf` within 0.89 ulp of exp (`tests/README.md`, Q8_0 and MoE) |
+| 5 | Qwen3.5-0.8B unchanged | in the session: tg128 448.1 against llama.cpp's 438.8; pp512 49,665, pp4096 56,997. Run alternately with step 10's build (three rounds each): pp4096 56,660 to 56,981 (step 10) and 56,683 to 56,985 (step 12), tg128 448.1 to 450.1 and 447.3 to 449.4, the same. The step 8 gate and the forward records as before (`make cuda test`); the CPU numbers of `test_forward` and `test_text` as before |
+| 6 | build and tests | `make test` and `make cuda test` green, also with `DEBUG=1` (the tests of Qwen3.6-35B-A3B skipped there with `ATH_MOE_DIR` unset: their 32 GB of host copies under ASan take too long); compute-sanitizer memcheck (with leak check), racecheck and initcheck on `gpu_matmul_q8_0`, `gpu_moe`, `gpu_moe_split`, memcheck on the engine's tests and the tiny MoE model's forward pass on the GPU: 0 errors, 0 hazards, 0 bytes leaked. No warnings; `ldd` as in step 10 (the Makefile's libraries are unchanged) |
+| 7 | documentation | READMEs of `src/core` (GGUF, ckpt, Q8_0), `src/ops` (Q8_0, MoE), `src/infer` (placement), `src/backend` (host calls), `src/models/qwen35` (GGUF layout), `tests` (Q8_0, MoE, GGUF, the MoE records); `docs/ARCHITECTURE.md` (the checkpoint table, the experts in `ath_exec`); `docs/contract/qwen36-35b-a3b.md`; `docs/program/PROGRAM.md` rows 1 and 11; `docs/PLAN.md` (step 12 decisions); `README.md`; the report; this file and `status_extended.md` |
 
 ## Completed steps
 
@@ -505,6 +517,8 @@ Result (2026-11-23, Qwen3.5-0.8B revision `2fc0636`, gcc 15.2, glibc 2.43):
 
 ## Next step (preview)
 
+**Step 13: server and MTP** (`docs/PLAN.md` §4), next after step 12. The OpenAI- and Anthropic-compatible server over localhost (`src/net/`), so that Claude Code, Codex CLI and OpenCode can drive athanor with tool calls; speculative decoding with the MTP head that steps 2 and 12 left bound as `unused` (Qwen3.6-35B-A3B's `blk.40`, where Strata gains 1.3 to 1.5 times with it). Gate (`docs/PLAN.md`): works with Claude Code, Codex CLI and OpenCode; speculative-decoding speedup reported; tool-calling conformance on a fixed task set.
+
 Superseded preview (written in step 10; step 12 is current): **Step 12: MoE and tiering** (`docs/PLAN.md` §4), next after step 10: step 11 is postponed (log, 2026-11-25). Experts routed per token, the expert weights placed across VRAM, RAM and disk, a fast CPU path for the experts that stay in RAM. Gate (`docs/PLAN.md`): Qwen3.6-35B-A3B decode at least Strata's on the same machine and quantization.
 
 Postponed preview (written in step 10; the step waits for AMD hardware): **Step 11: HIP build.** The same sources compiled by hipcc for AMD GPUs through `compat.h`: a Makefile target, hipBLASLt behind the matmul, the kernels written with NVIDIA's warp-level matrix instructions (`attn_mma.cu`) given an AMD form or left to their CUDA-core twins. Gate (`docs/PLAN.md`): all tests green on AMD, performance report published.
@@ -538,7 +552,14 @@ Work measured and worth doing, not scheduled in a step. Each entry says where it
 - **Attention for prompts closer to FlashAttention-2's speed**: 6.2 against vLLM's 5.0 ms at 4096 tokens (81 TFLOPS at 32k), the largest item at 32k (about 320 of 784 ms).
 - **Merged projections** (qkv with z in the Gated DeltaNet, gate with up in the MLP, as vLLM loads them): fewer, larger GEMMs; the products were already at parity (39.0 against 38.5 ms), so a small gain, and it needs strided views in SwiGLU.
 
-The numbers: `docs/results/2026-11-25-step10-prefill/` and the vLLM profile in the log (2026-11-25). Together, the first two would bring a 4096-token prompt from 72 to about 57 to 58 ms of kernels, vLLM's forward pass alone.
+The numbers: `docs/results/2026-11-25-step10-prefill/` and the vLLM profile in the log (2026-11-25).
+
+From step 12 (Qwen3.6-35B-A3B on the RTX 5080; `docs/results/2026-11-25-step12-moe/`):
+
+- **A MoE prompt on the GPU.** athanor computes a prompt's experts that are not in VRAM on the CPU, as in decode: about 130 to 140 tokens/s of prefill, where Strata streams them to the GPU in big chunks (3,180 tokens/s at 4096 tokens). For a chunk of hundreds of tokens nearly every expert is used, so copying a layer's missing experts over the bus (about 0.6 GB) beats reading them on the CPU once per chunk; with a grouped GEMM for the experts (tokens gathered per expert) the GPU part follows. Invariant 7 still holds if a prompt always computes every expert on the GPU, whatever is in VRAM, so the grouped GEMM may use the tensor cores.
+- **Q8_0 products of prompts on the tensor cores.** The prompt kernel (`q8_tile`) runs the canonical order on the CUDA cores, about 9 TFLOPS. int8 values are exact in bf16, so `mma.sync` with a per-block scale (llama.cpp's MMQ idea) would reach several times that; the non-expert weights never run on the CPU, so their bits need not match the CPU's.
+- **Decode on the MoE model.** The CPU reads its experts at about 43 GB/s; per layer the pass waits for the CPU (two pool runs, the copies to pinned memory, the merge). Gains to measure: the expert cache's policy (hit rate), the reserve (2 GiB) that bounds the slots, fewer pool wake-ups, the next layer's experts guessed from the router ahead.
+- **A disk tier.** Models whose experts do not fit in RAM (Qwen3.5-122B-A10B: 69 GB in 4 bits) need experts read from disk. Together, the first two would bring a 4096-token prompt from 72 to about 57 to 58 ms of kernels, vLLM's forward pass alone.
 
 ## Open questions
 
@@ -689,3 +710,5 @@ The numbers: `docs/results/2026-11-25-step10-prefill/` and the vLLM profile in t
 - 2026-11-25: Qwen3.6-35B-A3B against the reference (`tests/golden/moe.py`: transformers 5.24.0's modules one layer at a time over the GGUF dequantized exactly, the converter's transforms undone; 4 prompts, 234 positions). GPU bf16: pooled KL 1.811e-3 against the bf16 reference's 2.970e-3 (ratio 0.61), greedy token equal to the fp32 reference's at all 180 positions above the bf16 noise (0.718). GPU f32: KL 1e-12, logits within 9.6e-6, residual stream within 3.5e-5 (step 4's 1e-4 and 2e-4): the transforms, the value heads' order included, read back right. The bf16 reference rounds the dequantized weights to bf16, which athanor does not (its Q8_0 weights are exact): the comparison favours athanor by that much, and the f32 run is the strict check.
 - 2026-11-25: first speeds on Qwen3.6-35B-A3B (no claim; busy machine, random tokens): decode 102.7 tokens/s with 75 experts per layer in VRAM after a warm-up (the slots adapt), 34.9 with every expert on the CPU (about 43 GB/s from RAM); prefill of 512 tokens 129 tokens/s (the experts outside VRAM are computed by the CPU in prompts too).
 - 2026-11-25: the tiny MoE model (`tests/golden/tiny_moe.py`: a Qwen3_5MoeForCausalLM of transformers 5.24.0 with random weights, written in the published layout with fused `gate_up_proj`, 2 value heads per key head; 3 prompts and 4 greedy steps, 114 positions) covers the safetensors way into the MoE path. f32: KL 3e-13, logits within 5.7e-6, residual stream within 5.1e-6, on the CPU and the GPU. bf16: greedy token equal to the fp32 reference's at every position above the noise (3 of 3), but the pooled KL is 1.65 (CPU) and 1.84 (GPU) times the bf16 reference's. Over four more seeds the ratio was 0.14, 0.94, 1.27 and 1.47: with random weights both errors are rounding noise of one size, and which is smaller is chance (on the real checkpoints athanor is at 0.6). Acceptance criterion 2 amended for the tiny model (KL reported, not gated: `ATH_FORWARD_NO_KL_GATE`); the real checkpoints keep the rule.
+- 2026-11-25: the gate's session (19:42 to 20:20; `docs/results/2026-11-25-step12-moe/`). The same prompt ids and 128 greedy tokens: athanor 94.1 and 80.3 tokens/s after 33 and 4096 tokens; Strata with MTP off 30.1 and 25.9 at best (3.1 times slower), with MTP on 38.8 and 33.9; llama.cpp 59.5 and 58.8 on pseudo-random ids (athanor 102.6 and 69.6). Strata leads prefill (3,198 against 209 tokens/s at 4096 tokens: it streams experts to the GPU). Qwen3.5-0.8B's pp4096 came out 2.1% under step 10's report; run alternately with step 10's build the two are the same (the machine's power capping that evening). The athanor reports' `"weights"` field was a fixed "bf16" string: `tools/bench.c` now writes the format and the dtypes of the params.
+- 2026-11-25: step 12 done (all acceptance criteria met, criterion 2 as amended for the tiny model; table above); pushed on `step12-moe-tiering`: merging into `main` is the maintainer's call.

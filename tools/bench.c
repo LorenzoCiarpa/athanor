@@ -381,12 +381,24 @@ static ath_status write_report(const bench *b, const options *o, const result *r
     ATH_CHECK(put_str(j, "dir", o->model));
     ATH_CHECK(ath_buf_puts(j, ", "));
     ATH_CHECK(put_str(j, "family", b->m.family->name));
-    ATH_CHECK(ath_buf_puts(j, ", \"weights\": \"as stored in the checkpoint (bf16)\", \"files\": ["));
+    /* the format and the dtypes the params have, as stored (step 12: a GGUF of Q8_0) */
+    char dts[128] = "";
+    bool seen[ATH_DTYPE_QUANT_LAST + 1] = {false};
+    for (uint32_t i = 0; i < b->m.n_params; i++) {
+        const ath_dtype dt = b->m.params[i].t.dtype;
+        if ((b->m.params[i].flags & ATH_P_UNUSED) || (unsigned)dt > ATH_DTYPE_QUANT_LAST || seen[dt])
+            continue;
+        seen[dt] = true;
+        snprintf(dts + strlen(dts), sizeof dts - strlen(dts), "%s%s", dts[0] ? ", " : "", ath_dtype_name(dt));
+    }
+    ATH_CHECK(ath_buf_printf(j, ", \"weights\": \"as stored in the checkpoint (%s: %s)\", \"files\": [",
+                             ath_ckpt_format_name(b->m.ckpt.format), dts));
     DIR *dir = opendir(o->model);
     int32_t nf = 0;
     for (struct dirent *de; dir && (de = readdir(dir)) && nf < MAX_FILES;) {
         size_t l = strlen(de->d_name);
-        if (l < 12 || strcmp(de->d_name + l - 12, ".safetensors"))
+        if ((l < 12 || strcmp(de->d_name + l - 12, ".safetensors")) &&
+            (l < 5 || strcmp(de->d_name + l - 5, ".gguf") || !strncmp(de->d_name, "mmproj-", 7)))
             continue;
         char path[ATH_PATH_MAX], hex[65] = "not hashed (--no-hash)", meta[ATH_PATH_MAX];
         ATH_CHECK(ath_path_join(path, sizeof path, o->model, de->d_name));

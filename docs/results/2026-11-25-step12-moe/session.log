@@ -1,0 +1,18 @@
+=== 19:42:04 athanor, Strata's short prompt
+=== 19:43:48 athanor, Strata's 4096-token prompt
+=== 19:47:38 athanor, pseudo-random ids
+=== 19:50:15 Strata short MTP off ctx 8192 run 1
+=== 19:52:33 Strata short MTP off ctx 8192 run 2
+=== 19:54:50 Strata short MTP off ctx 8192 run 3
+=== 19:57:10 Strata short MTP off ctx 32768 run 1
+=== 19:59:36 Strata short MTP off ctx 32768 run 2
+=== 20:01:57 Strata short MTP off ctx 32768 run 3
+=== 20:04:19 Strata short MTP on run 1
+=== 20:06:35 Strata short MTP on run 2
+=== 20:08:53 Strata 4096 MTP off run 1
+=== 20:11:14 Strata 4096 MTP off run 2
+=== 20:13:34 Strata 4096 MTP on
+=== 20:15:53 llama.cpp
+=== 20:17:50 athanor Qwen3.5-0.8B
+=== 20:18:59 llama.cpp Qwen3.5-0.8B
+=== 20:20:03 done

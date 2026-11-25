@@ -1,0 +1,5 @@
+athanor bench: qwen35 on NVIDIA GeForce RTX 5080, context 4097, 5 runs after 1 warm-up
+pp512             49664.5 tok/s  (min 49646.2, max 49769.4)  TTFT 10.4 ms
+pp4096            56996.6 tok/s  (min 56967.8, max 57402.5)  TTFT 72.0 ms
+tg128@d0            448.1 tok/s  (min 448.0, max 448.1)  2.232 ms/token
+report: /home/ciarpa/Desktop/github/projects/athanor/docs/results/2026-11-25-step12-moe/athanor-0.8b.json

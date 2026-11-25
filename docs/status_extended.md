@@ -1283,6 +1283,17 @@ Measured with a throwaway harness (no claim: `docs/BENCHMARKS.md`): the decode k
 
 No file of its own: the decoder of step 9 runs a MoE model unchanged, since the CPU's share is part of the recorded step (`ath_host_call` on the side stream) and the experts move only between steps (`ath_place_update` in `ath_decoder_step`). `athanor chat` and `athanor bench` run Qwen3.6-35B-A3B with `--experts`; first answer of the chat: coherent Italian on a hash table, 100 tokens at 59 tokens/s.
 
+#### 12.8 Tests and numerics
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `tests/golden/moe.py` | New | The forward records of Qwen3.6-35B-A3B: a GGUF reader in numpy, exact Q8_0 dequantization, the converter's transforms undone (norms − 1, log(−A), value heads untiled, the convolution's middle dimension, gate and up concatenated), transformers' `Qwen3_5MoeDecoderLayer` one layer at a time in fp32 and bf16; dump.py's record layout, prompt positions only |
+| `tests/golden/tiny_moe.py` | New | A tiny Qwen3_5MoeForCausalLM with random weights, saved in the published layout (fused experts), and its forward records with greedy decode steps |
+| `tests/test_forward.c` | Changed | `ATH_FORWARD_GPU_ONLY` (the GPU runs only) and `ATH_FORWARD_NO_KL_GATE` (the KL reported, not gated, for random weights) in `forward_golden`; `gguf_matches_safetensors` |
+| `tests/test_engine.c` | Changed | `engine_moe_placement` (12.6) |
+
+compute-sanitizer: memcheck with leak check, racecheck and initcheck on `gpu_matmul_q8_0`, `gpu_moe` and `gpu_moe_split`, memcheck on the engine's tests and on the tiny MoE model's forward pass on the GPU: 0 errors, 0 hazards, 0 bytes leaked.
+
 ---
 
 ## Files by step

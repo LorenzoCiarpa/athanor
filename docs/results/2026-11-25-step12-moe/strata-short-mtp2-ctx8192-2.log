@@ -1,0 +1,9 @@
+strata-q36: /home/ciarpa/Desktop/github/projects/athanor/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-Q8_0.gguf: 753 tensors (layout checked), 4.40 GiB on the GPU in 4.2 s (the routed experts are placed after the engine's buffers)
+strata-q36: prompt experts on the fused int8 kernels
+strata-q36: GDN checkpoints: 4 per session x 62.82 MiB pinned host (251.28 MiB in all for 1) every 4096 tokens; 30 GDN layers, conv 98304 B + S 2097152 B + hlast 8192 B each
+strata-q36: context 8192 cells, prompt chunk 2048, MTP block loaded, K / V cache --kv fp32 (4.00 KiB per token, per attention layer), 6.87 GiB of VRAM free
+strata-q36: hybrid experts: 35 of 256 per layer in VRAM (4.47 GiB), all 32.67 GiB in pinned host memory, the rest of a batch of <= 128 rows on 8 CPU threads, bigger prompt chunks streamed (1.59 GiB staging); 65.0 s
+strata-q36: warmed up in 1.0 s (one prompt chunk, a decode step, a speculative step)
+strata-q36: prompt 33 tokens in 514.4 ms, 128 generated in 3831.9 ms (33.4 tok/s), MTP 2 drafts: 73 of 108 accepted (68%)
+strata-q36: hybrid experts: 28345 of 62792 batch entries on the GPU (45.1%), 34447 on the CPU pool in 3507 ms, 1227 slot replacements
+gen: 32 5010 1898 13325 264 869 539 18377 264 5010 709 310 279 1328 11 864 55288 449 1857 303 279 16045 1287 1332 279 11811 869 369 9476 13 1368 1330 2086 6679 5010 310 279 1788 1857 11 264 18188 13273 11 864 369 19072 1608 5245 1040 71159 318 267 5330 5081 3470 303 264 1103 506 421 1857 8 466 1724 26153 318 751 6909 364 279 1727 2420 9167 553 9358 279 4252 9167 369 10503 11 279 1898 68279 279 869 539 25456 6679 310 5790 279 4581 2353 369 5743 13 248046 198 248044 248045 248045 248045 248045 846 198 248046 198 248045 74455 198 38493 0 5514 579 264 4145 15673 314 1204 264 5010 1898 13325 264 869 11

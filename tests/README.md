@@ -143,6 +143,17 @@ A `DEBUG=1` build runs the first 4 positions of each prompt (three in one call, 
 
 Step 10: the GPU forward records with the prompt kernels (attention on the tensor cores, the chunked Gated DeltaNet for the prose prompt's 83 tokens): pooled KL 4.399e-4 against the bf16 reference's 5.005e-4 (ratio 0.88; step 9 4.295e-4), 0 greedy differences above the noise; f32 KL 3e-12, logits within 8.8e-6, residual stream within 1.3e-5. The hooks of these tests watch the residual stream, so the forward pass adds each output projection in its own kernel here (the fused add waits for no hook).
 
+### Forward records of the MoE models (step 12)
+
+Two more sets of forward records, in `forward_golden`'s layout, replayed by pointing `ATH_MODEL_DIR` and `ATH_GOLDEN_DIR` at them:
+
+- **Qwen3.6-35B-A3B** (`tests/golden/moe.py`, `tests/golden/data/qwen36-35b-a3b/`, 445 MiB, not committed): transformers 5.24.0's modules run one layer at a time over the GGUF, dequantized exactly, with the converter's transforms undone. There are 4 prompts (prose, chat, code, Italian), 234 positions, prompt positions only. `ATH_FORWARD_GPU_ONLY=1`: the CPU's reference ops would take hours on this model.
+  - GPU bf16: pooled KL 1.811e-3 against the bf16 reference's 2.970e-3 (ratio 0.61); 0 greedy differences at the 180 positions above the noise (0.718).
+  - GPU f32: KL 1e-12, logits within 9.6e-6 (tolerance 1e-4), residual stream within 3.5e-5 (tolerance 2e-4).
+- **A tiny Qwen3.5-MoE** (`tests/golden/tiny_moe.py`, `tests/golden/data/tiny-moe/`): random weights, in the published safetensors layout. It has 3 prompts with 4 greedy steps each, 114 positions, run on the CPU and the GPU.
+  - f32: KL 3e-13, logits within 5.7e-6, residual stream within 5.1e-6.
+  - bf16: the greedy token is right above the noise; the KL is reported, not gated (`ATH_FORWARD_NO_KL_GATE=1`). On random weights it is chance whether athanor's rounding or the reference's lands closer to fp32: the ratio measured 0.14 to 1.65 over five seeds.
+
 ## Engine
 
 Step 8 runs the forward pass on the GPU through the engine (`src/infer/engine.h`). Three checks hold it to the reference.
