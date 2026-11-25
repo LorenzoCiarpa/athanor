@@ -1,9 +1,11 @@
-/* chat.c: `athanor chat <model_dir> [options]`: a conversation on the CPU.
+/* chat.c: `athanor chat <model_dir> [options]`: a conversation, on the GPU
+ * when the build and the machine have one (step 8), on the CPU otherwise.
  *
  * Every turn goes through the contract: the family renders the whole
  * conversation with its chat template (ath_model_chat), the tokenizer turns
- * it into ids, the forward pass runs on the CPU (ath_model_forward with a
- * thread pool), a token is sampled (ath_sample_ref), decoded, and the
+ * it into ids, the forward pass runs (ath_model_forward, on the engine's
+ * device or on the CPU with a thread pool), a token is sampled from the
+ * logits on the host (ath_sample_ref), decoded, and the
  * family's parser (ath_model_parse) splits the output into text, thinking
  * and tool calls. Nothing here knows the model family.
  *
@@ -25,6 +27,7 @@
 #include "core/file.h"
 #include "core/json.h"
 #include "core/rng.h"
+#include "infer/engine.h"
 #include "model/model.h"
 #include "ops/ops.h"
 
@@ -37,7 +40,8 @@ void ath_cmd_chat_usage(FILE *out)
 {
     fprintf(out,
             "usage: athanor chat <model_dir> [options]\n\n"
-            "Chat with the model on the CPU. Without -p, read one message per line\n"
+            "Chat with the model, on the GPU when this build has one (make cuda) and the\n"
+            "machine too, on the CPU otherwise. Without -p, read one message per line\n"
             "from stdin (end a line with \\ to continue it); /reset starts over,\n"
             "/tool <text> answers a tool call, /exit (or end of input) quits.\n\n"
             "  -p, --prompt <text>  send one message, print the answer, exit\n"
@@ -53,13 +57,14 @@ void ath_cmd_chat_usage(FILE *out)
             "  --seed <n>           random seed (default: from the clock)\n"
             "  --max-tokens <n>     tokens per answer (default 2048)\n"
             "  --ctx <n>            context length in tokens (default 8192)\n"
+            "  --device <cpu|gpu>   where the model runs (default: gpu if there is one)\n"
             "  --threads <n>        CPU threads (default: all)\n"
             "  --f32                f32 activations instead of bf16 (slower)\n"
             "  --stats              print prompt and decode speed after each answer (stderr)\n");
 }
 
 typedef struct {
-    const char  *dir, *prompt, *system, *tools_file;
+    const char  *dir, *prompt, *system, *tools_file, *device;
     bool         think, f32, stats;
     ath_sampler  sampler;
     bool         temp_set, top_p_set;
@@ -135,6 +140,8 @@ typedef struct {
     ath_model        m;
     ath_tokenizer    tok;
     ath_pool         pool;
+    ath_engine      *engine;        /* NULL on the CPU                               */
+    ath_exec         exec;          /* where the forward pass runs                   */
     ath_state        state, snap;
     ath_tokens       seen;          /* the tokens the state holds                    */
     size_t           snap_n;        /* the first snap_n of them are in snap; 0: none  */
@@ -162,7 +169,7 @@ static ath_status feed(session *s, const int32_t *ids, size_t from, size_t to, b
     if (from == to)
         return ATH_OK;
     ath_batch b = {ids + from, (int32_t)(to - from), want ? &s->logits : NULL};
-    return ath_model_forward(&s->m, &b, &s->state, NULL, s->scratch, &s->pool);
+    return ath_model_forward(&s->m, &b, &s->state, NULL, s->scratch, &s->exec);
 }
 
 /* Bring the state to ids[0 .. stable) and then ids[stable .. n), keeping a
@@ -177,13 +184,13 @@ static ath_status prefill(session *s, const ath_tokens *ids, size_t stable, size
             ATH_CHECK(ath_state_copy(&s->state, &s->snap, &s->m));
             s->seen.n = s->snap_n;
         } else {
-            ath_state_reset(&s->state, &s->m);
+            ATH_CHECK(ath_state_reset(&s->state, &s->m));
             s->seen.n = 0;
         }
     }
     size_t start = s->seen.n;
     if (start >= ids->n) {   /* nothing new: the last token's logits are needed */
-        ath_state_reset(&s->state, &s->m);
+        ATH_CHECK(ath_state_reset(&s->state, &s->m));
         s->seen.n = 0, start = 0;
     }
     if (start < stable) {
@@ -405,6 +412,7 @@ static int parse_options(options *o, int argc, char **argv)
         else if (!strcmp(a, "--max-tokens") && num(v, 1, 1e9, &x)) o->max_tokens = (int32_t)x;
         else if (!strcmp(a, "--ctx") && num(v, 16, 1 << 24, &x)) o->ctx = (int32_t)x;
         else if (!strcmp(a, "--threads") && num(v, 1, 4096, &x)) o->threads = (int32_t)x;
+        else if (!strcmp(a, "--device") && (!strcmp(v, "cpu") || !strcmp(v, "gpu"))) o->device = v;
         else if (a[0] == '-')
             return usage_error("bad option or value:", a);
         else if (!o->dir) {
@@ -507,12 +515,36 @@ int ath_cmd_chat(ath_arena *a, int argc, char **argv)
         st = load_tools(a, o.tools_file, &s->tools, &s->n_tools);
     if (st == ATH_OK)
         st = ath_tensor_init(&s->logits, ATH_DTYPE_F32, 2, (int64_t[]){1, s->m.vocab_size}, lg, ATH_TIER_RAM);
-    if (st == ATH_OK)
+    /* the device: the GPU unless asked otherwise or there is none */
+    bool gpu = o.device ? !strcmp(o.device, "gpu") : ath_gpu_count() > 0;
+    if (st == ATH_OK && gpu) {
+        s->engine = ath_arena_zalloc(a, sizeof *s->engine, _Alignof(ath_engine));
+        st = s->engine ? ath_engine_open(s->engine, &s->m, 0, a) : ATH_ERR_NOMEM;
+        if (st != ATH_OK) {
+            fprintf(stderr, "athanor chat: no GPU (%s)%s\n", ath_status_str(st),
+                    o.device ? "" : "; running on the CPU (--device cpu)");
+            s->engine = NULL;
+            if (!o.device)
+                st = ATH_OK;
+        }
+    }
+    if (st == ATH_OK && s->engine) {
+        s->exec = s->engine->exec;
+        st = ath_engine_state(s->engine, &s->state, act, o.ctx, a);
+        if (st == ATH_OK && !o.prompt)
+            st = ath_engine_state(s->engine, &s->snap, act, o.ctx, a);
+        if (st == ATH_OK && o.stats)
+            fprintf(stderr, "athanor chat: on %s, %.2f GiB of weights\n", s->engine->dev.name,
+                    (double)s->engine->weight_bytes / 1073741824.0);
+    } else if (st == ATH_OK) {
         st = ath_state_init(&s->state, &s->m, act, o.ctx, a);
-    if (st == ATH_OK && !o.prompt)
-        st = ath_state_init(&s->snap, &s->m, act, o.ctx, a);
+        if (st == ATH_OK && !o.prompt)
+            st = ath_state_init(&s->snap, &s->m, act, o.ctx, a);
+    }
     if (st == ATH_OK)
         st = ath_pool_init(&s->pool, o.threads, a);
+    if (st == ATH_OK && !s->engine)
+        s->exec = (ath_exec){.pool = &s->pool};
     if (st == ATH_OK) {
         ath_tokens_init(&s->seen, a);
         s->eos[0] = ath_tokenizer_added(&s->tok, "<|im_end|>");
@@ -522,6 +554,8 @@ int ath_cmd_chat(ath_arena *a, int argc, char **argv)
     } else {
         fprintf(stderr, "athanor chat: %s\n", ath_status_str(st));
     }
+    if (s->engine)
+        ath_engine_close(s->engine);
     ath_model_close(&s->m);
     ath_arena_free(&scratch);
     return rc;

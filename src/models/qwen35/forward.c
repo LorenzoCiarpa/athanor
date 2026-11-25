@@ -1,6 +1,7 @@
-/* forward.c: the Qwen3.5 forward pass, composed from the reference ops and
- * ath_matmul_fast, which gives the matmuls the same bits as ath_matmul_ref
- * on the threads of the caller's pool.
+/* forward.c: the Qwen3.5 forward pass, composed from the ops' entry points
+ * (ops.h, dispatch), once for both devices: on the CPU they are the
+ * reference ops and ath_matmul_fast (the reference's bits on the threads of
+ * the caller's pool), on a GPU the kernels of step 7 (step 8).
  *
  * One call runs T tokens of one sequence at positions P … P + T − 1, where P
  * is the number of tokens the state has already seen: a whole prompt
@@ -25,8 +26,12 @@
  *   CONV       [K − 1, conv_dim], the last inputs of the convolution
  *   RECURRENT  [n_v_heads, k_dim, v_dim] fp32
  *
- * Working tensors come from the scratch arena and are released after every
- * layer, so scratch memory is one layer's worth for T tokens.
+ * Working tensors come from the scratch arena (on a GPU, the device scratch
+ * arena of the ath_exec) and are released after every layer, so scratch
+ * memory is one layer's worth for T tokens. On a GPU the weights are the
+ * params' device copies (x->weights, by param index), the token ids and
+ * positions are copied to the device, every op is queued on the compute
+ * stream, and the logits come back to the batch's host tensor at the end.
  */
 #include "qwen35.h"
 
@@ -44,7 +49,10 @@ typedef struct {
     const ath_qwen35_config *c;
     ath_state               *s;
     ath_arena               *a;
-    ath_pool                *pool;  /* threads for the matmuls, or NULL */
+    ath_pool                *pool;  /* CPU: threads for the matmuls, or NULL */
+    const ath_device        *dev;   /* NULL: the CPU                        */
+    ath_dev_arena           *da;    /* GPU: working memory                  */
+    const ath_tensor        *w;     /* GPU: the params' device copies       */
     ath_dtype                act;
     int64_t                  T;     /* tokens in this call            */
     int64_t                  P;     /* tokens before them (n_past)    */
@@ -54,14 +62,24 @@ typedef struct {
 
 /* ---- tensors ------------------------------------------------------------------- */
 
-/* A new contiguous tensor in the scratch arena. */
+static ath_tier tier(const fwd *f) { return f->dev ? ATH_TIER_VRAM : ATH_TIER_RAM; }
+
+/* A new contiguous tensor in the scratch arena of the device the pass runs on. */
 static ath_status tmp(fwd *f, ath_tensor *t, ath_dtype dt, int32_t ndim, int64_t d0, int64_t d1, int64_t d2)
 {
     const int64_t shape[3] = {d0, d1, d2};
-    ATH_CHECK(ath_tensor_init(t, dt, ndim, shape, NULL, ATH_TIER_RAM));
+    ATH_CHECK(ath_tensor_init(t, dt, ndim, shape, NULL, tier(f)));
     size_t bytes = ath_tensor_nbytes(t);
-    t->data = ath_arena_alloc(f->a, bytes ? bytes : 1, 64);
+    t->data = f->dev ? ath_dev_arena_alloc(f->da, bytes ? bytes : 1, 0) : ath_arena_alloc(f->a, bytes ? bytes : 1, 64);
     return t->data ? ATH_OK : ATH_ERR_NOMEM;
+}
+
+/* The tensor of param p where the pass reads it: the param itself on the
+ * CPU, its device copy on a GPU (the layer table points into m->params, so
+ * the index is the pointer's offset). */
+static const ath_tensor *W(const fwd *f, const ath_param *p)
+{
+    return f->w ? &f->w[p - f->m->params] : &p->t;
 }
 
 /* The same elements as t, seen with another shape. */
@@ -71,24 +89,30 @@ static ath_status view(const ath_tensor *t, ath_tensor *out, int32_t ndim, int64
     return ath_tensor_reshape(t, ndim, shape, out);
 }
 
-/* A host tensor over memory the forward pass does not own (state, tokens). */
-static ath_status wrap(ath_tensor *t, ath_dtype dt, void *data, int32_t ndim, int64_t d0, int64_t d1, int64_t d2)
+/* A tensor over state memory, on the side the pass runs on. */
+static ath_status wrap(const fwd *f, ath_tensor *t, ath_dtype dt, void *data, int32_t ndim, int64_t d0, int64_t d1,
+                       int64_t d2)
 {
     const int64_t shape[3] = {d0, d1, d2};
-    return ath_tensor_init(t, dt, ndim, shape, data, ATH_TIER_RAM);
+    return ath_tensor_init(t, dt, ndim, shape, data, tier(f));
 }
 
 /* dst[r, :] = src[r, col : col + n] for every row r, n the last dimension of
  * dst: a slice of the last dimension copied out (exactly) so that the ops get
- * contiguous tensors. src and dst have the same dtype and number of rows. */
-static void copy_cols(const ath_tensor *src, int64_t col, ath_tensor *dst)
+ * contiguous tensors. src and dst have the same dtype and number of rows. On
+ * a GPU, one strided copy on the compute stream. */
+static ath_status copy_cols(const fwd *f, const ath_tensor *src, int64_t col, ath_tensor *dst)
 {
     const size_t es = ath_dtype_size(src->dtype);
     const int64_t sc = src->shape[src->ndim - 1], dc = dst->shape[dst->ndim - 1];
     const int64_t rows = ath_tensor_numel(dst) / dc;
+    if (f->dev)
+        return ath_copy_2d(f->dev, dst->data, (size_t)dc * es, (const char *)src->data + (size_t)col * es,
+                           (size_t)sc * es, (size_t)dc * es, (size_t)rows, ATH_STREAM_COMPUTE);
     for (int64_t r = 0; r < rows; r++)
         memcpy((char *)dst->data + (size_t)(r * dc) * es, (const char *)src->data + (size_t)(r * sc + col) * es,
                (size_t)dc * es);
+    return ATH_OK;
 }
 
 /* ---- mixers --------------------------------------------------------------------- */
@@ -107,8 +131,8 @@ static ath_status attention(fwd *f, const ath_qwen35_layer *L, const ath_tensor 
     /* KV cache of this layer: keys [cap, nkv, hd], then values. */
     char *kv = f->s->buf[L->kv];
     ath_tensor kc, vc, k_new, v_new, k_all, v_all;
-    ATH_CHECK(wrap(&kc, act, kv, 3, cap, nkv, hd));
-    ATH_CHECK(wrap(&vc, act, kv + ath_tensor_nbytes(&kc), 3, cap, nkv, hd));
+    ATH_CHECK(wrap(f, &kc, act, kv, 3, cap, nkv, hd));
+    ATH_CHECK(wrap(f, &vc, act, kv + ath_tensor_nbytes(&kc), 3, cap, nkv, hd));
     ATH_CHECK(ath_tensor_slice(&kc, 0, P, T, &k_new));
     ATH_CHECK(ath_tensor_slice(&vc, 0, P, T, &v_new));
     ATH_CHECK(ath_tensor_slice(&kc, 0, 0, S, &k_all));
@@ -117,41 +141,41 @@ static ath_status attention(fwd *f, const ath_qwen35_layer *L, const ath_tensor 
     /* projections; the values go straight into the cache */
     ath_tensor qg, qg_rows, q, q_rows, gate, gate_rows, k, k_rows, v_flat;
     ATH_CHECK(tmp(f, &qg, act, 2, T, nh * 2 * hd, 0));
-    ATH_CHECK(ath_matmul_fast(xn, &L->q_proj->t, &qg, f->pool));
+    ATH_CHECK(ath_matmul(f->dev, f->pool, xn, W(f, L->q_proj), &qg));
     ATH_CHECK(tmp(f, &q, act, 3, T, nh, hd));
     ATH_CHECK(tmp(f, &gate, act, 3, T, nh, hd));
     ATH_CHECK(view(&qg, &qg_rows, 2, T * nh, 2 * hd, 0));
     ATH_CHECK(view(&q, &q_rows, 2, T * nh, hd, 0));
     ATH_CHECK(view(&gate, &gate_rows, 2, T * nh, hd, 0));
-    copy_cols(&qg_rows, 0, &q_rows);     /* per head: query [0, hd), gate [hd, 2 hd) */
-    copy_cols(&qg_rows, hd, &gate_rows);
+    ATH_CHECK(copy_cols(f, &qg_rows, 0, &q_rows));     /* per head: query [0, hd), gate [hd, 2 hd) */
+    ATH_CHECK(copy_cols(f, &qg_rows, hd, &gate_rows));
     ATH_CHECK(tmp(f, &k, act, 2, T, nkv * hd, 0));
-    ATH_CHECK(ath_matmul_fast(xn, &L->k_proj->t, &k, f->pool));
+    ATH_CHECK(ath_matmul(f->dev, f->pool, xn, W(f, L->k_proj), &k));
     ATH_CHECK(view(&v_new, &v_flat, 2, T, nkv * hd, 0));
-    ATH_CHECK(ath_matmul_fast(xn, &L->v_proj->t, &v_flat, f->pool));
+    ATH_CHECK(ath_matmul(f->dev, f->pool, xn, W(f, L->v_proj), &v_flat));
 
     /* QK-norm (zero-centered, per head), then RoPE; rotated keys into the cache */
     ath_tensor qn, kn, qn3, kn3, qr;
     ATH_CHECK(view(&k, &k_rows, 2, T * nkv, hd, 0));
     ATH_CHECK(tmp(f, &qn, act, 2, T * nh, hd, 0));
     ATH_CHECK(tmp(f, &kn, act, 2, T * nkv, hd, 0));
-    ATH_CHECK(ath_rmsnorm_ref(&q_rows, &L->q_norm->t, 1.0f, f->eps, &qn));
-    ATH_CHECK(ath_rmsnorm_ref(&k_rows, &L->k_norm->t, 1.0f, f->eps, &kn));
+    ATH_CHECK(ath_rmsnorm(f->dev, &q_rows, W(f, L->q_norm), 1.0f, f->eps, &qn));
+    ATH_CHECK(ath_rmsnorm(f->dev, &k_rows, W(f, L->k_norm), 1.0f, f->eps, &kn));
     ATH_CHECK(view(&qn, &qn3, 3, T, nh, hd));
     ATH_CHECK(view(&kn, &kn3, 3, T, nkv, hd));
     ATH_CHECK(tmp(f, &qr, act, 3, T, nh, hd));
-    ATH_CHECK(ath_rope_ref(&qn3, &f->pos, c->rope_dim, (float)c->rope_theta, &qr));
-    ATH_CHECK(ath_rope_ref(&kn3, &f->pos, c->rope_dim, (float)c->rope_theta, &k_new));
+    ATH_CHECK(ath_rope(f->dev, &qn3, &f->pos, c->rope_dim, (float)c->rope_theta, &qr));
+    ATH_CHECK(ath_rope(f->dev, &kn3, &f->pos, c->rope_dim, (float)c->rope_theta, &k_new));
 
     /* attention over positions 0 … S − 1, output gate, output projection */
     ath_tensor o, o_flat, gate_flat, og;
     ATH_CHECK(tmp(f, &o, act, 3, T, nh, hd));
-    ATH_CHECK(ath_attn_ref(&qr, &k_all, &v_all, (float)(1.0 / sqrt((double)hd)), &o));
+    ATH_CHECK(ath_attn(f->dev, &qr, &k_all, &v_all, (float)(1.0 / sqrt((double)hd)), &o));
     ATH_CHECK(view(&o, &o_flat, 2, T, nh * hd, 0));
     ATH_CHECK(view(&gate, &gate_flat, 2, T, nh * hd, 0));
     ATH_CHECK(tmp(f, &og, act, 2, T, nh * hd, 0));
-    ATH_CHECK(ath_sigmoid_mul_ref(&o_flat, &gate_flat, &og));
-    return ath_matmul_fast(&og, &L->o_proj->t, out, f->pool);
+    ATH_CHECK(ath_sigmoid_mul(f->dev, &o_flat, &gate_flat, &og));
+    return ath_matmul(f->dev, f->pool, &og, W(f, L->o_proj), out);
 }
 
 /* Gated DeltaNet (contract, Gated DeltaNet layer): projections; causal conv
@@ -171,49 +195,49 @@ static ath_status gated_deltanet(fwd *f, const ath_qwen35_layer *L, const ath_te
     ATH_CHECK(tmp(f, &z, act, 2, T, value_dim, 0));
     ATH_CHECK(tmp(f, &a, act, 2, T, nv, 0));
     ATH_CHECK(tmp(f, &b, act, 2, T, nv, 0));
-    ATH_CHECK(ath_matmul_fast(xn, &L->qkv_proj->t, &qkv, f->pool));
-    ATH_CHECK(ath_matmul_fast(xn, &L->z_proj->t, &z, f->pool));
-    ATH_CHECK(ath_matmul_fast(xn, &L->a_proj->t, &a, f->pool));
-    ATH_CHECK(ath_matmul_fast(xn, &L->b_proj->t, &b, f->pool));
+    ATH_CHECK(ath_matmul(f->dev, f->pool, xn, W(f, L->qkv_proj), &qkv));
+    ATH_CHECK(ath_matmul(f->dev, f->pool, xn, W(f, L->z_proj), &z));
+    ATH_CHECK(ath_matmul(f->dev, f->pool, xn, W(f, L->a_proj), &a));
+    ATH_CHECK(ath_matmul(f->dev, f->pool, xn, W(f, L->b_proj), &b));
 
     /* convolution over all conv_dim channels, then the split into q, k, v */
     ath_tensor conv_state, mixed, q, k, v, q2, k2, v2;
-    ATH_CHECK(wrap(&conv_state, act, f->s->buf[L->conv_state], 2, c->conv_kernel - 1, conv_dim, 0));
+    ATH_CHECK(wrap(f, &conv_state, act, f->s->buf[L->conv_state], 2, c->conv_kernel - 1, conv_dim, 0));
     ATH_CHECK(tmp(f, &mixed, act, 2, T, conv_dim, 0));
-    ATH_CHECK(ath_conv_ref(&qkv, &L->conv->t, &conv_state, ATH_ACT_SILU, &mixed));
+    ATH_CHECK(ath_conv(f->dev, &qkv, W(f, L->conv), &conv_state, ATH_ACT_SILU, &mixed));
     ATH_CHECK(tmp(f, &q, act, 3, T, nk, dk));
     ATH_CHECK(tmp(f, &k, act, 3, T, nk, dk));
     ATH_CHECK(tmp(f, &v, act, 3, T, nv, dv));
     ATH_CHECK(view(&q, &q2, 2, T, key_dim, 0));
     ATH_CHECK(view(&k, &k2, 2, T, key_dim, 0));
     ATH_CHECK(view(&v, &v2, 2, T, value_dim, 0));
-    copy_cols(&mixed, 0, &q2);
-    copy_cols(&mixed, key_dim, &k2);
-    copy_cols(&mixed, 2 * key_dim, &v2);
+    ATH_CHECK(copy_cols(f, &mixed, 0, &q2));
+    ATH_CHECK(copy_cols(f, &mixed, key_dim, &k2));
+    ATH_CHECK(copy_cols(f, &mixed, 2 * key_dim, &v2));
 
     /* fp32 from here on, as in the reference: L2 norm, gates, recurrence */
     ath_tensor qn, kn, g, beta, rec, o;
     ATH_CHECK(tmp(f, &qn, ATH_DTYPE_F32, 3, T, nk, dk));
     ATH_CHECK(tmp(f, &kn, ATH_DTYPE_F32, 3, T, nk, dk));
-    ATH_CHECK(ath_l2norm_ref(&q, L2NORM_EPS, &qn));
-    ATH_CHECK(ath_l2norm_ref(&k, L2NORM_EPS, &kn));
+    ATH_CHECK(ath_l2norm(f->dev, &q, L2NORM_EPS, &qn));
+    ATH_CHECK(ath_l2norm(f->dev, &k, L2NORM_EPS, &kn));
     /* beta = sigmoid(b) is rounded to the activation dtype, as the reference
      * computes it on the bf16 projection; g is fp32 */
     ATH_CHECK(tmp(f, &g, ATH_DTYPE_F32, 2, T, nv, 0));
     ATH_CHECK(tmp(f, &beta, act, 2, T, nv, 0));
-    ATH_CHECK(ath_gdn_gates_ref(&a, &b, &L->a_log->t, &L->dt_bias->t, &g, &beta));
-    ATH_CHECK(wrap(&rec, ATH_DTYPE_F32, f->s->buf[L->recurrent], 3, nv, dk, dv));
+    ATH_CHECK(ath_gdn_gates(f->dev, &a, &b, W(f, L->a_log), W(f, L->dt_bias), &g, &beta));
+    ATH_CHECK(wrap(f, &rec, ATH_DTYPE_F32, f->s->buf[L->recurrent], 3, nv, dk, dv));
     ATH_CHECK(tmp(f, &o, act, 3, T, nv, dv));
-    ATH_CHECK(ath_gdn_ref(&qn, &kn, &v, &g, &beta, (float)(1.0 / sqrt((double)dk)), &rec, &o));
+    ATH_CHECK(ath_gdn(f->dev, &qn, &kn, &v, &g, &beta, (float)(1.0 / sqrt((double)dk)), &rec, &o));
 
     /* gated RMSNorm per value head, then the output projection */
     ath_tensor o_rows, z_rows, on, on_flat;
     ATH_CHECK(view(&o, &o_rows, 2, T * nv, dv, 0));
     ATH_CHECK(view(&z, &z_rows, 2, T * nv, dv, 0));
     ATH_CHECK(tmp(f, &on, act, 2, T * nv, dv, 0));
-    ATH_CHECK(ath_rmsnorm_gated_ref(&o_rows, &z_rows, &L->norm->t, f->eps, &on));
+    ATH_CHECK(ath_rmsnorm_gated(f->dev, &o_rows, &z_rows, W(f, L->norm), f->eps, &on));
     ATH_CHECK(view(&on, &on_flat, 2, T, value_dim, 0));
-    return ath_matmul_fast(&on_flat, &L->out_proj->t, out, f->pool);
+    return ath_matmul(f->dev, f->pool, &on_flat, W(f, L->out_proj), out);
 }
 
 /* SwiGLU MLP (contract, MLP): down(silu(gate(x)) · up(x)). */
@@ -224,10 +248,10 @@ static ath_status mlp(fwd *f, const ath_qwen35_layer *L, const ath_tensor *xn, a
     ATH_CHECK(tmp(f, &gate, f->act, 2, T, I, 0));
     ATH_CHECK(tmp(f, &up, f->act, 2, T, I, 0));
     ATH_CHECK(tmp(f, &h, f->act, 2, T, I, 0));
-    ATH_CHECK(ath_matmul_fast(xn, &L->gate_proj->t, &gate, f->pool));
-    ATH_CHECK(ath_matmul_fast(xn, &L->up_proj->t, &up, f->pool));
-    ATH_CHECK(ath_swiglu_ref(&gate, &up, &h));
-    return ath_matmul_fast(&h, &L->down_proj->t, out, f->pool);
+    ATH_CHECK(ath_matmul(f->dev, f->pool, xn, W(f, L->gate_proj), &gate));
+    ATH_CHECK(ath_matmul(f->dev, f->pool, xn, W(f, L->up_proj), &up));
+    ATH_CHECK(ath_swiglu(f->dev, &gate, &up, &h));
+    return ath_matmul(f->dev, f->pool, &h, W(f, L->down_proj), out);
 }
 
 /* One decoder layer, in place on the residual stream x [T, hidden]. Both
@@ -240,22 +264,22 @@ static ath_status layer(fwd *f, int32_t l, ath_tensor *x)
     ATH_CHECK(tmp(f, &xn, f->act, 2, T, H, 0));
     ATH_CHECK(tmp(f, &y, f->act, 2, T, H, 0));
 
-    ATH_CHECK(ath_rmsnorm_ref(x, &L->input_norm->t, 1.0f, f->eps, &xn));
+    ATH_CHECK(ath_rmsnorm(f->dev, x, W(f, L->input_norm), 1.0f, f->eps, &xn));
     if (f->c->mixer[l] == ATH_QWEN35_ATTENTION)
         ATH_CHECK(attention(f, L, &xn, &y));
     else
         ATH_CHECK(gated_deltanet(f, L, &xn, &y));
-    ATH_CHECK(ath_add_ref(x, &y, x));
+    ATH_CHECK(ath_add(f->dev, x, &y, x));
 
-    ATH_CHECK(ath_rmsnorm_ref(x, &L->post_norm->t, 1.0f, f->eps, &xn));
+    ATH_CHECK(ath_rmsnorm(f->dev, x, W(f, L->post_norm), 1.0f, f->eps, &xn));
     ATH_CHECK(mlp(f, L, &xn, &y));
-    return ath_add_ref(x, &y, x);
+    return ath_add(f->dev, x, &y, x);
 }
 
 /* ---- entry point ------------------------------------------------------------------ */
 
 ath_status ath_qwen35_forward(const ath_model *m, const ath_batch *b, ath_state *s, const ath_hooks *h,
-                              ath_arena *scratch, ath_pool *pool)
+                              ath_arena *scratch, const ath_exec *x_)
 {
     const ath_qwen35_model *q = m->family_data;
     const ath_qwen35_config *c = &q->c;
@@ -264,24 +288,43 @@ ath_status ath_qwen35_forward(const ath_model *m, const ath_batch *b, ath_state 
         return ATH_ERR_UNSUPPORTED;
     }
     fwd f = {
-        .m = m, .c = c, .s = s, .a = scratch, .pool = pool, .act = s->act,
-        .T = b->n_tokens, .P = s->n_past, .eps = (float)c->rms_eps,
+        .m = m, .c = c, .s = s, .a = scratch, .pool = x_->pool, .dev = x_->dev, .da = x_->scratch,
+        .w = x_->dev ? x_->weights : NULL, .act = s->act, .T = b->n_tokens, .P = s->n_past,
+        .eps = (float)c->rms_eps,
     };
     const int64_t T = f.T, H = c->hidden;
 
-    ath_tensor ids, x;
-    ATH_CHECK(wrap(&ids, ATH_DTYPE_I32, (void *)b->tokens, 1, T, 0, 0));
-    ATH_CHECK(tmp(&f, &f.pos, ATH_DTYPE_I32, 1, T, 0, 0));
+    /* token ids and positions, computed on the host, copied to the device
+     * on a GPU (a copy from ordinary memory consumes the source before it
+     * returns, so the host buffers may go) */
+    ath_tensor ids, x, pos_host;
+    const int64_t one[1] = {T};
+    ATH_CHECK(ath_tensor_init(&pos_host, ATH_DTYPE_I32, 1, one, NULL, ATH_TIER_RAM));
+    pos_host.data = ath_arena_alloc(scratch, (size_t)T * sizeof(int32_t), 64);
+    if (!pos_host.data)
+        return ATH_ERR_NOMEM;
     for (int64_t i = 0; i < T; i++)
-        ((int32_t *)f.pos.data)[i] = (int32_t)(f.P + i);
+        ((int32_t *)pos_host.data)[i] = (int32_t)(f.P + i);
+    if (f.dev) {
+        ATH_CHECK(tmp(&f, &ids, ATH_DTYPE_I32, 1, T, 0, 0));
+        ATH_CHECK(tmp(&f, &f.pos, ATH_DTYPE_I32, 1, T, 0, 0));
+        ATH_CHECK(ath_copy(f.dev, ids.data, b->tokens, (size_t)T * sizeof(int32_t), ATH_STREAM_COMPUTE));
+        ATH_CHECK(ath_copy(f.dev, f.pos.data, pos_host.data, (size_t)T * sizeof(int32_t), ATH_STREAM_COMPUTE));
+    } else {
+        ATH_CHECK(ath_tensor_init(&ids, ATH_DTYPE_I32, 1, one, (void *)b->tokens, ATH_TIER_RAM));
+        f.pos = pos_host;
+    }
     ATH_CHECK(tmp(&f, &x, f.act, 2, T, H, 0));
-    ATH_CHECK(ath_embed_ref(&q->embed->t, &ids, &x));
+    ATH_CHECK(ath_embed(f.dev, W(&f, q->embed), &ids, &x));
 
     for (int32_t l = 0; l < c->n_layers; l++) {
         if (h && h->on_residual)
             h->on_residual(h->u, l, &x);
         ath_arena_pos mark = ath_arena_mark(scratch);
+        ath_dev_arena_pos dmark = f.dev ? ath_dev_arena_mark(f.da) : (ath_dev_arena_pos){0};
         ath_status st = layer(&f, l, &x);
+        if (f.dev)
+            ath_dev_arena_reset(f.da, dmark);   /* the next layer's work comes after on the stream */
         ath_arena_reset(scratch, mark);
         ATH_CHECK(st);
     }
@@ -291,10 +334,16 @@ ath_status ath_qwen35_forward(const ath_model *m, const ath_batch *b, ath_state 
     if (!b->logits)
         return ATH_OK;
     /* final norm and output projection on the rows that need logits */
-    ath_tensor rows = x, xn;
+    ath_tensor rows = x, xn, logits = *b->logits;
     if (b->logits->shape[0] == 1)
         ATH_CHECK(ath_tensor_slice(&x, 0, T - 1, 1, &rows));
     ATH_CHECK(tmp(&f, &xn, f.act, 2, rows.shape[0], H, 0));
-    ATH_CHECK(ath_rmsnorm_ref(&rows, &q->norm->t, 1.0f, f.eps, &xn));
-    return ath_matmul_fast(&xn, &q->head->t, b->logits, f.pool);
+    ATH_CHECK(ath_rmsnorm(f.dev, &rows, W(&f, q->norm), 1.0f, f.eps, &xn));
+    if (f.dev)
+        ATH_CHECK(tmp(&f, &logits, ATH_DTYPE_F32, 2, rows.shape[0], m->vocab_size, 0));
+    ATH_CHECK(ath_matmul(f.dev, f.pool, &xn, W(&f, q->head), &logits));
+    if (!f.dev)
+        return ATH_OK;
+    ATH_CHECK(ath_copy(f.dev, b->logits->data, logits.data, ath_tensor_nbytes(&logits), ATH_STREAM_COMPUTE));
+    return ath_stream_sync(f.dev, ATH_STREAM_COMPUTE);
 }

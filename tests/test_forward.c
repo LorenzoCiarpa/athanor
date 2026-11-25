@@ -22,7 +22,9 @@
  *
  * The four runs are independent; they run in parallel threads and share one
  * pool for their matmuls (ath_matmul_fast, the same bits as the reference
- * with any number of threads). A DEBUG build runs only the first
+ * with any number of threads). With a GPU (make cuda test) the same four
+ * runs go through the engine (src/infer/engine.h) afterwards, one after the
+ * other, and are held to the same gate and tolerances (step 8). A DEBUG build runs only the first
  * ATH_FORWARD_POSITIONS positions (default 4) and checks the f32 tolerances,
  * not the gate, which needs every position. Needs $ATH_GOLDEN_DIR and
  * $ATH_MODEL_DIR; skipped when either is missing.
@@ -32,6 +34,7 @@
 #include "util.h"
 
 #include "core/safetensors.h"
+#include "infer/engine.h"
 #include "model/model.h"
 
 #include <pthread.h>
@@ -169,7 +172,7 @@ ATH_TEST(state_specs)
     for (uint32_t i = 0; i < m->n_states; i++)
         memset(s.buf[i], 0x5a, spec_bytes(&m->states[i], s.act, s.capacity));
     s.n_past = 3;
-    ath_state_reset(&s, m);
+    ATH_EXPECT_OK(ath_state_reset(&s, m));
     ATH_EXPECT(s.n_past == 0);
     for (uint32_t i = 0; i < m->n_states; i++) {
         if (m->states[i].kind == ATH_STATE_KV)
@@ -415,7 +418,9 @@ typedef struct {
     /* in */
     const ath_model       *m;
     const ath_safetensors *g;
-    ath_pool              *pool;                 /* shared by the runs */
+    ath_pool              *pool;                 /* shared by the CPU runs */
+    ath_engine            *eng;                  /* the GPU runs: the engine; NULL on the CPU */
+    void                  *res_host;             /* GPU: the residual stream copied back */
     const char            *name;
     ath_dtype              act;
     const int32_t         *tokens;
@@ -433,9 +438,19 @@ typedef struct {
 
 /* Score of the residual stream entering `layer` against both reference runs,
  * for the positions of the current call. */
-static void compare_residual(void *u, int32_t layer, const ath_tensor *x)
+static void compare_residual(void *u, int32_t layer, const ath_tensor *x_in)
 {
     job *j = u;
+    ath_tensor xh = *x_in, *x = &xh;
+    if (x_in->tier == ATH_TIER_VRAM) {   /* on the GPU: copy it back on the compute stream, after its writers */
+        xh.data = j->res_host;
+        xh.tier = ATH_TIER_RAM;
+        if (ath_copy(&j->eng->dev, xh.data, x_in->data, ath_tensor_nbytes(x_in), ATH_STREAM_COMPUTE) != ATH_OK ||
+            ath_stream_sync(&j->eng->dev, ATH_STREAM_COMPUTE) != ATH_OK) {
+            j->err[layer] = j->err32[layer] = INFINITY;
+            return;
+        }
+    }
     const int64_t H = j->m->hidden_size, rows = x->shape[0];
     const size_t at = ((size_t)layer * (size_t)j->n_tokens + (size_t)j->pos0) * (size_t)H;
     const size_t es = ath_dtype_size(j->res->dtype), es32 = ath_dtype_size(j->res32->dtype);
@@ -468,7 +483,8 @@ static void *run_job(void *arg)
     double t0 = now();
     ath_state s;
     ath_hooks h = {.on_residual = compare_residual, .u = j};
-    j->st = ath_state_init(&s, j->m, j->act, j->n_run, &a);
+    const ath_exec x = j->eng ? j->eng->exec : (ath_exec){.pool = j->pool};
+    j->st = j->eng ? ath_engine_state(j->eng, &s, j->act, j->n_run, &a) : ath_state_init(&s, j->m, j->act, j->n_run, &a);
     int32_t first = j->n_prompt < j->n_run ? j->n_prompt : j->n_run - 1;
     if (first < 1)
         first = 1;
@@ -476,7 +492,7 @@ static void *run_job(void *arg)
         int32_t n = p == 0 ? first : 1;
         ath_tensor logits = f32_tensor(j->logits + (size_t)p * (size_t)V, n, V);
         j->pos0 = p;
-        j->st = ath_model_forward(j->m, &(ath_batch){j->tokens + p, n, &logits}, &s, &h, &scratch, j->pool);
+        j->st = ath_model_forward(j->m, &(ath_batch){j->tokens + p, n, &logits}, &s, &h, &scratch, &x);
         p += n;
     }
     j->seconds = now() - t0;
@@ -635,25 +651,35 @@ ATH_TEST(forward_golden)
     for (size_t i = 0; i < n_prompts; i++)
         ATH_REQUIRE(read_prompt(t_, ath_json_at(recs, i), &g, &a, &P[i]));
 
-    /* two runs per prompt: bf16 and f32 activations */
+    /* two runs per prompt, bf16 and f32 activations, on the CPU; then the
+     * same on the GPU when there is one */
     ath_pool pool = {.n_threads = 0};   /* started below, once nothing can return early */
-    job J[2 * MAX_PROMPTS];
+    ath_engine *eng = NULL;
+    if (ath_gpu_count() > 0) {
+        eng = ath_arena_zalloc(&a, sizeof *eng, _Alignof(ath_engine));
+        ATH_REQUIRE(eng);
+        ATH_REQUIRE_OK(ath_engine_open(eng, &m, 0, &a));
+    }
+    job J[4 * MAX_PROMPTS];
     pthread_t th[2 * MAX_PROMPTS];
-    const int n_jobs = 2 * (int)n_prompts;
+    const int n_cpu = 2 * (int)n_prompts, n_jobs = eng ? 2 * n_cpu : n_cpu;
     for (int k = 0; k < n_jobs; k++) {
-        prompt *p = &P[k / 2];
+        const int kc = k % n_cpu;
+        prompt *p = &P[kc / 2];
         job *j = &J[k];
         int32_t n_run = positions_to_run(p->n_tokens);
         *j = (job){
-            .m = &m, .g = &g, .pool = &pool, .name = p->name, .act = k % 2 ? ATH_DTYPE_F32 : ATH_DTYPE_BF16,
+            .m = &m, .g = &g, .pool = &pool, .eng = k >= n_cpu ? eng : NULL, .name = p->name,
+            .act = kc % 2 ? ATH_DTYPE_F32 : ATH_DTYPE_BF16,
             .tokens = p->tokens, .n_prompt = p->n_prompt, .n_tokens = p->n_tokens, .n_run = n_run,
             .res = p->res, .res32 = p->res32, .rms = p->rms, .rms32 = p->rms32,
         };
         j->logits = ath_arena_alloc(&a, (size_t)n_run * (size_t)V * sizeof(float), 64);
         j->err = ath_arena_zalloc(&a, (size_t)L1 * sizeof(double), 8);
         j->err32 = ath_arena_zalloc(&a, (size_t)L1 * sizeof(double), 8);
-        ATH_REQUIRE(j->logits && j->err && j->err32);
-        if (k % 2 == 0)   /* RMS of each layer's stream over the positions run */
+        j->res_host = j->eng ? ath_arena_alloc(&a, (size_t)n_run * (size_t)H * sizeof(float), 64) : NULL;
+        ATH_REQUIRE(j->logits && j->err && j->err32 && (!j->eng || j->res_host));
+        if (k < n_cpu && kc % 2 == 0)   /* RMS of each layer's stream over the positions run */
             for (int64_t l = 0; l < L1; l++) {
                 const size_t at = (size_t)(l * p->n_tokens) * (size_t)H;
                 p->rms[l] = rms_of((const char *)p->res->data + at * ath_dtype_size(p->res->dtype), p->res->dtype,
@@ -664,12 +690,16 @@ ATH_TEST(forward_golden)
     }
     ATH_REQUIRE_OK(ath_pool_init(&pool, ath_pool_default_threads(), &a));
     int started = 0;
-    while (started < n_jobs && pthread_create(&th[started], NULL, run_job, &J[started]) == 0)
+    while (started < n_cpu && pthread_create(&th[started], NULL, run_job, &J[started]) == 0)
         started++;
     for (int k = 0; k < started; k++)
         pthread_join(th[k], NULL);
     ath_pool_free(&pool);
-    ATH_REQUIRE(started == n_jobs);
+    ATH_REQUIRE(started == n_cpu);
+    for (int k = n_cpu; k < n_jobs; k++)   /* the GPU runs share the engine's scratch: one at a time */
+        run_job(&J[k]);
+    if (eng)
+        ath_engine_close(eng);
 
     bool full = true;
     for (int k = 0; k < n_jobs; k++) {
@@ -696,13 +726,13 @@ ATH_TEST(forward_golden)
 
     float *row = ath_arena_alloc(&a, (size_t)V * sizeof(float), 64);   /* a bf16 reference row, widened */
     ATH_REQUIRE(row);
-    double all_kl = 0, all_ref = 0;   /* sums over every position of every prompt (bf16 runs) */
-    int all_n = 0, all_bad = 0, all_checked = 0;
-    printf("  %-6s %-4s %9s  %5s  %-9s %-9s %-9s  %-9s %-9s  %-7s %-7s %-6s\n", "prompt", "act", "positions", "s",
+    double all_kl[2] = {0}, all_ref[2] = {0};   /* sums over every position of every prompt (bf16 runs), per device */
+    int all_n[2] = {0}, all_bad[2] = {0}, all_checked[2] = {0};
+    printf("  %-6s %-8s %9s  %5s  %-9s %-9s %-9s  %-9s %-9s  %-7s %-7s %-6s\n", "prompt", "act", "positions", "s",
            "KL mean", "KL max", "ref mean", "ref max", "logits", "greedy", "ref", "res");
     for (int k = 0; k < n_jobs; k++) {
         const job *j = &J[k];
-        const prompt *p = &P[k / 2];
+        const prompt *p = &P[(k % n_cpu) / 2];
         double kl_sum = 0, kl_max = 0, ref_sum = 0, ref_max = 0;
         int greedy_bad = 0, greedy_checked = 0, ath_differs = 0, ref_differs = 0;
         for (int32_t t = 0; t < j->n_run; t++) {
@@ -725,9 +755,9 @@ ATH_TEST(forward_golden)
             bool differs = argmax_f32(got, V) != x;
             ath_differs += differs;
             if (getenv("ATH_FORWARD_DETAIL"))
-                printf("  position %-6s %-4s %3d  KL %.2e  ref %.2e  top-2 margin %6.3f%s%s\n", p->name,
-                       j->act == ATH_DTYPE_F32 ? "f32" : "bf16", t, kl, klr, margin, differs ? "  athanor differs" : "",
-                       argmax_f32(row, V) != x ? "  reference differs" : "");
+                printf("  position %-6s %-4s%s %3d  KL %.2e  ref %.2e  top-2 margin %6.3f%s%s\n", p->name,
+                       j->act == ATH_DTYPE_F32 ? "f32" : "bf16", j->eng ? " gpu" : "", t, kl, klr, margin,
+                       differs ? "  athanor differs" : "", argmax_f32(row, V) != x ? "  reference differs" : "");
             if (margin > noise) {
                 greedy_checked++;
                 greedy_bad += differs;
@@ -743,20 +773,21 @@ ATH_TEST(forward_golden)
                 res_worst = j->err32[l];
                 res_layer = (int)l;
             }
-        printf("  %-6s %-4s %4d of %-3d %5.1f  %-9.2e %-9.2e %-9.2e  %-9.2e %-9.2e  %2d of %-2d %-7d %.2e (layer %d)\n",
-               p->name, j->act == ATH_DTYPE_F32 ? "f32" : "bf16", j->n_run, j->n_tokens, j->seconds, kl_mean, kl_max,
-               ref_mean, ref_max, lerr, ath_differs, j->n_run, ref_differs, res_worst, res_layer);
+        const char *dev = j->eng ? " gpu" : "";
+        printf("  %-6s %-4s%-4s %4d of %-3d %5.1f  %-9.2e %-9.2e %-9.2e  %-9.2e %-9.2e  %2d of %-2d %-7d %.2e (layer %d)\n",
+               p->name, j->act == ATH_DTYPE_F32 ? "f32" : "bf16", dev, j->n_run, j->n_tokens, j->seconds, kl_mean,
+               kl_max, ref_mean, ref_max, lerr, ath_differs, j->n_run, ref_differs, res_worst, res_layer);
 
         char msg[300];
         if (j->act == ATH_DTYPE_F32) {
             for (int64_t l = 0; l < L1; l++)
                 if (!(j->err32[l] <= TOL_F32_RESIDUAL)) {
-                    snprintf(msg, sizeof msg, "%s f32: residual entering layer %d: %.3g > %.3g", p->name, (int)l,
-                             j->err32[l], TOL_F32_RESIDUAL);
+                    snprintf(msg, sizeof msg, "%s f32%s: residual entering layer %d: %.3g > %.3g", p->name, dev,
+                             (int)l, j->err32[l], TOL_F32_RESIDUAL);
                     ath_test_fail_(t_, __FILE__, __LINE__, msg);
                 }
             if (!(lerr <= TOL_F32_LOGITS)) {
-                snprintf(msg, sizeof msg, "%s f32: logits %.3g > %.3g", p->name, lerr, TOL_F32_LOGITS);
+                snprintf(msg, sizeof msg, "%s f32%s: logits %.3g > %.3g", p->name, dev, lerr, TOL_F32_LOGITS);
                 ath_test_fail_(t_, __FILE__, __LINE__, msg);
             }
             continue;
@@ -769,25 +800,30 @@ ATH_TEST(forward_golden)
                 ath_test_fail_(t_, __FILE__, __LINE__, msg);
             }
         }
-        all_kl += kl_sum;
-        all_ref += ref_sum;
-        all_n += j->n_run;
-        all_bad += greedy_bad;
-        all_checked += greedy_checked;
+        const int d = j->eng != NULL;
+        all_kl[d] += kl_sum;
+        all_ref[d] += ref_sum;
+        all_n[d] += j->n_run;
+        all_bad[d] += greedy_bad;
+        all_checked[d] += greedy_checked;
     }
-    printf("  bf16, all %d positions run: mean KL %.3e, bf16 reference %.3e (ratio %.2f); greedy token\n"
-           "  differs from the fp32 reference at %d of %d positions whose top-2 margin exceeds the bf16 noise\n",
-           all_n, all_kl / all_n, all_ref / all_n, all_kl / all_ref, all_bad, all_checked);
-    if (full) {
-        char msg[200];
-        if (!(all_kl <= all_ref)) {
-            snprintf(msg, sizeof msg, "bf16: mean KL %.3g > bf16 reference %.3g", all_kl / all_n, all_ref / all_n);
-            ath_test_fail_(t_, __FILE__, __LINE__, msg);
-        }
-        if (all_bad) {
-            snprintf(msg, sizeof msg, "bf16: greedy token differs at %d of %d positions above the noise", all_bad,
-                     all_checked);
-            ath_test_fail_(t_, __FILE__, __LINE__, msg);
+    for (int d = 0; d < (eng ? 2 : 1); d++) {
+        printf("  bf16 on the %s, all %d positions run: mean KL %.3e, bf16 reference %.3e (ratio %.2f); greedy\n"
+               "  token differs from the fp32 reference at %d of %d positions whose top-2 margin exceeds the bf16 noise\n",
+               d ? "GPU" : "CPU", all_n[d], all_kl[d] / all_n[d], all_ref[d] / all_n[d], all_kl[d] / all_ref[d],
+               all_bad[d], all_checked[d]);
+        if (full) {
+            char msg[200];
+            if (!(all_kl[d] <= all_ref[d])) {
+                snprintf(msg, sizeof msg, "bf16 %s: mean KL %.3g > bf16 reference %.3g", d ? "GPU" : "CPU",
+                         all_kl[d] / all_n[d], all_ref[d] / all_n[d]);
+                ath_test_fail_(t_, __FILE__, __LINE__, msg);
+            }
+            if (all_bad[d]) {
+                snprintf(msg, sizeof msg, "bf16 %s: greedy token differs at %d of %d positions above the noise",
+                         d ? "GPU" : "CPU", all_bad[d], all_checked[d]);
+                ath_test_fail_(t_, __FILE__, __LINE__, msg);
+            }
         }
     }
     printf("  greedy: bf16 noise of the top-2 margin %.3f; columns greedy and ref count the positions where\n"
@@ -798,8 +834,9 @@ ATH_TEST(forward_golden)
     if (getenv("ATH_FORWARD_LAYERS"))
         for (int k = 0; k < n_jobs; k++)
             for (int64_t l = 0; l < L1; l++)
-                printf("  layer %-6s %-4s %2d  vs bf16 ref %.2e  vs fp32 ref %.2e\n", J[k].name,
-                       J[k].act == ATH_DTYPE_F32 ? "f32" : "bf16", (int)l, J[k].err[l], J[k].err32[l]);
+                printf("  layer %-6s %-4s%s %2d  vs bf16 ref %.2e  vs fp32 ref %.2e\n", J[k].name,
+                       J[k].act == ATH_DTYPE_F32 ? "f32" : "bf16", J[k].eng ? " gpu" : "", (int)l, J[k].err[l],
+                       J[k].err32[l]);
 
 out:
     ath_model_close(&m);

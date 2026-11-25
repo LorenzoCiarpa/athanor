@@ -736,7 +736,7 @@ ATH_TEST(golden_chat_generate)
     float *lg = ath_arena_alloc(&a, (size_t)m.vocab_size * sizeof *lg, _Alignof(float));
     ath_tensor logits;
     ATH_REQUIRE_OK(ath_tensor_init(&logits, ATH_DTYPE_F32, 2, (int64_t[]){1, m.vocab_size}, lg, ATH_TIER_RAM));
-    ath_status s = ath_model_forward(&m, &(ath_batch){ids.ids, (int32_t)ids.n, &logits}, &st, NULL, &scratch, &pool);
+    ath_status s = ath_model_forward(&m, &(ath_batch){ids.ids, (int32_t)ids.n, &logits}, &st, NULL, &scratch, &(ath_exec){.pool = &pool});
     ATH_EXPECT_OK(s);
 
     int compared = 0, safe = 1, equal = 0;
@@ -760,7 +760,7 @@ ATH_TEST(golden_chat_generate)
             safe = margin > noise && next == want;
         }
         ATH_REQUIRE_OK(ath_tokenizer_decode(&tok, &next, 1, &text));
-        s = ath_model_forward(&m, &(ath_batch){&next, 1, &logits}, &st, NULL, &scratch, &pool);
+        s = ath_model_forward(&m, &(ath_batch){&next, 1, &logits}, &st, NULL, &scratch, &(ath_exec){.pool = &pool});
         ATH_EXPECT_OK(s);
     }
     /* The parser gives the decoded text back as one text event. */

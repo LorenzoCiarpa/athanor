@@ -26,6 +26,7 @@
 #ifndef ATH_MODEL_H
 #define ATH_MODEL_H
 
+#include "backend/backend.h"
 #include "core/arena.h"
 #include "core/buf.h"
 #include "core/json.h"
@@ -216,15 +217,29 @@ typedef struct {
     void             *family_data;       /* family-private (parsed config); opaque     */
 } ath_model;
 
-/* The state of one sequence, in host memory (ath_state_init). The engine of
- * step 8 keeps the same layout on the GPU. */
+/* The state of one sequence: in host memory (ath_state_init) or in the
+ * memory of a device (ath_state_init_gpu, step 8), with the same layout. */
 typedef struct {
-    ath_dtype act;          /* activation dtype: ATH_DTYPE_BF16 (the checkpoint's, as the
-                             * reference runs) or ATH_DTYPE_F32 (an exact forward pass)   */
-    int32_t   capacity;     /* tokens the KV buffers hold                                 */
-    int32_t   n_past;       /* tokens processed so far: the position of the next token    */
-    void    **buf;          /* [n_states]: buf[i] holds m->states[i]                      */
+    ath_dtype         act;      /* activation dtype: ATH_DTYPE_BF16 (the checkpoint's, as the
+                                 * reference runs) or ATH_DTYPE_F32 (an exact forward pass)   */
+    int32_t           capacity; /* tokens the KV buffers hold                                 */
+    int32_t           n_past;   /* tokens processed so far: the position of the next token    */
+    void            **buf;      /* [n_states]: buf[i] holds m->states[i] (the pointer array
+                                 * itself is always in host memory)                           */
+    const ath_device *dev;      /* NULL: the buffers are in host memory; otherwise on dev     */
 } ath_state;
+
+/* Where a forward pass runs (step 8). On the CPU every member but pool is
+ * NULL, and a NULL ath_exec means the CPU on the calling thread. On a GPU,
+ * dev, weights and scratch are set, and the state must be on dev
+ * (ath_state_init_gpu): src/infer/engine.h builds it. */
+typedef struct {
+    ath_pool         *pool;      /* CPU threads for the fast paths; NULL: the calling thread     */
+    const ath_device *dev;       /* the device that runs the pass; NULL: the CPU                 */
+    const ath_tensor *weights;   /* dev: [n_params], each param's copy in dev's memory (ignored
+                                  * params: an empty descriptor); NULL: the params themselves    */
+    ath_dev_arena    *scratch;   /* dev: working memory, released after every call               */
+} ath_exec;
 
 /* Tokens appended to the sequence of a state by one forward call. */
 typedef struct {
@@ -239,8 +254,11 @@ typedef struct {
 typedef struct {
     /* The residual stream entering layer `layer` (0 … n_layers − 1); with
      * layer == n_layers, the stream entering the final norm. x is
-     * [n_tokens, hidden_size] in the activation dtype. Abliteration captures
-     * it (phase 3); the forward tests compare it with the reference. */
+     * [n_tokens, hidden_size] in the activation dtype, where the pass runs:
+     * in device memory (tier VRAM) on a GPU, where work on the compute
+     * stream may still be writing it, so a hook that reads it copies it on
+     * that stream and waits. Abliteration captures it (phase 3); the forward
+     * tests compare it with the reference. */
     void (*on_residual)(void *u, int32_t layer, const ath_tensor *x);
     void  *u;
 } ath_hooks;
@@ -258,12 +276,15 @@ struct ath_family {
     /* Run b->tokens at positions s->n_past, s->n_past + 1, ...: read and update
      * the state buffers, call the hooks, write the logits. Called only through
      * ath_model_forward, which has checked every argument and advances
-     * s->n_past afterwards. Working memory comes from scratch; CPU work may
-     * be spread over the threads of pool (NULL: the calling thread only),
-     * which never changes a result. NULL if the family cannot run models
-     * yet. */
+     * s->n_past afterwards. x says where it runs (ath_exec; never NULL
+     * here): on the CPU, working memory comes from scratch and CPU work may
+     * be spread over the threads of x->pool, which never changes a result;
+     * on a GPU, the ops run on x->dev with the params' copies x->weights,
+     * device working memory comes from x->scratch, and the logits are copied
+     * to the batch's host tensor before returning. NULL if the family cannot
+     * run models yet. */
     ath_status (*forward)(const ath_model *m, const ath_batch *b, ath_state *s, const ath_hooks *h,
-                          ath_arena *scratch, ath_pool *pool);
+                          ath_arena *scratch, const ath_exec *x);
 
     /* ---- text (step 5); NULL if the family has none ---- */
 
@@ -313,16 +334,24 @@ ath_status ath_state_bytes(const ath_model *m, ath_dtype act, int32_t capacity, 
 ath_status ath_state_init(ath_state *s, const ath_model *m, ath_dtype act, int32_t capacity,
                           ath_arena *a);
 
+/* The same in the memory of device d (step 8): the buffers from mem, the
+ * pointer array from a. */
+ath_status ath_state_init_gpu(ath_state *s, const ath_model *m, ath_dtype act, int32_t capacity,
+                              const ath_device *d, ath_dev_arena *mem, ath_arena *a);
+
 /* Start a new sequence: n_past = 0, conv and recurrent state zeroed. (The
- * KV cache is not cleared: positions at or past n_past are never read.) */
-void ath_state_reset(ath_state *s, const ath_model *m);
+ * KV cache is not cleared: positions at or past n_past are never read.) On
+ * a device the zeroing is queued on its compute stream, before any later
+ * forward pass. */
+ath_status ath_state_reset(ath_state *s, const ath_model *m);
 
 /* Copy the state of one sequence into another state of the same model,
  * activation dtype and capacity: every buffer and n_past. A copy taken at
  * a point the conversation will come back to (the end of a turn's stable
  * prefix) lets a pipeline resume there, since a recurrent state cannot be
- * rolled back. ATH_ERR_INVALID_ARG if the two states differ in dtype or
- * capacity. */
+ * rolled back. ATH_ERR_INVALID_ARG if the two states differ in dtype,
+ * capacity or device. On a device the copy is queued on its compute
+ * stream, in order with the forward passes. */
 ath_status ath_state_copy(ath_state *dst, const ath_state *src, const ath_model *m);
 
 /* Run one batch through the model. Checks the arguments (ATH_ERR_INVALID_ARG,
@@ -330,12 +359,17 @@ ath_status ath_state_copy(ath_state *dst, const ath_state *src, const ath_model 
  * batch that does not fit in the state; ATH_ERR_UNSUPPORTED if the family
  * has no forward pass), calls the family's forward and, on success, advances
  * s->n_past by b->n_tokens. On failure the state is undefined until
- * ath_state_reset. Working memory is allocated in scratch and released
- * before returning; h may be NULL. pool (may be NULL) lends threads to the
- * CPU work; the results are the same, bit for bit, with any number of
- * threads. */
+ * ath_state_reset. Working memory is allocated in scratch (and on a GPU in
+ * x->scratch) and released before returning; h may be NULL.
+ *
+ * x says where the pass runs (ath_exec): NULL or a CPU exec for a state in
+ * host memory, where x->pool lends threads to the CPU work and the results
+ * are the same, bit for bit, with any number of threads; a GPU exec for a
+ * state on that device (ATH_ERR_INVALID_ARG otherwise). On a GPU the
+ * logits, in host memory as always, are ready when the call returns; a
+ * batch without logits returns as soon as its work is queued. */
 ath_status ath_model_forward(const ath_model *m, const ath_batch *b, ath_state *s, const ath_hooks *h,
-                             ath_arena *scratch, ath_pool *pool);
+                             ath_arena *scratch, const ath_exec *x);
 
 /* ---- text (text.c) ------------------------------------------------------------- */
 

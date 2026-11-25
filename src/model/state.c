@@ -1,9 +1,10 @@
 /* state.c: per-sequence state and the forward entry point. See model.h.
  *
  * A model lists its state as specs (kind, layer, element counts); this file
- * turns them into host buffers for one sequence and is the only way into a
- * family's forward pass, so that every family gets the same argument checks
- * and the same bookkeeping of positions and scratch memory.
+ * turns them into buffers for one sequence, in host memory or on a device
+ * (step 8), and is the only way into a family's forward pass, so that every
+ * family gets the same argument checks and the same bookkeeping of
+ * positions and scratch memory on both.
  */
 #include "model/model.h"
 
@@ -60,8 +61,10 @@ ath_status ath_state_bytes(const ath_model *m, ath_dtype act, int32_t capacity, 
     return ATH_OK;
 }
 
-ath_status ath_state_init(ath_state *s, const ath_model *m, ath_dtype act, int32_t capacity,
-                          ath_arena *a)
+/* The buffers of one sequence in host memory (mem NULL) or in device
+ * memory (mem set). */
+static ath_status init(ath_state *s, const ath_model *m, ath_dtype act, int32_t capacity, const ath_device *d,
+                       ath_dev_arena *mem, ath_arena *a)
 {
     if (!s || !m || !a)
         return ATH_ERR_INVALID_ARG;
@@ -73,7 +76,7 @@ ath_status ath_state_init(ath_state *s, const ath_model *m, ath_dtype act, int32
         ath_log(ATH_LOG_ERROR, "state: capacity %d; expected at least 1 token", capacity);
         return ATH_ERR_INVALID_ARG;
     }
-    *s = (ath_state){.act = act, .capacity = capacity};
+    *s = (ath_state){.act = act, .capacity = capacity, .dev = d};
     s->buf = ath_arena_alloc(a, (m->n_states ? m->n_states : 1) * sizeof *s->buf, _Alignof(void *));
     if (!s->buf)
         return ATH_ERR_NOMEM;
@@ -85,37 +88,60 @@ ath_status ath_state_init(ath_state *s, const ath_model *m, ath_dtype act, int32
                     ath_state_kind_name(m->states[i].kind), m->states[i].layer, capacity);
             return st;
         }
-        s->buf[i] = ath_arena_alloc(a, b ? b : 1, STATE_ALIGN);
+        s->buf[i] = mem ? ath_dev_arena_alloc(mem, b ? b : 1, 0) : ath_arena_alloc(a, b ? b : 1, STATE_ALIGN);
         if (!s->buf[i])
             return ATH_ERR_NOMEM;
     }
-    ath_state_reset(s, m);
-    return ATH_OK;
+    return ath_state_reset(s, m);
 }
 
-void ath_state_reset(ath_state *s, const ath_model *m)
+ath_status ath_state_init(ath_state *s, const ath_model *m, ath_dtype act, int32_t capacity,
+                          ath_arena *a)
 {
+    return init(s, m, act, capacity, NULL, NULL, a);
+}
+
+ath_status ath_state_init_gpu(ath_state *s, const ath_model *m, ath_dtype act, int32_t capacity,
+                              const ath_device *d, ath_dev_arena *mem, ath_arena *a)
+{
+    if (!d || !mem)
+        return ATH_ERR_INVALID_ARG;
+    return init(s, m, act, capacity, d, mem, a);
+}
+
+ath_status ath_state_reset(ath_state *s, const ath_model *m)
+{
+    if (!s || !m || !s->buf)
+        return ATH_ERR_INVALID_ARG;
     s->n_past = 0;
     for (uint32_t i = 0; i < m->n_states; i++) {
         const ath_state_spec *sp = &m->states[i];
         if (sp->kind == ATH_STATE_KV)
             continue;
         size_t b = 0;
-        if (spec_bytes(sp, s->act, s->capacity, &b) == ATH_OK)
+        ATH_CHECK(spec_bytes(sp, s->act, s->capacity, &b));
+        if (s->dev)
+            ATH_CHECK(ath_memset(s->dev, s->buf[i], 0, b, ATH_STREAM_COMPUTE));
+        else
             memset(s->buf[i], 0, b);
     }
+    return ATH_OK;
 }
 
 /* ---- forward ------------------------------------------------------------------ */
 
 ath_status ath_state_copy(ath_state *dst, const ath_state *src, const ath_model *m)
 {
-    if (!dst || !src || !m || dst->act != src->act || dst->capacity != src->capacity || !dst->buf || !src->buf)
+    if (!dst || !src || !m || dst->act != src->act || dst->capacity != src->capacity || !dst->buf || !src->buf ||
+        dst->dev != src->dev)
         return ATH_ERR_INVALID_ARG;
     for (uint32_t i = 0; i < m->n_states; i++) {
         size_t b;
         ATH_CHECK(spec_bytes(&m->states[i], src->act, src->capacity, &b));
-        memcpy(dst->buf[i], src->buf[i], b);
+        if (src->dev)
+            ATH_CHECK(ath_copy(src->dev, dst->buf[i], src->buf[i], b, ATH_STREAM_COMPUTE));
+        else
+            memcpy(dst->buf[i], src->buf[i], b);
     }
     dst->n_past = src->n_past;
     return ATH_OK;
@@ -153,7 +179,7 @@ static ath_status check_logits(const ath_model *m, const ath_batch *b)
 }
 
 ath_status ath_model_forward(const ath_model *m, const ath_batch *b, ath_state *s, const ath_hooks *h,
-                             ath_arena *scratch, ath_pool *pool)
+                             ath_arena *scratch, const ath_exec *x)
 {
     if (!m || !m->family || !b || !s || !scratch)
         return bad(ATH_ERR_INVALID_ARG, "missing model, batch, state or scratch arena");
@@ -171,9 +197,20 @@ ath_status ath_model_forward(const ath_model *m, const ath_batch *b, ath_state *
             return bad(ATH_ERR_RANGE, "token %d at index %d is outside the vocabulary [0, %d)", b->tokens[i], i,
                        m->vocab_size);
     ATH_CHECK(check_logits(m, b));
+    const ath_exec cpu = {.pool = NULL};
+    if (!x)
+        x = &cpu;
+    if (x->dev != s->dev)
+        return bad(ATH_ERR_INVALID_ARG, "the state is %s, the pass would run %s", s->dev ? "on a device" : "in host memory",
+                   x->dev ? "on a device" : "on the CPU");
+    if (x->dev && (!x->weights || !x->scratch))
+        return bad(ATH_ERR_INVALID_ARG, "a GPU pass needs the weights on the device and a device scratch arena");
 
     ath_arena_pos mark = ath_arena_mark(scratch);
-    ath_status st = m->family->forward(m, b, s, h, scratch, pool);
+    ath_dev_arena_pos dmark = x->dev ? ath_dev_arena_mark(x->scratch) : (ath_dev_arena_pos){0};
+    ath_status st = m->family->forward(m, b, s, h, scratch, x);
+    if (x->dev)
+        ath_dev_arena_reset(x->scratch, dmark);   /* later work on the stream reuses it in order */
     ath_arena_reset(scratch, mark);
     if (st == ATH_OK)
         s->n_past += b->n_tokens;

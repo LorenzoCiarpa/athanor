@@ -82,6 +82,7 @@ CORE_SRC  := $(wildcard src/core/*.c)
 OPS_SRC   := $(wildcard src/ops/*.c)
 TEXT_SRC  := $(wildcard src/text/*.c)
 MODEL_SRC := $(wildcard src/model/*.c)
+INFER_SRC := $(wildcard src/infer/*.c)
 # GPU code: the backend's gpu.cu and the kernels of src/ops/*.cu with a GPU;
 # without one, the stubs gpu_none.c of both (src/backend/README.md).
 BACKEND_SRC := $(filter-out src/backend/gpu_none.c,$(wildcard src/backend/*.c))
@@ -93,7 +94,7 @@ BACKEND_SRC += src/backend/gpu_none.c
 OPS_SRC     += src/ops/gpu_none.c
 GPU_SRC   :=
 endif
-LIB_SRC   := $(CORE_SRC) $(OPS_SRC) $(TEXT_SRC) $(MODEL_SRC) $(FAMILY_SRC) $(BACKEND_SRC)
+LIB_SRC   := $(CORE_SRC) $(OPS_SRC) $(TEXT_SRC) $(MODEL_SRC) $(FAMILY_SRC) $(BACKEND_SRC) $(INFER_SRC)
 # A kernel file shares its op's name (matmul.c, matmul.cu): .cu objects end in .cu.o.
 LIB_OBJ   := $(LIB_SRC:%.c=$(BUILD)/obj/%.o) $(GPU_SRC:%.cu=$(BUILD)/obj/%.cu.o)
 
