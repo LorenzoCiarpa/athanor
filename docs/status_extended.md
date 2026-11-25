@@ -21,6 +21,7 @@ How to read it:
   - [Step 7: GPU ops, one by one](#step-7-gpu-ops-one-by-one)
   - [Step 8: sequence state and engine](#step-8-sequence-state-and-engine)
   - [Before step 9: source layout](#before-step-9-source-layout)
+  - [Step 9: fast decode and bench](#step-9-fast-decode-and-bench)
 - [Files by step](#files-by-step)
 
 ---
@@ -1083,6 +1084,80 @@ Then, the same day, two rules written down at the maintainer's request:
 | `docs/PLAN.md`, `src/backend/README.md` | Changed | The Source layout decision and section name the rule |
 | `src/model/README.md`, `docs/contract/README.md` | Changed | Pointers to Three names |
 | `src/train/README.md`, `src/quant/README.md` | Changed | Optimizer steps and the GPU parts of quantization algorithms are ops |
+
+---
+
+### Step 9: fast decode and bench
+
+Branch `step9-fast-decode`, from `main` after step 8, opened with the source layout change (above). The gate of `docs/PLAN.md`: decode tokens/s at least llama.cpp's at batch 1, same model, precision and GPU. Every change below was measured with `athanor bench` on the RTX 5080 and kept only if it paid; the report is `docs/results/2026-11-25-step9-decode/`.
+
+#### 9.1 `athanor bench` and the baselines
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `tools/bench.c` | New | ppN and tgN@dD as llama-bench names them; warm-up and measured runs from a reset state, median with min and max; the JSON report of `docs/BENCHMARKS.md` (hardware from the device and sysfs, software with the commit, model files with SHA-256 and Hugging Face revision, workload, method, every run, memory from the driver and the kernel); `--direct` for step 8's decode |
+| `src/core/sha256.h`, `sha256.c` | New | SHA-256 (FIPS 180-4), streaming and of a file through its mapping |
+| `tests/test_core.c` | Changed | The NIST examples whole and in pieces, a million 'a', a file |
+| `src/backend/backend.h`, `cuda/gpu.cu`, `cuda/compat.h` | Changed | `ath_device.pci_bus_id`, `blas_version` |
+| `Makefile` | Changed | `build/gen/version.h` with the commit, written only when it changes (no `rm` in the rule) |
+| `tools/athanor.c`, `commands.h` | Changed | The `bench` entry |
+
+Found while measuring: a tg test timed the end of its prompt too (a pass without logits returns once queued); the clock now starts after the prompt, and step 8's numbers at 4k and 32k were measured again with that fix. llama.cpp (commit `5220a2d`) was built for `sm_120` with CUDA 13.5 outside the repository (static, the toolkit's path given to the linker), the checkpoint converted to GGUF bf16 with its `convert_hf_to_gguf.py` in a separate environment. Nsight Systems 2026.5 from NVIDIA's redist archives (the system's 2023.4 could not import traces). Commit `57f95dd`.
+
+#### 9.2 GEMV
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `src/ops/cuda/matmul.cu` | Changed | The GEMV kernel: up to 8 rows of x, bf16 weights, a warp per output column (2 or 4 by K), 16-byte pieces loaded past L1, fp32 sums in an order fixed by K; a set of up to 4 weights per launch; `gemv_one` for one row; `gemv_swiglu`; the add epilogue |
+| `src/ops/ops.h`, `matmul.c`, `dispatch.c`, `launch.h`, `gpu_none.c` | Changed | `ath_matmul_n` (and `_gpu`), `ath_matmul_add_gpu`, `ath_matmul_swiglu_gpu`, their `fits` queries and launchers |
+| `src/ops/cuda/kernel.cuh` | Changed | `k_unpack_bf16x8`, `k_ld8` shared by the GEMV and the norms |
+
+The cuBLASLt plans of other shapes are still built per call: with the GEMV kernel decode does not call cuBLASLt, so their cache moves to step 10 with prefill (log). Commits `e56d2f9`, `d4c80ed`, `758f3a3`, `7f0f3a6`.
+
+#### 9.3 Positions on the device
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `src/ops/attn.c`, `ops.h`, `dispatch.c` | Changed | `ath_attn` takes the queries' positions (NULL: the last T of S) and, on the GPU, the device scratch arena |
+| `src/ops/scatter.c`, `src/ops/cuda/scatter.cu` | New | `ath_scatter_rows`: rows written at given rows, byte for byte |
+| `src/model/model.h`, `state.c` | Changed | `ath_batch.pos` and `flags`, `ATH_BATCH_DEVICE`; checks |
+| `src/models/qwen35/forward.c` | Changed | The new keys and values into the cache by position, attention over the whole cache, positions from a device batch, no copy or wait for a device batch |
+| callers of `ath_batch` | Changed | Designated initializers |
+
+The CPU forward pass gives the same bits (test_forward: KL 3.018e-4, ratio 0.60). Commits `e56d2f9`, `f22046b`, `4421aae`.
+
+#### 9.4 Split-K attention
+
+`src/ops/cuda/attn.cu`, rewritten: pieces of 64 keys, partial softmaxes combined in order; the rows kernel and the split-K pair (split, merge) share the device functions and their rounding intrinsics; the fast path for heads up to 256 (8 keys per warp loaded at once, the tile's softmax one head per warp). Commits `e56d2f9`, `d4c80ed`, `758f3a3`.
+
+#### 9.5 GPU sampling
+
+`src/ops/cuda/sample.cu` (new) and `ath_sample_gpu` in `src/ops/sample.c`: select (each block's k best in the reference's order) and merge (one block, then the reference's double arithmetic on thread 0). Commit `7d680de`.
+
+#### 9.6 Graph capture and the decoder
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `src/backend/backend.h`, `cuda/gpu.cu`, `gpu_none.c`, `cuda/compat.h` | Changed | `ath_graph_begin`, `end`, `launch`, `destroy` |
+| `src/infer/engine.h`, `engine.c` | Changed | `ath_decoder`: the first step direct, the second recorded, the rest replayed; pinned inputs and the 4-byte result; host sampling when the sampler does not fit the GPU's |
+
+Commit `7d680de`.
+
+#### 9.7 `athanor chat` and `athanor bench` on the decoder
+
+`tools/chat.c` decodes through the decoder on a GPU (the first token from the prompt's logits); `tools/bench.c` tg tests too. Commits `7d680de`, `7f0f3a6`.
+
+#### Other kernels of the decode step
+
+`src/ops/cuda/norm.cu` (a warp per row up to 1024 elements, 16-byte pieces), `src/ops/cuda/conv.cu` (one kernel for one token), `src/ops/cuda/gdn.cu` (a lane per column of the state, rows over the warps), and in `src/models/qwen35/forward.c` the one-token forms (views of q, k, v and one L2 norm; q and k rotated in one call; gate, up and SwiGLU fused). Commits `d4c80ed`, `758f3a3`, `7f0f3a6`.
+
+#### 9.8 Tests
+
+`tests/test_gpu_ops.c` (`gpu_gemv`, `gpu_matmul_n`, `gpu_matmul_swiglu`, `gpu_scatter_rows`, `gpu_sample`, positions and split-K in `gpu_attn`), `tests/test_ops.c` (positions in `attn`, `scatter_rows`), `tests/test_golden.c` (decode records split-K), `tests/test_engine.c` (`engine_decoder`; the pieces tolerance on the tiny model). Results in `tests/README.md` and `STATUS.md`.
+
+#### 9.9 Report and documentation
+
+The report, `docs/results/2026-11-25-step9-decode/`; READMEs of `src/ops`, `src/backend`, `src/infer`, `src/model`, `src/models/qwen35`, `src/core`, `tools`, `tests`; `docs/ARCHITECTURE.md` (the device batch, positions); `docs/program/PROGRAM.md` rows 6 and 8; `STATUS.md` and this file.
 
 ---
 

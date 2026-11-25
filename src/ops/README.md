@@ -88,6 +88,25 @@ Each kernel is compared with its `_ref` on random inputs (`tests/test_gpu_ops.c`
 
 Dtypes reach kernels as an argument, and `k_ld`/`k_st` branch on it. Every thread of a launch takes the same branch, so it costs no divergence; kernels specialized per dtype and per shape come with the fast paths of steps 9 and 10, instantiated by macros in one place per op (Rules).
 
+## Decode kernels (step 9)
+
+Decode reads every weight once per token, so its time is the time to read them plus a fixed cost per kernel. Step 9 made the reads stream and cut the kernels. Each change was measured on the RTX 5080 with `athanor bench` and kept only if it paid; the numbers are in `docs/results/2026-11-25-step9-decode/`.
+
+| Op | Kernel |
+| --- | --- |
+| `matmul`, a few rows | athanor's GEMV for up to 8 rows of x against bf16 weights: a warp per output column (2 or 4 for rows of K >= 1536, by K alone), 16-byte pieces, four in flight per lane, loaded past L1 (`ld.global.nc.L1::no_allocate`, about 6% on decode: x stays in L1), fp32 sums whose order depends on K only. A one-row kernel (72 registers) beside the few-rows one. cuBLASLt keeps the other shapes |
+| `ath_matmul_n` | several weights sharing x in one GEMV launch: the projections of one input (q/k/v, qkv/z/a/b, gate/up) read in one pass, with the bits of one call each |
+| `ath_matmul_add_gpu` | out += x · wᵀ, the product rounded first: an output projection added to the residual stream without the add kernel, with its bits |
+| `ath_matmul_swiglu_gpu` | gate, up and SwiGLU for one row: a warp per column of both, silu(g)·u with g and u rounded first, with the bits of the three ops |
+| `attn` | queries by position (`pos`) over a whole cache; keys in pieces of `ATH_ATTN_SPLIT` (64), each reduced to a partial softmax and combined in order; with scratch, up to 8 queries split-K (a block per piece and key head, each key read once for the query heads that share it, then a merge kernel). Heads up to 256: warp w takes 8 keys of a tile and loads them, then their values, at once; the tile's softmax runs head g on warp g, key j on lane j. Rows and split-K share the functions and their rounding intrinsics: the same bits, and decode still gives the bits of the prompt's last row |
+| `scatter_rows` | new rows of the cache at their positions, from device memory |
+| `sample` | `ath_sample_gpu`: greedy or top-k up to 64 with temperature, top-p, min-p; each block takes its k best in the reference's order, one block merges and runs the reference's double arithmetic |
+| `rmsnorm`, `l2norm`, gated | rows up to 1024 in 16-byte pieces take a warp each, with x, weights and gate loaded at once |
+| `conv` | one token: output and state in one kernel |
+| `gdn` | a lane per column of the state, the rows split over the block's warps: every state row is one 128-byte access; the parts added in warp order |
+
+Tried and dropped, measured: programmatic dependent launch for the GEMV (no gain inside the graph), double-buffered weight loads and eight pieces in flight (no gain), normalizing x inside the GEMV (each block's prologue cost more than the norm kernel it saved), 256-key attention pieces (too few blocks for one query).
+
 ## Op list
 
 | Op | Content | Step |
@@ -99,9 +118,10 @@ Dtypes reach kernels as an argument, and `k_ld`/`k_st` branch on it. Every threa
 | `matmul` | dense GEMM/GEMV for bf16 and f32 (cuBLASLt on the GPU); per-format GEMV/GEMM from phase 2 | 3 (ref), 4 (fast CPU), 7 (GPU), 9–10 (fast GPU) |
 | `attn` | causal attention with GQA: naive reference; tiled prefill and split-K decode on GPU | 3, 7, 9, 10 |
 | `conv` | short depthwise causal conv1d with state | 3, 7 (GPU) |
+| `scatter` | rows written at given rows (the KV cache by position) | 9 |
 | `gdn` | Gated DeltaNet: gates; recurrent reference (CPU and GPU decode), chunkwise-parallel GPU prefill | 3, 7, 10 |
 | `moe` | router top-k, expert dispatch, grouped GEMM, shared expert | 12 |
-| `sample` | greedy, temperature, top-k, top-p, min-p (step 5); presence and repetition penalties later; GPU sampling | 5, 9 |
+| `sample` | greedy, temperature, top-k, top-p, min-p (step 5); GPU sampling, greedy and top-k up to 64 (step 9); presence and repetition penalties later | 5, 9 |
 | `quant` | (de)quantization per format | Q1 |
 
 Backward functions for each op are added in phase 4 (T1) in the same files, with gradient checks.

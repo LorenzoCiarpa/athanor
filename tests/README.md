@@ -83,6 +83,11 @@ ATH_GPU_OPS_DETAIL=1 ./build/cuda/test_gpu_ops     # every comparison with its m
 CUDA_HOME=<toolkit> $CUDA_HOME/bin/compute-sanitizer --tool memcheck --leak-check full ./build/cuda/test_gpu_ops
 ```
 
+
+### Decode kernels (step 9)
+
+`test_gpu_ops` adds: `gpu_gemv` (every row count from 1 to 9, K from one piece to 3584, odd M, bf16 and f32 into bf16 and f32, a row alone against the same row among others bit for bit, an x off a 16-byte boundary that goes to the other kernel), `gpu_matmul_n` (several weights in one launch: the bits of one call each, for few rows and for many), `gpu_matmul_swiglu` (gate, up and SwiGLU in one launch: the bits of the three ops), `gpu_scatter_rows` (bit for bit), `gpu_sample` (360 cases against `ath_sample_ref`: vocabularies of 7 to 248,320, logits with and without ties, six samplers, ten values of u; 0 differ), and in `gpu_attn` positions over a noisy cache, rows against split-K bit for bit, decode against the prompt's last row bit for bit, NaN for a position past the cache. The tolerances are those of the step 7 kernels (2e-5 for f32 matmul outputs, one bf16 ulp; 1e-5 for attention), and the measured errors stay inside them: GEMV worst 1e-7 in f32 on the random cases; on the golden records attention 1.04e-5 (prefill) and 4.2e-6 (decode), Gated DeltaNet output 4.7e-6 and state 1.46e-5, matmul 4.2e-6.
+
 ## Forward pass
 
 `test_forward` reaches the forward pass only through `src/model/model.h`, like a pipeline.
@@ -152,6 +157,9 @@ ATH_GENERATE_PROMPTS=5 ATH_GENERATE_STEPS=32 ./build/cuda/test_engine generate
 ```
 
 A `DEBUG=1` build runs 2 prompts of 8 steps.
+
+
+Step 9 (`engine_decoder`): the decoder's recorded and replayed steps give the logits of the same steps run directly, bit for bit, and with the same uniform numbers the tokens `ath_sample_ref` chooses, for host sampling (top-k 0), GPU sampling (top-k 3) and greedy; a full state is refused; a reset state decodes again with the same recording. `engine_pieces` now allows 5e-5 between a prompt fed in pieces and at once on the tiny random model (1.22e-5 measured): pieces of up to 8 tokens take the GEMV kernel and the decode fusions, the whole prompt cuBLASLt, and the random network amplifies the difference of their roundings (step 4 found it ill-conditioned). Against the CPU it is 2.8e-6. The real checkpoint's gates are the measure: 0 differences in 11,445 steps above the noise, and the GPU forward records at a pooled KL of 4.295e-4 (the bf16 reference's 5.005e-4; 2.4e-4 at step 8 and 2.477e-4 with the first step 9 kernels: the change is rounding luck on the ill-conditioned positions, as the f32 run shows: KL 3e-12, logits within 9.5e-6).
 
 ## Text
 

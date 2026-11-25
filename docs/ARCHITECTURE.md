@@ -105,7 +105,9 @@ typedef struct { ath_dtype act; int32_t capacity, n_past; void **buf;
                  const ath_device *dev; } ath_state;   /* one sequence; dev NULL: host memory */
 typedef struct { ath_pool *pool; const ath_device *dev;      /* where a forward pass runs (step 8) */
                  const ath_tensor *weights; ath_dev_arena *scratch; } ath_exec;
-typedef struct { const int32_t *tokens; int32_t n_tokens; ath_tensor *logits; } ath_batch;
+typedef struct { const int32_t *tokens; int32_t n_tokens; ath_tensor *logits;
+                 const int32_t *pos; uint32_t flags; } ath_batch;    /* pos, flags: step 9 */
+#define ATH_BATCH_DEVICE 1u   /* tokens, positions and logits in device memory: no copy, no wait */
 typedef struct {
     void (*on_residual)(void *u, int32_t layer, const ath_tensor *x);   /* stream entering a layer */
     /* later (phase 2): on_matmul_in */
@@ -187,6 +189,8 @@ Step 4 departs from the first design of the state in three places. A spec counts
 
 Step 8 put the forward pass on the GPU without a second composition. The pool became one member of `ath_exec`, which says where a pass runs: on the CPU (`pool`, or a NULL exec), or on a device (`dev`), with a device copy of every param the pass reads (`weights`, indexed like `m->params`) and device working memory (`scratch`). A state lives where its pass runs (`ath_state.dev`; `ath_state_init_gpu`), and `ath_model_forward` refuses a pass on one side over a state on the other. The family's `forward` calls the ops' entry points (`ath_<op>(d, ...)`, `src/ops/dispatch.c`), which run the reference ops on the CPU or the kernels on the device, so `src/models/qwen35/forward.c` is one composition for both. On a GPU the logits still land in host memory, ready when the call returns; hooks see device tensors there. `ath_state_reset` now returns a status, since on a device it queues work. The engine (`src/infer/engine.h`) builds the GPU exec: it opens the device and copies the params once.
 
+Step 9 made a decode step something that can be recorded once and replayed, for the decoder of `src/infer/` (one graph launch per token, the next token chosen on the GPU). Two additions to the contract, both by addition: `ath_batch` gained `pos` and `flags`, and a device batch (`ATH_BATCH_DEVICE`) has its tokens, positions and logits in the memory of the device the pass runs on, so the pass copies nothing to or from the host and waits for nothing; the host cannot check its token ids or positions, which the caller guarantees. And no op argument depends on `n_past` any more: the family writes the new keys and values into the cache at their positions (`ath_scatter_rows`) and gives attention the whole cache with the queries' positions (`ath_attn` with `pos`), so the work of a step is the same whatever the length of the sequence. A replayed step gives the logits of the same step run directly, bit for bit.
+
 ### Text
 
 The text members joined the contract in step 5, as CHANGE-001 (2026-11-24) specified them, with the details step 5 settled. `ath_spans` and `ath_tokenizer` are the generic byte-level BPE engine of `src/text/bpe.h`; `ath_buf` is a growable buffer in an arena (`src/core/buf.h`).
@@ -249,23 +253,24 @@ athanor/
 ├── Makefile                     targets: cpu (default), cuda (+ test), hip, test, golden, clean; FAMILIES=qwen35
 ├── include/athanor.h            public C API
 ├── src/
-│   ├── core/      base.c arena.c buf.c tensor.c file.c json.c safetensors.c threads.c rng.c (each with its .h)
+│   ├── core/      base.c arena.c buf.c tensor.c file.c json.c safetensors.c threads.c rng.c sha256.c (each with its .h)
 │   ├── backend/   backend.h gpu_none.c devarena.c (step 6), cpu.c (later)
 │   │   └── cuda/  gpu.cu compat.h (step 6), gpu.h (step 7)
 │   ├── ops/       ops.h, check.h (private); per op a .c reference here and a .cu kernel in cuda/:
-│   │              embed matmul norm rope act attn conv gdn (step 3, kernels step 7), sample (step 5), moe quant;
+│   │              embed matmul norm rope act attn conv gdn (step 3, kernels step 7), sample (step 5, kernel step 9),
+│   │              scatter (step 9), moe quant;
 │   │              launch.h gpu_none.c (private, step 7); dispatch.c (step 8)
 │   │   └── cuda/  <op>.cu, kernel.cuh (private, step 7)
 │   ├── text/      bpe.c unicode.c, unicode_tables.h (generated, committed)
 │   ├── model/     model.h registry.c state.c text.c
 │   ├── models/
 │   │   └── qwen35/  qwen35.h family.c config.c weights.c forward.c text.c [backward.c] [cuda/fused.cu]
-│   ├── infer/     engine.h engine.c (step 8), state.c sched.c tier.c spec.c (later)
+│   ├── infer/     engine.h engine.c (step 8; the decoder, step 9), state.c sched.c tier.c spec.c (later)
 │   ├── quant/     formats.c rtn.c gptq.c awq.c recipe.c container.c gguf.c eval.c
 │   ├── ablit/     capture.c direction.c edit.c search.c eval.c
 │   ├── train/     loop.c optim.c lora.c hotcold.c data.c planner.c ckpt.c
 │   └── net/       http.c api.c
-├── tools/         athanor.c (dispatch), one file per subcommand (inspect.c, chat.c, devices.c, ...), dev/ (development helpers)
+├── tools/         athanor.c (dispatch), one file per subcommand (inspect.c, chat.c, devices.c, bench.c, ...), dev/ (development helpers)
 ├── tests/         test.h (runner) util.h tiny.h test_core.c test_model.c test_ops.c test_golden.c test_forward.c
 │                  test_text.c test_backend.c test_gpu_ops.c test_engine.c ...; golden/ (dump.py, text.py, generate.py, requirements.txt; data/ not committed)
 └── docs/          ARCHITECTURE.md PLAN.md STATUS.md status_extended.md MODELS.md BENCHMARKS.md

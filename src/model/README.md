@@ -43,8 +43,8 @@ float *out = ...;                                                /* [1, vocab_si
 ath_tensor logits;
 ATH_CHECK(ath_tensor_init(&logits, ATH_DTYPE_F32, 2, (int64_t[]){1, m.vocab_size}, out, ATH_TIER_RAM));
 const ath_exec cpu = {.pool = &pool};
-ATH_CHECK(ath_model_forward(&m, &(ath_batch){prompt, n_prompt, &logits}, &s, NULL, &scratch, &cpu));   /* prefill */
-ATH_CHECK(ath_model_forward(&m, &(ath_batch){&next, 1, &logits}, &s, NULL, &scratch, &cpu));          /* decode */
+ATH_CHECK(ath_model_forward(&m, &(ath_batch){.tokens = prompt, .n_tokens = n_prompt, .logits = &logits}, &s, NULL, &scratch, &cpu));
+ATH_CHECK(ath_model_forward(&m, &(ath_batch){.tokens = &next, .n_tokens = 1, .logits = &logits}, &s, NULL, &scratch, &cpu));
 ATH_CHECK(ath_state_reset(&s, &m));                              /* a new sequence */
 ath_pool_free(&pool);
 ```
@@ -55,11 +55,15 @@ On a GPU (step 8) the engine (`src/infer/engine.h`) holds the device, the params
 ath_engine e;
 ATH_CHECK(ath_engine_open(&e, &m, 0, &a));                       /* device 0, the weights copied once */
 ATH_CHECK(ath_engine_state(&e, &s, ATH_DTYPE_BF16, 4096, &a));
-ATH_CHECK(ath_model_forward(&m, &(ath_batch){prompt, n_prompt, &logits}, &s, NULL, &scratch, &e.exec));
+ATH_CHECK(ath_model_forward(&m, &(ath_batch){.tokens = prompt, .n_tokens = n_prompt, .logits = &logits}, &s, NULL, &scratch, &e.exec));
 ath_engine_close(&e);
 ```
 
 The logits tensor has one row per token or one row for the last token. `n_past` counts the tokens the state has seen; a batch that does not fit in `capacity` fails with `ATH_ERR_RANGE` and leaves the state as it was. Any other failure inside the family leaves the state undefined until `ath_state_reset`. Every working tensor of a call comes from the scratch arena and is released before it returns, so the arena's blocks are reused from call to call. The pool lends its threads to the CPU work. A NULL pool (or a NULL exec) runs everything on the calling thread, and the logits and the state are the same bits with any number of threads. On a GPU the logits are in host memory when the call returns; a batch without logits returns as soon as its work is queued on the device, and later calls on the same state come after it.
+
+### Device batches (step 9)
+
+A batch with `flags = ATH_BATCH_DEVICE` has its tokens, its positions (`pos`, `n_past + i` when the work runs) and its logits in the memory of the device the pass runs on. The pass then copies nothing between host and device and does not wait, so the call can be recorded in a graph and replayed: the decoder of `src/infer/` does that, one launch per token. `ath_model_forward` cannot read the ids or the positions, so it does not check them; positions are refused on any other batch. Batch initializers are designated (`.tokens = ...`), since the struct gained members.
 
 ## Text
 
