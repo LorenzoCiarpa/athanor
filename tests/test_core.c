@@ -575,7 +575,7 @@ ATH_TEST(tensor_init_and_views)
     ATH_EXPECT_STATUS(ath_tensor_init(&t, ATH_DTYPE_I64, 1, big, NULL, ATH_TIER_RAM), ATH_ERR_RANGE);
     int64_t nine[9] = {1, 1, 1, 1, 1, 1, 1, 1, 1};
     ATH_EXPECT_STATUS(ath_tensor_init(&t, ATH_DTYPE_F32, 9, nine, NULL, ATH_TIER_RAM), ATH_ERR_RANGE);
-    ATH_EXPECT_STATUS(ath_tensor_init(&t, (ath_dtype)(ATH_DTYPE_QUANT_FIRST + 1), 1, nine, NULL, ATH_TIER_RAM),
+    ATH_EXPECT_STATUS(ath_tensor_init(&t, (ath_dtype)(ATH_DTYPE_QUANT_FIRST + 2), 1, nine, NULL, ATH_TIER_RAM),
                       ATH_ERR_UNSUPPORTED);
 }
 
@@ -585,7 +585,7 @@ ATH_TEST(q8_0_blocks)
     ATH_EXPECT_EQ_U64(ath_dtype_size(ATH_DTYPE_Q8_0), 0);
     ATH_EXPECT_EQ_INT(ath_dtype_block(ATH_DTYPE_Q8_0), 32);
     ATH_EXPECT_EQ_INT(ath_dtype_block(ATH_DTYPE_BF16), 1);
-    ATH_EXPECT_EQ_INT(ath_dtype_block((ath_dtype)(ATH_DTYPE_QUANT_FIRST + 1)), 0);
+    ATH_EXPECT_EQ_INT(ath_dtype_block((ath_dtype)(ATH_DTYPE_QUANT_FIRST + 2)), 0);
     ATH_EXPECT_EQ_U64(ath_dtype_bytes(ATH_DTYPE_Q8_0, 64), 68);
     ATH_EXPECT_EQ_U64(ath_dtype_bytes(ATH_DTYPE_F32, 3), 12);
     ATH_EXPECT_STR_EQ(ath_dtype_name(ATH_DTYPE_Q8_0), "q8_0");

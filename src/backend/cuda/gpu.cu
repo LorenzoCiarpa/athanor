@@ -350,6 +350,26 @@ ath_status ath_stream_wait(const ath_device *d, ath_stream s, const ath_event *e
     return ATH_OK;
 }
 
+ath_status ath_host_call(const ath_device *d, ath_stream s, ath_host_fn fn, void *ctx)
+{
+    if (!fn || !stream_ok(s))
+        return ATH_ERR_INVALID_ARG;
+    ATH_CHECK(ath_gpu_use(d));
+    ATH_GPU_CHECK(cudaLaunchHostFunc(ath_gpu_stream(d, s), (cudaHostFn_t)fn, ctx));
+    return ATH_OK;
+}
+
+ath_status ath_stream_capturing(const ath_device *d, ath_stream s, bool *capturing)
+{
+    if (!capturing || !stream_ok(s))
+        return ATH_ERR_INVALID_ARG;
+    ATH_CHECK(ath_gpu_use(d));
+    cudaStreamCaptureStatus st;
+    ATH_GPU_CHECK(cudaStreamIsCapturing(ath_gpu_stream(d, s), &st));
+    *capturing = st != cudaStreamCaptureStatusNone;
+    return ATH_OK;
+}
+
 ath_status ath_event_sync(const ath_device *d, const ath_event *e)
 {
     if (!e || !e->handle)

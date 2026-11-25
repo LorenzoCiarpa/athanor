@@ -133,6 +133,18 @@ ath_status ath_stream_wait(const ath_device *d, ath_stream s, const ath_event *e
     return ATH_ERR_UNSUPPORTED;
 }
 
+ath_status ath_host_call(const ath_device *d, ath_stream s, ath_host_fn fn, void *ctx)
+{
+    (void)d, (void)s, (void)fn, (void)ctx;
+    return ATH_ERR_UNSUPPORTED;
+}
+
+ath_status ath_stream_capturing(const ath_device *d, ath_stream s, bool *capturing)
+{
+    (void)d, (void)s, (void)capturing;
+    return ATH_ERR_UNSUPPORTED;
+}
+
 ath_status ath_event_sync(const ath_device *d, const ath_event *e)
 {
     (void)d, (void)e;

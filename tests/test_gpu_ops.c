@@ -391,6 +391,180 @@ ATH_TEST(gpu_matmul_q8_0)
     gpu_close(&g);
 }
 
+/* MoE (step 12): the router's choice against the reference (the same
+ * experts; weights within 1e-6), the routed experts on the device against
+ * ath_moe_expert_ref bit for bit, with every other expert left out of the
+ * table (its entries untouched, as the CPU will fill them), and the
+ * combination within an ulp (the shared gate's exp is the device's). */
+ATH_TEST(gpu_moe)
+{
+    gpu g;
+    GPU_OR_SKIP(g);
+    const int64_t T = 5, E = 16, K = 4;
+    static const struct { int64_t H, I; } dims[] = {{512, 512}, {64, 96}};   /* staged and plain dot paths */
+    for (size_t di = 0; di < ATH_ARRAY_LEN(dims); di++) {
+        const int64_t H = dims[di].H, I = dims[di].I;
+        ath_tensor logits = rand_t(&g, ATH_DTYPE_F32, -3, 3, SHAPE(T, E));
+        ath_tensor ids = host(&g, ATH_DTYPE_I32, SHAPE(T, K)), w = host(&g, ATH_DTYPE_BF16, SHAPE(T, K));
+        ATH_REQUIRE_OK(ath_moe_route_ref(&logits, &ids, &w));
+        ath_tensor ld = up(&g, &logits), idd = up(&g, &ids), wd = up(&g, &w);
+        ATH_EXPECT_OK(ath_moe_route_gpu(&g.d, &ld, &idd, &wd));
+        ath_tensor ids2 = down(&g, &idd), w2 = down(&g, &wd);
+        ATH_EXPECT(memcmp(ids2.data, ids.data, ath_tensor_nbytes(&ids)) == 0);
+        for (int64_t i = 0; i < T * K; i++)
+            ATH_EXPECT(fabsf(ath_load_f32(w2.data, w2.dtype, i) - ath_load_f32(w.data, w.dtype, i)) <= 4e-3f);
+
+        /* experts: even ones on the device, odd ones absent */
+        ath_tensor x = rand_t(&g, ATH_DTYPE_BF16, -1, 1, SHAPE(T, H));
+        ath_tensor gw[16], uw[16], dw[16], gd[16], ud[16], ddv[16];
+        const void *tab_h[3 * 16];
+        for (int64_t e = 0; e < E; e++) {
+            gw[e] = rand_q8_0(&g, I, H), uw[e] = rand_q8_0(&g, I, H), dw[e] = rand_q8_0(&g, H, I);
+            gd[e] = up(&g, &gw[e]), ud[e] = up(&g, &uw[e]), ddv[e] = up(&g, &dw[e]);
+            const bool on = e % 2 == 0;
+            tab_h[e] = on ? gd[e].data : NULL;
+            tab_h[E + e] = on ? ud[e].data : NULL;
+            tab_h[2 * E + e] = on ? ddv[e].data : NULL;
+        }
+        void *tab = ath_dev_arena_alloc(&g.dev, sizeof tab_h, 0);
+        ATH_REQUIRE(tab);
+        ATH_REQUIRE_OK(ath_copy(&g.d, tab, tab_h, sizeof tab_h, ATH_STREAM_COMPUTE));
+        ath_tensor yh = host(&g, ATH_DTYPE_BF16, SHAPE(T, K, H)), hh = host(&g, ATH_DTYPE_BF16, SHAPE(T, K, I));
+        ath_tensor xd = up(&g, &x), hd = up(&g, &hh), yd = up(&g, &yh);
+        ATH_EXPECT_OK(ath_memset(&g.d, yd.data, 0xff, ath_tensor_nbytes(&yd), ATH_STREAM_COMPUTE));
+        ATH_EXPECT_OK(ath_moe_experts_gpu(&g.d, &xd, &idd, (const void *const *)tab, ATH_DTYPE_Q8_0, E, I, &hd, &yd));
+        ath_tensor got = down(&g, &yd);
+        int on_dev = 0, bad = 0, kept = 0;
+        for (int64_t t = 0; t < T; t++)
+            for (int64_t c = 0; c < K; c++) {
+                const int32_t e = ((const int32_t *)ids.data)[t * K + c];
+                const uint16_t *row = (const uint16_t *)got.data + (t * K + c) * H;
+                if (e % 2) {               /* absent: left as it was (0xffff) */
+                    for (int64_t r = 0; r < H; r++)
+                        kept += row[r] == 0xffff;
+                    continue;
+                }
+                ath_tensor xr, want = host(&g, ATH_DTYPE_BF16, SHAPE(1, H));
+                ATH_REQUIRE_OK(ath_tensor_slice(&x, 0, t, 1, &xr));
+                ATH_REQUIRE_OK(ath_moe_expert_ref(&xr, &gw[e], &uw[e], &dw[e], &want));
+                bad += memcmp(row, want.data, (size_t)H * 2) != 0;
+                on_dev++;
+            }
+        ATH_EXPECT(on_dev > 0 && bad == 0);
+        ATH_EXPECT(kept == (T * K - on_dev) * H);
+
+        /* the combination of the device's outputs (absent ones zeroed here) */
+        for (int64_t i = 0; i < T * K * H; i++)
+            if (((uint16_t *)got.data)[i] == 0xffff)
+                ((uint16_t *)got.data)[i] = 0;
+        ath_tensor ys = rand_t(&g, ATH_DTYPE_BF16, -1, 1, SHAPE(T, H)), sg = rand_t(&g, ATH_DTYPE_BF16, -2, 2, SHAPE(T, 1));
+        ath_tensor want = host(&g, ATH_DTYPE_F32, SHAPE(T, H));
+        ATH_REQUIRE_OK(ath_moe_combine_ref(&got, &w, &ys, &sg, &want));
+        ath_tensor gy = up(&g, &got), gys = up(&g, &ys), gsg = up(&g, &sg), out = up(&g, &want);
+        ATH_EXPECT_OK(ath_moe_combine_gpu(&g.d, &gy, &wd, &gys, &gsg, &out));
+        EXPECT_CLOSE(g, "moe combine", out, want, 1e-6, 1);
+    }
+    gpu_close(&g);
+}
+
+/* Experts split between the GPU and the CPU (step 12, invariant 7): with
+ * half the experts on the device and the rest computed by the CPU from
+ * their regrouped host copies, every output is ath_moe_expert_ref's bits;
+ * the same inside a captured graph, replayed after experts moved between
+ * the device and the host (the table on the device and the host's flags
+ * changed, the graph not), and with every expert away. */
+ATH_TEST(gpu_moe_split)
+{
+    gpu g;
+    GPU_OR_SKIP(g);
+    const int64_t T = 3, H = 512, I = 512, E = 8, K = 3;
+    ath_tensor gw[8], uw[8], dw[8], gr[8], ur[8], dr[8], gd[8], ud[8], dd[8];
+    const void *host_tab[24];
+    const void *dev_h[24];
+    uint8_t on_dev[8];
+    for (int64_t e = 0; e < E; e++) {
+        gw[e] = rand_q8_0(&g, I, H), uw[e] = rand_q8_0(&g, I, H), dw[e] = rand_q8_0(&g, H, I);
+        gr[e] = host(&g, ATH_DTYPE_Q8_0_R16, SHAPE(I, H)), ur[e] = host(&g, ATH_DTYPE_Q8_0_R16, SHAPE(I, H));
+        dr[e] = host(&g, ATH_DTYPE_Q8_0_R16, SHAPE(H, I));
+        ATH_REQUIRE_OK(ath_q8_0_repack(&gw[e], &gr[e]));
+        ATH_REQUIRE_OK(ath_q8_0_repack(&uw[e], &ur[e]));
+        ATH_REQUIRE_OK(ath_q8_0_repack(&dw[e], &dr[e]));
+        gd[e] = up(&g, &gw[e]), ud[e] = up(&g, &uw[e]), dd[e] = up(&g, &dw[e]);
+        host_tab[e] = gr[e].data, host_tab[E + e] = ur[e].data, host_tab[2 * E + e] = dr[e].data;
+    }
+    void *dev_tab = ath_dev_arena_alloc(&g.dev, sizeof dev_h, 0);
+    ATH_REQUIRE(dev_tab);
+    /* place: the experts with place(e) on the device */
+#define PLACE(cond)                                                                                     \
+    do {                                                                                                \
+        for (int64_t e = 0; e < E; e++) {                                                               \
+            on_dev[e] = (cond) ? 1 : 0;                                                                 \
+            dev_h[e] = on_dev[e] ? gd[e].data : NULL;                                                   \
+            dev_h[E + e] = on_dev[e] ? ud[e].data : NULL;                                               \
+            dev_h[2 * E + e] = on_dev[e] ? dd[e].data : NULL;                                           \
+        }                                                                                               \
+        ATH_REQUIRE_OK(ath_copy(&g.d, dev_tab, dev_h, sizeof dev_h, ATH_STREAM_COMPUTE));              \
+        ATH_REQUIRE_OK(ath_stream_sync(&g.d, ATH_STREAM_COMPUTE));                                     \
+    } while (0)
+    const ath_moe_experts ex = {.n_experts = E, .inter = I, .hidden = H, .dev_dtype = ATH_DTYPE_Q8_0,
+                                .dev_tab = (const void *const *)dev_tab, .host_dtype = ATH_DTYPE_Q8_0_R16,
+                                .host_tab = host_tab, .on_dev = on_dev};
+    ath_pool pool;
+    ATH_REQUIRE_OK(ath_pool_init(&pool, 4, &g.host));
+    ath_moe_ws *ws;
+    ATH_REQUIRE_OK(ath_moe_ws_create(&ws, &g.d, &pool, 2, K, H, I, &g.host));   /* 2 tokens a time: chunks */
+
+    static const int32_t idv[9] = {0, 3, 6, 1, 2, 7, 4, 5, 6};
+    ath_tensor ids = host(&g, ATH_DTYPE_I32, SHAPE(T, K));
+    memcpy(ids.data, idv, sizeof idv);
+    ath_tensor x = rand_t(&g, ATH_DTYPE_BF16, -1, 1, SHAPE(T, H));
+    ath_tensor want = host(&g, ATH_DTYPE_BF16, SHAPE(T, K, H));
+    for (int64_t t = 0; t < T; t++)
+        for (int64_t c = 0; c < K; c++) {
+            const int e = idv[t * K + c];
+            ath_tensor xr, cell;
+            ATH_REQUIRE_OK(ath_tensor_slice(&x, 0, t, 1, &xr));
+            ATH_REQUIRE_OK(ath_tensor_init(&cell, ATH_DTYPE_BF16, SHAPE(1, H),
+                                           (uint16_t *)want.data + (t * K + c) * H, ATH_TIER_RAM));
+            ATH_REQUIRE_OK(ath_moe_expert_ref(&xr, &gw[e], &uw[e], &dw[e], &cell));
+        }
+    ath_tensor hh = host(&g, ATH_DTYPE_BF16, SHAPE(T, K, I));
+    ath_tensor xd = up(&g, &x), idd = up(&g, &ids), hd = up(&g, &hh), yd = up(&g, &want);
+
+    /* directly, half the experts away */
+    PLACE(e % 2 == 0);
+    ATH_EXPECT_OK(ath_memset(&g.d, yd.data, 0, ath_tensor_nbytes(&yd), ATH_STREAM_COMPUTE));
+    ATH_EXPECT_OK(ath_moe_experts_split(&g.d, &xd, &idd, &ex, ws, &hd, &yd));
+    ath_tensor got = down(&g, &yd);
+    ATH_EXPECT(memcmp(got.data, want.data, ath_tensor_nbytes(&want)) == 0);
+
+    /* captured once, replayed with the experts in other places */
+    ath_graph gr_;
+    memset(&gr_, 0, sizeof gr_);
+    ATH_REQUIRE_OK(ath_graph_begin(&g.d, ATH_STREAM_COMPUTE));
+    ath_status cap = ath_memset(&g.d, yd.data, 0, ath_tensor_nbytes(&yd), ATH_STREAM_COMPUTE);
+    if (cap == ATH_OK)
+        cap = ath_moe_experts_split(&g.d, &xd, &idd, &ex, ws, &hd, &yd);
+    ATH_REQUIRE_OK(ath_graph_end(&g.d, ATH_STREAM_COMPUTE, &gr_));
+    ATH_REQUIRE_OK(cap);
+    for (int round = 0; round < 3; round++) {
+        if (round == 0)
+            PLACE(e % 2 == 1);
+        else if (round == 1)
+            PLACE(false);                 /* every expert on the CPU */
+        else
+            PLACE(true);                  /* every expert on the device */
+        ATH_EXPECT_OK(ath_graph_launch(&g.d, &gr_, ATH_STREAM_COMPUTE));
+        ath_tensor rep = down(&g, &yd);
+        ATH_EXPECT(memcmp(rep.data, want.data, ath_tensor_nbytes(&want)) == 0);
+    }
+    ath_graph_destroy(&g.d, &gr_);
+#undef PLACE
+    ath_moe_ws_free(ws);
+    ath_pool_free(&pool);
+    gpu_close(&g);
+}
+
 /* The GEMV kernel (step 9): every row count it takes, K from one 16-byte
  * piece to more than a lane's four, odd M, both activation dtypes into
  * both output dtypes; an x that is not on a 16-byte boundary goes to the
@@ -1100,7 +1274,7 @@ ATH_TEST(gpu_gdn_chunk)
 }
 
 static const ath_test_case tests[] = {
-    ATH_TEST_ENTRY(gpu_argument_checks), ATH_TEST_ENTRY(gpu_embed),       ATH_TEST_ENTRY(gpu_matmul),      ATH_TEST_ENTRY(gpu_gemv), ATH_TEST_ENTRY(gpu_matmul_q8_0), ATH_TEST_ENTRY(gpu_matmul_n), ATH_TEST_ENTRY(gpu_matmul_swiglu), ATH_TEST_ENTRY(gpu_scatter_rows), ATH_TEST_ENTRY(gpu_sample),
+    ATH_TEST_ENTRY(gpu_argument_checks), ATH_TEST_ENTRY(gpu_embed),       ATH_TEST_ENTRY(gpu_matmul),      ATH_TEST_ENTRY(gpu_gemv), ATH_TEST_ENTRY(gpu_matmul_q8_0), ATH_TEST_ENTRY(gpu_moe), ATH_TEST_ENTRY(gpu_moe_split), ATH_TEST_ENTRY(gpu_matmul_n), ATH_TEST_ENTRY(gpu_matmul_swiglu), ATH_TEST_ENTRY(gpu_scatter_rows), ATH_TEST_ENTRY(gpu_sample),
     ATH_TEST_ENTRY(gpu_norms),           ATH_TEST_ENTRY(gpu_add_rmsnorm),           ATH_TEST_ENTRY(gpu_rope),        ATH_TEST_ENTRY(gpu_elementwise),
     ATH_TEST_ENTRY(gpu_attn),            ATH_TEST_ENTRY(gpu_attn_mma),    ATH_TEST_ENTRY(gpu_conv),        ATH_TEST_ENTRY(gpu_gdn_gates),
     ATH_TEST_ENTRY(gpu_gdn),             ATH_TEST_ENTRY(gpu_gdn_chunk),

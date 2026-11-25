@@ -301,6 +301,119 @@ ath_status ath_gdn_gpu(const ath_device *d, const ath_tensor *q, const ath_tenso
                        const ath_tensor *g, const ath_tensor *beta, float q_scale, float l2_eps, bool tiled,
                        ath_tensor *state, ath_dev_arena *scratch, ath_tensor *out);
 
+/* ---- moe.c (step 12) ---------------------------------------------------------
+ *
+ * A mixture-of-experts layer (docs/contract/qwen35-35b-a3b.md, MoE op
+ * contract): the router picks k experts per token, each chosen expert runs
+ * its SwiGLU MLP on the token, and the outputs are added with the router's
+ * weights, plus the gated shared expert. Three ops: the router's choice, one
+ * routed expert, and the weighted combination. */
+
+/* The router's choice per token: p = softmax(logits) over the n experts in
+ * fp32, the k largest (on ties the lower index), and their weights p / Σ p
+ * over the k, stored in w's dtype. logits [T, n] f32; ids [T, k] i32, sorted
+ * by expert index (the order in which the reference adds the experts, and
+ * the order of ath_moe_combine); w [T, k] f32 or bf16. k <= ATH_MOE_MAX_K. */
+#define ATH_MOE_MAX_K 16
+ath_status ath_moe_route_ref(const ath_tensor *logits, ath_tensor *ids, ath_tensor *w);
+ath_status ath_moe_route_gpu(const ath_device *d, const ath_tensor *logits, ath_tensor *ids, ath_tensor *w);
+
+/* One routed expert on every row of x: y = down · h with h = silu(g) · u,
+ * g = gate · x and u = up · x, every product an ath_matmul_ref (for Q8_0
+ * weights the canonical order) rounded to y's dtype, silu by the canonical
+ * exponential (ath_q8_silu, src/ops/q8_0.h) so that the CPU and the GPU give
+ * the same bits (invariant 7, step 12), h rounded to y's dtype. x [T, H],
+ * gate and up [I, H], down [H, I], y [T, H]; x and y f32 or bf16, the
+ * weights f32, bf16 or Q8_0. */
+ath_status ath_moe_expert_ref(const ath_tensor *x, const ath_tensor *gate, const ath_tensor *up,
+                              const ath_tensor *down, ath_tensor *y);
+
+/* The routed experts of one layer on the GPU: for every token t and choice
+ * c, y[t, c] = the MLP of expert ids[t, c] on x[t], with
+ * ath_moe_expert_ref's bits for Q8_0 weights, wherever that expert's
+ * weights are on the device; the entries of the other experts are left as
+ * they are (the CPU computes them: ath_moe_experts_cpu). tab: in device
+ * memory, 3 · n pointers, each expert's gate [I, H], then each expert's up
+ * [I, H], then each expert's down [H, I], all of dtype wdt; NULL for an
+ * expert not on the device. x [T, H], ids [T, k], h [T, k, I] working
+ * memory and y [T, k, H] of x's dtype. */
+ath_status ath_moe_experts_gpu(const ath_device *d, const ath_tensor *x, const ath_tensor *ids,
+                               const void *const *tab, ath_dtype wdt, int64_t n_experts, int64_t inter, ath_tensor *h,
+                               ath_tensor *y);
+
+/* ---- moe_cpu.c: experts in host memory (step 12) ----
+ *
+ * The routed experts of one MoE layer, wherever they are: each expert's
+ * gate [I, H], up [I, H] and down [H, I] in device memory (dev_tab, read by
+ * the kernels at run time, so that a captured graph sees experts move), and
+ * in host memory (host_tab) for the ones the CPU computes. A pipeline
+ * (src/infer/tier.c) fills it; the forward pass passes it to the ops. */
+typedef struct {
+    int64_t            n_experts, inter, hidden;   /* n, I, H                                  */
+    ath_dtype          dev_dtype;                  /* the device copies' dtype                 */
+    const void *const *dev_tab;                    /* device memory: 3n pointers, every gate,
+                                                    * then every up, then every down; NULL where
+                                                    * an expert is not on the device          */
+    ath_dtype          host_dtype;                 /* ATH_DTYPE_Q8_0_R16 or the dev_dtype       */
+    const void *const *host_tab;                   /* host memory: 3n pointers in the same order;
+                                                    * NULL when every expert is on the device */
+    const uint8_t     *on_dev;                     /* host memory: [n], 1 where dev_tab has it  */
+    uint32_t          *uses;                       /* host memory: [n] choices counted by the
+                                                    * CPU's pass (the placement's statistics),
+                                                    * or NULL                                  */
+} ath_moe_experts;
+
+/* Q8_0 rows regrouped for the CPU (core/tensor.h, ATH_DTYPE_Q8_0_R16): the
+ * same values. src Q8_0 [rows, K], dst Q8_0_R16 [rows, K], K a multiple of
+ * 512; host memory. */
+ath_status ath_q8_0_repack(const ath_tensor *src, ath_tensor *dst);
+
+/* The routed experts of one layer that are not on the device (on_dev 0),
+ * on the CPU: y[t, c] for every token t and choice c whose expert ids[t, c]
+ * has on_dev 0, with ath_moe_expert_ref's bits (the canonical order: the
+ * same bits as the GPU's for the experts there, invariant 7); the other
+ * entries are left as they are. With host copies in Q8_0_R16 and a CPU with
+ * AVX-512, 16 partial sums in one register; otherwise the same operations
+ * one lane at a time. Counts every choice in ex->uses. x [T, H], ids
+ * [T, k], y [T, k, H], host memory; work memory from a (reset before
+ * returning); rows spread over the threads of pool. */
+ath_status ath_moe_experts_cpu(const ath_tensor *x, const ath_tensor *ids, const ath_moe_experts *ex, ath_tensor *y,
+                               ath_pool *pool, ath_arena *a);
+
+/* Working state of the experts split between a GPU and the CPU: pinned
+ * buffers for the tokens of up to max_tokens rows at a time (the CPU's
+ * inputs and outputs), the events that order the side stream, the CPU's
+ * working memory and the jobs it runs. One per device and model (the
+ * engine's), shared by the MoE layers in turn. */
+typedef struct ath_moe_ws ath_moe_ws;
+ath_status ath_moe_ws_create(ath_moe_ws **ws, const ath_device *d, ath_pool *pool, int64_t max_tokens, int64_t k,
+                             int64_t hidden, int64_t inter, ath_arena *a);
+void       ath_moe_ws_free(ath_moe_ws *ws);
+
+/* The routed experts of one layer on a GPU, wherever they are: y[t, c] for
+ * every token and choice, the experts on the device computed there
+ * (ath_moe_experts_gpu) while the others run on the CPU from their host
+ * copies (ath_moe_experts_cpu, called from the stream: ath_host_call), and
+ * the CPU's outputs merged into y. Everything is queued on the device's
+ * streams and nothing waits on the host, so a decode step that contains it
+ * can be captured in a graph and replayed: the CPU's share runs again at
+ * every replay, for the experts away from the device at that time. The
+ * bits do not depend on where an expert is (invariant 7). x [T, H], ids
+ * [T, k] on the device; h [T, k, I] device working memory, y [T, k, H]. */
+ath_status ath_moe_experts_split(const ath_device *d, const ath_tensor *x, const ath_tensor *ids,
+                                 const ath_moe_experts *ex, ath_moe_ws *ws, ath_tensor *h, ath_tensor *y);
+
+/* The layer's output: out[t] = Σ_j w[t, j] · y[t, j] + sigmoid(sg[t]) · ys[t],
+ * the routed sum as a chain of fused multiply-adds in the order of j (the
+ * experts by index, ath_moe_route), the shared term added last, rounded
+ * once to out's dtype. y [T, k, H], w [T, k], ys [T, H], sg [T, 1] (the
+ * shared expert's output and its gate's logit; both NULL without a shared
+ * expert), out [T, H]; f32 or bf16. */
+ath_status ath_moe_combine_ref(const ath_tensor *y, const ath_tensor *w, const ath_tensor *ys, const ath_tensor *sg,
+                               ath_tensor *out);
+ath_status ath_moe_combine_gpu(const ath_device *d, const ath_tensor *y, const ath_tensor *w, const ath_tensor *ys,
+                               const ath_tensor *sg, ath_tensor *out);
+
 /* ---- dispatch.c (step 8): one entry point per op ------------------------------
  *
  * d NULL: the CPU (ath_<op>_ref; ath_matmul_fast on the threads of pool).

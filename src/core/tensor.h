@@ -43,11 +43,20 @@ typedef enum {
      * f16 scale d followed by 32 int8 values q; element i of a block is
      * d · q[i] (exact in f32). 34 bytes per block, no padding. */
     ATH_DTYPE_Q8_0 = ATH_DTYPE_QUANT_FIRST,
+    /* Q8_0 regrouped for the CPU (step 12): each row in groups of 16 Q8_0
+     * blocks (512 elements, 544 bytes), a group holding the 16 f16 scales
+     * (32 bytes) and then the 512 int8 values with value i of block j at
+     * byte 32 + 16 i + j, so that one 16-byte load gives value i of 16
+     * blocks, one per lane of an AVX-512 register. The same values as Q8_0
+     * (src/ops/moe_cpu.c repacks them); rows are whole groups. */
+    ATH_DTYPE_Q8_0_R16,
     ATH_DTYPE_QUANT_LAST  = 127
 } ath_dtype;
 
 #define ATH_Q8_0_BLOCK 32           /* elements per Q8_0 block           */
 #define ATH_Q8_0_BYTES 34           /* bytes per Q8_0 block: f16 + 32 i8 */
+#define ATH_Q8_0_R16_BLOCK 512      /* elements per Q8_0_R16 group       */
+#define ATH_Q8_0_R16_BYTES 544      /* bytes per Q8_0_R16 group          */
 
 /* Bytes per element; 0 for block formats and for reserved or unknown values. */
 size_t      ath_dtype_size(ath_dtype dt);

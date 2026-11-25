@@ -86,6 +86,16 @@ ath_status ath_gdn_chunk_launch(const ath_device *d, const ath_tensor *q, const 
                                 const ath_tensor *g, const ath_tensor *beta, float q_scale, float l2_eps, bool tiled,
                                 ath_tensor *state, void *work, ath_tensor *out);
 
+/* MoE (moe.cu, step 12) */
+ath_status ath_moe_route_launch(const ath_device *d, const ath_tensor *logits, ath_tensor *ids, ath_tensor *w);
+ath_status ath_moe_combine_launch(const ath_device *d, const ath_tensor *y, const ath_tensor *w, const ath_tensor *ys,
+                                  const ath_tensor *sg, ath_tensor *out);
+ath_status ath_moe_experts_launch(const ath_device *d, const ath_tensor *x, const ath_tensor *ids,
+                                  const void *const *tab, ath_dtype wdt, int64_t n_experts, int64_t inter,
+                                  ath_tensor *h, ath_tensor *y);
+ath_status ath_moe_merge_launch(const ath_device *d, const ath_tensor *ids, const void *const *tab,
+                                int64_t n_experts, const void *src, ath_tensor *y);
+
 #ifdef __cplusplus
 }
 #endif

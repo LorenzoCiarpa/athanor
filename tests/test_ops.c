@@ -10,6 +10,7 @@
 #include "ops/q8_0.h"
 
 #include <float.h>
+#include <stdlib.h>
 
 /* ---- helpers --------------------------------------------------------------- */
 
@@ -336,6 +337,131 @@ ATH_TEST(matmul_q8_0)
     /* rows must be whole blocks: the dtype refuses others; a Q8_0 x is refused */
     ath_tensor xbad = mk(ATH_DTYPE_Q8_0, 2, (const int64_t[]){1, 64}, NULL);
     ATH_EXPECT_STATUS(ath_matmul_ref(&xbad, &w, &out), ATH_ERR_TYPE);
+}
+
+/* ---- MoE (step 12) -------------------------------------------------------------- */
+
+ATH_TEST(moe_route_hand)
+{
+    /* 2 tokens, 5 experts, top 2. Token 0: probabilities ∝ e^l; the two
+     * largest are experts 3 and 1; token 1 has a tie between 0 and 4 (the
+     * lower index wins the second place). */
+    ath_tensor logits = F(SHAPE(2, 5), VALS(0.0f, 2.0f, -1.0f, 3.0f, 0.5f,  1.0f, 0.0f, 2.0f, 0.0f, 1.0f));
+    ath_tensor ids = Z(ATH_DTYPE_I32, SHAPE(2, 2)), w = F(SHAPE(2, 2), NULL);
+    ATH_REQUIRE_OK(ath_moe_route_ref(&logits, &ids, &w));
+    const int32_t *id = ids.data;
+    ATH_EXPECT(id[0] == 1 && id[1] == 3);                 /* sorted by index */
+    const double e1 = exp(2.0), e3 = exp(3.0);
+    ATH_EXPECT(fabs(at(&w, 0) - e1 / (e1 + e3)) < 1e-6 && fabs(at(&w, 1) - e3 / (e1 + e3)) < 1e-6);
+    ATH_EXPECT(id[2] == 0 && id[3] == 2);                 /* 2 first, then 0 over 4 */
+    ATH_EXPECT(fabs(at(&w, 2) + at(&w, 3) - 1.0f) < 1e-6);
+    ath_tensor bad = Z(ATH_DTYPE_I32, SHAPE(2, 6));
+    ATH_EXPECT_STATUS(ath_moe_route_ref(&logits, &bad, &w), ATH_ERR_INVALID_ARG);
+}
+
+ATH_TEST(moe_expert_and_combine)
+{
+    /* one expert against its definition in double: h = silu(g) · u */
+    const int64_t T = 3, H = 64, I = 32;
+    ath_tensor x = random_tensor(ATH_DTYPE_F32, 2, (const int64_t[]){T, H});
+    ath_tensor g = random_q8_0(I, H), u = random_q8_0(I, H), d = random_q8_0(H, I);
+    ath_tensor y = mk(ATH_DTYPE_F32, 2, (const int64_t[]){T, H}, NULL);
+    ATH_REQUIRE_OK(ath_moe_expert_ref(&x, &g, &u, &d, &y));
+    double worst = 0;
+    for (int64_t t = 0; t < T; t++) {
+        double hd[32];
+        for (int64_t i = 0; i < I; i++) {
+            double gs = 0, us = 0;
+            for (int64_t k = 0; k < H; k++) {
+                gs += q8_0_at(&g, i, k) * at(&x, t * H + k);
+                us += q8_0_at(&u, i, k) * at(&x, t * H + k);
+            }
+            hd[i] = gs / (1.0 + exp(-gs)) * us;
+        }
+        for (int64_t r = 0; r < H; r++) {
+            double ys = 0, mag = 0;
+            for (int64_t i = 0; i < I; i++) {
+                ys += q8_0_at(&d, r, i) * hd[i];
+                mag += fabs(q8_0_at(&d, r, i) * hd[i]);
+            }
+            const double err = fabs(at(&y, t * H + r) - ys) / (mag + 1e-30);
+            worst = err > worst ? err : worst;
+        }
+    }
+    ATH_EXPECT(worst < 1e-5);
+    printf("  moe expert: worst error %.2e of sum|terms| against double\n", worst);
+
+    /* combine: the routed sum by fused multiply-adds, then the shared term */
+    ath_tensor yk = F(SHAPE(1, 2, 2), VALS(1.0f, 2.0f, 3.0f, 4.0f));
+    ath_tensor wk = F(SHAPE(1, 2), VALS(0.25f, 0.75f));
+    ath_tensor ys = F(SHAPE(1, 2), VALS(8.0f, -8.0f)), sg = F(SHAPE(1, 1), VALS(0.0f));
+    ath_tensor out = F(SHAPE(1, 2), NULL);
+    ATH_REQUIRE_OK(ath_moe_combine_ref(&yk, &wk, &ys, &sg, &out));
+    ATH_EXPECT(at(&out, 0) == 0.25f + 2.25f + 4.0f && at(&out, 1) == 0.5f + 3.0f - 4.0f);
+    ATH_REQUIRE_OK(ath_moe_combine_ref(&yk, &wk, NULL, NULL, &out));
+    ATH_EXPECT(at(&out, 0) == 2.5f && at(&out, 1) == 3.5f);
+    ATH_EXPECT_STATUS(ath_moe_combine_ref(&yk, &wk, &ys, NULL, &out), ATH_ERR_INVALID_ARG);
+}
+
+/* The CPU's experts (step 12): Q8_0 regrouped into Q8_0_R16 keeps every
+ * value; ath_moe_experts_cpu gives ath_moe_expert_ref's bits with AVX-512
+ * and with the one-lane path, leaves the experts marked on the device
+ * alone, and counts every choice. */
+ATH_TEST(moe_experts_cpu)
+{
+    const int64_t T = 3, H = 512, I = 1024, E = 6, K = 2;
+    ath_tensor g[6], u[6], d[6], gr[6], ur[6], dr[6];
+    const void *tab[18];
+    uint8_t on_dev[6] = {0, 1, 0, 0, 1, 0};
+    uint32_t uses[6] = {0};
+    for (int e = 0; e < E; e++) {
+        g[e] = random_q8_0(I, H), u[e] = random_q8_0(I, H), d[e] = random_q8_0(H, I);
+        gr[e] = mk(ATH_DTYPE_Q8_0_R16, 2, (const int64_t[]){I, H}, NULL);
+        ur[e] = mk(ATH_DTYPE_Q8_0_R16, 2, (const int64_t[]){I, H}, NULL);
+        dr[e] = mk(ATH_DTYPE_Q8_0_R16, 2, (const int64_t[]){H, I}, NULL);
+        ATH_REQUIRE_OK(ath_q8_0_repack(&g[e], &gr[e]));
+        ATH_REQUIRE_OK(ath_q8_0_repack(&u[e], &ur[e]));
+        ATH_REQUIRE_OK(ath_q8_0_repack(&d[e], &dr[e]));
+        tab[e] = gr[e].data, tab[E + e] = ur[e].data, tab[2 * E + e] = dr[e].data;
+    }
+    /* the regrouped layout holds the same values */
+    const uint8_t *q = g[2].data, *r = gr[2].data;
+    ATH_EXPECT(r[2 * 5] == q[5 * 34] && r[2 * 5 + 1] == q[5 * 34 + 1] && r[32 + 16 * 7 + 5] == q[5 * 34 + 2 + 7]);
+    ATH_EXPECT(r[544 + 32 + 16 * 31 + 15] == q[(16 + 15) * 34 + 2 + 31]);
+
+    const ath_moe_experts ex = {.n_experts = E, .inter = I, .hidden = H, .dev_dtype = ATH_DTYPE_Q8_0,
+                                .host_dtype = ATH_DTYPE_Q8_0_R16, .host_tab = tab, .on_dev = on_dev, .uses = uses};
+    static const int32_t idv[6] = {0, 3, 1, 5, 2, 4};
+    ath_tensor ids = mk(ATH_DTYPE_I32, 2, (const int64_t[]){T, K}, NULL);
+    memcpy(ids.data, idv, sizeof idv);
+    for (int pass = 0; pass < 4; pass++) {
+        const ath_dtype dt = pass & 1 ? ATH_DTYPE_F32 : ATH_DTYPE_BF16;
+        if (pass >= 2)
+            setenv("ATH_CPU_NO_AVX512", "1", 1);
+        ath_tensor x = random_tensor(dt, 2, (const int64_t[]){T, H});
+        ath_tensor y = mk(dt, 3, (const int64_t[]){T, K, H}, NULL);
+        memset(y.data, 0xff, ath_tensor_nbytes(&y));
+        ATH_REQUIRE_OK(ath_moe_experts_cpu(&x, &ids, &ex, &y, &pool, &arena));
+        int bad = 0, kept = 0;
+        for (int64_t t = 0; t < T; t++)
+            for (int64_t c = 0; c < K; c++) {
+                const int e = idv[t * K + c];
+                const size_t row = (size_t)H * ath_dtype_size(dt);
+                const uint8_t *cell = (const uint8_t *)y.data + (size_t)(t * K + c) * row;
+                if (on_dev[e]) {
+                    for (size_t b = 0; b < row; b++)
+                        kept += cell[b] == 0xff;
+                    continue;
+                }
+                ath_tensor xr = rows(&x, t, 1), want = mk(dt, 2, (const int64_t[]){1, H}, NULL);
+                ATH_REQUIRE_OK(ath_moe_expert_ref(&xr, &g[e], &u[e], &d[e], &want));
+                bad += memcmp(cell, want.data, row) != 0;
+            }
+        ATH_EXPECT(bad == 0);
+        ATH_EXPECT(kept == 2 * (int)(H * ath_dtype_size(dt)));
+    }
+    unsetenv("ATH_CPU_NO_AVX512");
+    ATH_EXPECT(uses[0] == 4 && uses[3] == 4 && uses[1] == 4 && uses[4] == 4);
 }
 
 /* ---- norms ------------------------------------------------------------------- */
@@ -718,6 +844,9 @@ static const ath_test_case tests[] = {
     ATH_TEST_ENTRY(matmul_fast_same_bits),
     ATH_TEST_ENTRY(q8_0_f16_and_exp),
     ATH_TEST_ENTRY(matmul_q8_0),
+    ATH_TEST_ENTRY(moe_route_hand),
+    ATH_TEST_ENTRY(moe_expert_and_combine),
+    ATH_TEST_ENTRY(moe_experts_cpu),
     ATH_TEST_ENTRY(rmsnorm_hand),
     ATH_TEST_ENTRY(rmsnorm_gated_hand),
     ATH_TEST_ENTRY(l2norm_hand),

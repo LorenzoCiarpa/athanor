@@ -179,3 +179,31 @@ ath_status ath_add_rmsnorm_launch(const ath_device *d, ath_tensor *x, const ath_
     (void)d, (void)x, (void)y, (void)w, (void)w_offset, (void)eps, (void)out;
     return none("add_rmsnorm");
 }
+
+ath_status ath_moe_route_launch(const ath_device *d, const ath_tensor *logits, ath_tensor *ids, ath_tensor *w)
+{
+    (void)d, (void)logits, (void)ids, (void)w;
+    return none("moe_route");
+}
+
+ath_status ath_moe_combine_launch(const ath_device *d, const ath_tensor *y, const ath_tensor *w, const ath_tensor *ys,
+                                  const ath_tensor *sg, ath_tensor *out)
+{
+    (void)d, (void)y, (void)w, (void)ys, (void)sg, (void)out;
+    return none("moe_combine");
+}
+
+ath_status ath_moe_experts_launch(const ath_device *d, const ath_tensor *x, const ath_tensor *ids,
+                                  const void *const *tab, ath_dtype wdt, int64_t n_experts, int64_t inter,
+                                  ath_tensor *h, ath_tensor *y)
+{
+    (void)d, (void)x, (void)ids, (void)tab, (void)wdt, (void)n_experts, (void)inter, (void)h, (void)y;
+    return none("moe_experts");
+}
+
+ath_status ath_moe_merge_launch(const ath_device *d, const ath_tensor *ids, const void *const *tab,
+                                int64_t n_experts, const void *src, ath_tensor *y)
+{
+    (void)d, (void)ids, (void)tab, (void)n_experts, (void)src, (void)y;
+    return none("moe_merge");
+}

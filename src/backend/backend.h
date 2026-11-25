@@ -149,6 +149,20 @@ ath_status ath_event_record(const ath_device *d, ath_event *e, ath_stream s);
 ath_status ath_stream_wait(const ath_device *d, ath_stream s, const ath_event *e);
 /* Wait on the host for the work before event e. */
 ath_status ath_event_sync(const ath_device *d, const ath_event *e);
+
+/* ---- host work in a stream (step 12) ---------------------------------------
+ * Run fn(ctx) on a thread of the runtime when the work queued on stream s
+ * so far has finished; the work queued after it waits until fn returns. fn
+ * must not call the runtime. It takes part in graphs like any other work
+ * (a host node): a replay calls fn again with the same ctx, which must
+ * therefore outlive the graph. The routed experts that are not in device
+ * memory run this way on the CPU (src/ops/moe.c). */
+typedef void (*ath_host_fn)(void *ctx);
+ath_status ath_host_call(const ath_device *d, ath_stream s, ath_host_fn fn, void *ctx);
+/* Whether stream s is recording a graph now (between ath_graph_begin and
+ * ath_graph_end): work queued now will be replayed, so what it points to
+ * must last as long as the graph. */
+ath_status ath_stream_capturing(const ath_device *d, ath_stream s, bool *capturing);
 /* Milliseconds between two completed timing events (start recorded before
  * end). ATH_ERR_INVALID_ARG for events created without timing. */
 ath_status ath_event_elapsed(const ath_device *d, const ath_event *start, const ath_event *end, float *ms);

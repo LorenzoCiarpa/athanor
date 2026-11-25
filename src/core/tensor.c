@@ -24,20 +24,26 @@ size_t ath_dtype_size(ath_dtype dt)
 
 bool ath_dtype_is_quant(ath_dtype dt)
 {
-    return dt == ATH_DTYPE_Q8_0;
+    return dt == ATH_DTYPE_Q8_0 || dt == ATH_DTYPE_Q8_0_R16;
 }
 
 int64_t ath_dtype_block(ath_dtype dt)
 {
     if (dt == ATH_DTYPE_Q8_0)
         return ATH_Q8_0_BLOCK;
+    if (dt == ATH_DTYPE_Q8_0_R16)
+        return ATH_Q8_0_R16_BLOCK;
     return ath_dtype_size(dt) ? 1 : 0;
 }
 
 /* Bytes of one block. */
 static size_t block_bytes(ath_dtype dt)
 {
-    return dt == ATH_DTYPE_Q8_0 ? ATH_Q8_0_BYTES : ath_dtype_size(dt);
+    if (dt == ATH_DTYPE_Q8_0)
+        return ATH_Q8_0_BYTES;
+    if (dt == ATH_DTYPE_Q8_0_R16)
+        return ATH_Q8_0_R16_BYTES;
+    return ath_dtype_size(dt);
 }
 
 size_t ath_dtype_bytes(ath_dtype dt, int64_t n)
@@ -50,6 +56,8 @@ const char *ath_dtype_name(ath_dtype dt)
 {
     if (dt == ATH_DTYPE_Q8_0)
         return "q8_0";
+    if (dt == ATH_DTYPE_Q8_0_R16)
+        return "q8_0r16";
     return (unsigned)dt < ATH_DTYPE_COUNT ? dtype_info[dt].name : "?";
 }
 

@@ -59,6 +59,11 @@ typedef hipDeviceProp_t cudaDeviceProp;
 #define cudaStreamDestroy            hipStreamDestroy
 #define cudaStreamSynchronize        hipStreamSynchronize
 #define cudaStreamWaitEvent          hipStreamWaitEvent
+#define cudaLaunchHostFunc           hipLaunchHostFunc
+#define cudaStreamIsCapturing        hipStreamIsCapturing
+#define cudaStreamCaptureStatus      hipStreamCaptureStatus
+#define cudaStreamCaptureStatusNone  hipStreamCaptureStatusNone
+#define cudaHostFn_t                 hipHostFn_t
 #define cudaDeviceSynchronize        hipDeviceSynchronize
 #define cudaEventCreateWithFlags     hipEventCreateWithFlags
 #define cudaEventDestroy             hipEventDestroy

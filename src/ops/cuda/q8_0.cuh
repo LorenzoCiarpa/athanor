@@ -122,4 +122,56 @@ static __device__ __forceinline__ void k_q8_stage(unsigned char *region, int j, 
         r[j + 32] = p.c;
 }
 
+/* One canonical dot product of a Q8_0 row of K elements with the row of x
+ * that starts at element xoff, by the half-warp of lane j; every lane of
+ * the half-warp gets the result. region: this half-warp's Q8_REGION bytes of
+ * shared memory. K a multiple of 512 with 16-byte aligned rows takes the
+ * staged path (q8_gemv's, the next group loading while one computes);
+ * other K read their blocks 2 bytes at a time. A half-warp with !live
+ * computes nothing that matters but takes part in the warp's
+ * synchronization and shuffles. */
+static __device__ __forceinline__ float k_q8_dot(const uint8_t *row, const void *x, int xdt, int64_t xoff, int64_t K,
+                                                 unsigned char *region, int j, bool live)
+{
+    const int64_t nb = K / ATH_Q8_0_BLOCK;
+    float P = 0.0f;
+    if (K % 512 == 0) {
+        const uint4 *r = (const uint4 *)row;
+        const int64_t groups = nb / 16;
+        q8_pieces next = k_q8_fetch(r, j, live && groups > 0);
+        for (int64_t g = 0; g < groups; g++) {
+            __syncwarp();
+            k_q8_stage(region, j, next);
+            __syncwarp();
+            if (g + 1 < groups)
+                next = k_q8_fetch(r + (g + 1) * (Q8_GROUP_BYTES / 16), j, live);
+            uint32_t nw[9];
+            k_q8_words(region, j, nw);
+            float xf[32];
+            if (live)
+                k_q8_x(x, xdt, xoff, g * 16 + j, xf);
+            else
+                for (int i = 0; i < 32; i++)
+                    xf[i] = 0.0f;
+            P = fmaf(k_q8_scale(nw), k_q8_chain(nw, xf), P);
+        }
+    } else {
+        const uint16_t *r = (const uint16_t *)row;
+        for (int64_t b = j; live && b < nb; b += 16) {
+            uint32_t nw[9];
+            const uint16_t *blk = r + b * (ATH_Q8_0_BYTES / 2);
+#pragma unroll
+            for (int i = 0; i < 8; i++)
+                nw[i] = (uint32_t)blk[2 * i] | (uint32_t)blk[2 * i + 1] << 16;
+            nw[8] = blk[16];
+            float xf[32];
+#pragma unroll
+            for (int i = 0; i < 32; i++)
+                xf[i] = k_ld(x, xdt, xoff + b * ATH_Q8_0_BLOCK + i);
+            P = fmaf(k_q8_scale(nw), k_q8_chain(nw, xf), P);
+        }
+    }
+    return k_q8_tree(P);
+}
+
 #endif /* ATH_OPS_Q8_0_CUH */
