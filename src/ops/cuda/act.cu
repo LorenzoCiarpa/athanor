@@ -4,7 +4,7 @@
  * One kernel for the three, one thread per element. out may alias a or b:
  * each thread reads its two inputs before it writes the same index.
  */
-#include "ops/kernel.cuh"
+#include "ops/cuda/kernel.cuh"
 
 static __global__ void elem_kernel(int kind, const void *a, int adt, const void *b, int bdt, void *out, int odt,
                                    int64_t n)

@@ -93,7 +93,7 @@ ath_status ath_matmul_fast(const ath_tensor *x, const ath_tensor *w, ath_tensor 
 
 /* The GPU matmul: cuBLASLt when it has the dtypes (x and w bf16 with out bf16
  * or f32, or all three f32), accumulating in fp32 (never TF32); athanor's
- * own kernel, slower, for the other combinations (src/ops/matmul.cu). */
+ * own kernel, slower, for the other combinations (src/ops/cuda/matmul.cu). */
 ath_status ath_matmul_gpu(const ath_device *d, const ath_tensor *x, const ath_tensor *w, ath_tensor *out);
 
 /* ---- norm.c ---------------------------------------------------------------- */

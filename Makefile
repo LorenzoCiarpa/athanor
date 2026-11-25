@@ -84,20 +84,20 @@ OPS_SRC   := $(wildcard src/ops/*.c)
 TEXT_SRC  := $(wildcard src/text/*.c)
 MODEL_SRC := $(wildcard src/model/*.c)
 INFER_SRC := $(wildcard src/infer/*.c)
-# GPU code: the backend's gpu.cu and the kernels of src/ops/*.cu with a GPU;
-# without one, the stubs gpu_none.c of both (src/backend/README.md).
+# GPU code: the CUDA C of the cuda/ folders (the backend's runtime, the ops'
+# kernels) with a GPU; without one, the stubs gpu_none.c of both
+# (src/backend/README.md, Source layout).
 BACKEND_SRC := $(filter-out src/backend/gpu_none.c,$(wildcard src/backend/*.c))
 OPS_SRC     := $(filter-out src/ops/gpu_none.c,$(OPS_SRC))
 ifeq ($(GPU),cuda)
-GPU_SRC   := src/backend/gpu.cu $(wildcard src/ops/*.cu)
+GPU_SRC   := $(wildcard src/backend/cuda/*.cu src/ops/cuda/*.cu)
 else
 BACKEND_SRC += src/backend/gpu_none.c
 OPS_SRC     += src/ops/gpu_none.c
 GPU_SRC   :=
 endif
 LIB_SRC   := $(CORE_SRC) $(OPS_SRC) $(TEXT_SRC) $(MODEL_SRC) $(FAMILY_SRC) $(BACKEND_SRC) $(INFER_SRC)
-# A kernel file shares its op's name (matmul.c, matmul.cu): .cu objects end in .cu.o.
-LIB_OBJ   := $(LIB_SRC:%.c=$(BUILD)/obj/%.o) $(GPU_SRC:%.cu=$(BUILD)/obj/%.cu.o)
+LIB_OBJ   := $(LIB_SRC:%.c=$(BUILD)/obj/%.o) $(GPU_SRC:%.cu=$(BUILD)/obj/%.o)
 
 TOOL_SRC := $(wildcard tools/*.c)
 TOOL_OBJ := $(TOOL_SRC:%.c=$(BUILD)/obj/%.o)
@@ -122,7 +122,7 @@ $(BUILD)/obj/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-$(BUILD)/obj/%.cu.o: %.cu | cuda-check
+$(BUILD)/obj/%.o: %.cu | cuda-check
 	@mkdir -p $(dir $@)
 	$(NVCC) $(NVCCFLAGS) -c -o $@ $<
 

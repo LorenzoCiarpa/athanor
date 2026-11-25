@@ -2,8 +2,10 @@
  *
  * Each ath_<op>_gpu in ops.h checks its arguments in the op's .c file, with
  * the same code as ath_<op>_ref, then calls the launcher here, defined in
- * the op's .cu file: it makes the device current, queues the kernels on the
- * device's compute stream and returns. In a build without a GPU backend,
+ * the op's .cu file in src/ops/cuda/: it makes the device current, queues
+ * the kernels on the device's compute stream and returns. This header is
+ * the boundary between the portable C of src/ops/ and the kernels, so it
+ * stays at the root of the module. In a build without a GPU backend,
  * src/ops/gpu_none.c defines every launcher as a failure
  * (ATH_ERR_UNSUPPORTED).
  *

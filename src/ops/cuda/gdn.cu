@@ -13,7 +13,7 @@
  * contiguous. Tokens run one after the other, as the recurrence requires;
  * the chunked form that parallelizes a long prompt is step 10.
  */
-#include "ops/kernel.cuh"
+#include "ops/cuda/kernel.cuh"
 
 #define GDN_WARPS 8
 #define GDN_ROWS (ATH_GDN_MAX_DK / ATH_WARP)   /* state rows per lane */

@@ -1,5 +1,5 @@
-/* kernel.cuh: what the GPU kernels of src/ops share. Private to the .cu
- * files of src/ops.
+/* kernel.cuh: what the GPU kernels share. Private to the .cu
+ * files of src/ops/cuda/.
  *
  * Elements. Kernels read and write f32 and bf16 through k_ld and k_st, the
  * device twins of ld and st (check.h). The dtype is an argument of the
@@ -17,8 +17,8 @@
 #ifndef ATH_OPS_KERNEL_CUH
 #define ATH_OPS_KERNEL_CUH
 
-#include "backend/compat.h"
-#include "backend/gpu.h"
+#include "backend/cuda/compat.h"
+#include "backend/cuda/gpu.h"
 #include "core/tensor.h"
 #include "ops/launch.h"
 

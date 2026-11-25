@@ -8,7 +8,7 @@
  * angle are the device's, rounded to the activation dtype as the reference
  * rounds its tables.
  */
-#include "ops/kernel.cuh"
+#include "ops/cuda/kernel.cuh"
 
 typedef struct {
     float f[ATH_ROPE_MAX_DIM / 2];

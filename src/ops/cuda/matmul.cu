@@ -22,7 +22,7 @@
  * inputs into a bf16 output) run on matmul_kernel below: one warp per
  * output, slower, for the exact (f32-activation) path that tests use.
  */
-#include "ops/kernel.cuh"
+#include "ops/cuda/kernel.cuh"
 
 /* ---- cuBLASLt --------------------------------------------------------------- */
 

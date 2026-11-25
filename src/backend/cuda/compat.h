@@ -1,6 +1,6 @@
 /* compat.h: one source for CUDA and HIP.
  *
- * GPU code (src/backend/gpu.cu, and the .cu kernels of src/ops from step 7)
+ * GPU code (src/backend/cuda/gpu.cu, and the kernels in src/ops/cuda/)
  * is written once against the CUDA runtime API and cuBLASLt, and includes
  * this header instead of a vendor header. nvcc compiles it as CUDA. hipcc
  * compiles the same files for AMD with __HIP_PLATFORM_AMD__ defined, and the

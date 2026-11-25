@@ -8,7 +8,7 @@
  * which is safe in place for the reason conv.c gives. Writing the state in
  * the first kernel would race with the threads still reading it.
  */
-#include "ops/kernel.cuh"
+#include "ops/cuda/kernel.cuh"
 
 /* Row r, channel c of xx = [state; x]. */
 static __device__ __forceinline__ float k_xx(const void *state, int sdt, const void *x, int xdt, int64_t r,

@@ -21,7 +21,7 @@
  * several blocks (split-K) is step 9; tiled prefill on tensor cores is
  * step 10.
  */
-#include "ops/kernel.cuh"
+#include "ops/cuda/kernel.cuh"
 
 #define ATTN_THREADS 128
 #define ATTN_TILE 32

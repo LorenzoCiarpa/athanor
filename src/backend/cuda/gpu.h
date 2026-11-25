@@ -1,15 +1,15 @@
 /* gpu.h: what GPU code shares: runtime errors mapped to a status, the
  * device made current, its streams, and the check after a kernel launch.
  *
- * Private to GPU code: included only by .cu files (src/backend/gpu.cu and
- * the kernels of src/ops), never by C code above the backend, which sees
- * backend.h alone.
+ * Private to GPU code: included only by .cu files (src/backend/cuda/gpu.cu
+ * and the kernels in src/ops/cuda/), never by C code above the backend,
+ * which sees backend.h alone.
  */
 #ifndef ATH_BACKEND_GPU_H
 #define ATH_BACKEND_GPU_H
 
 #include "backend/backend.h"
-#include "backend/compat.h"
+#include "backend/cuda/compat.h"
 
 /* Log a runtime error and map it to a status. The runtime also remembers
  * the last error until it is read; reading it here keeps a handled error

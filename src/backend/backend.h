@@ -64,7 +64,7 @@ typedef struct {
     int32_t  runtime_version;        /* the runtime this binary was built with         */
     void    *stream[ATH_STREAM_COUNT];
     /* The vendor's dense matmul library (cuBLASLt; hipBLASLt from step 11)
-     * and its workspace, used by the GPU matmul (src/ops/matmul.cu). One
+     * and its workspace, used by the GPU matmul (src/ops/cuda/matmul.cu). One
      * workspace per device is enough because ops run on ATH_STREAM_COMPUTE
      * only, one after the other. */
     void    *blas;

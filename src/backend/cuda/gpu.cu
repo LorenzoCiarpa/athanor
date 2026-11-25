@@ -9,8 +9,8 @@
  * state.
  */
 #include "backend/backend.h"
-#include "backend/compat.h"
-#include "backend/gpu.h"
+#include "backend/cuda/compat.h"
+#include "backend/cuda/gpu.h"
 
 #include <stdio.h>
 #include <string.h>

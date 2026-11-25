@@ -6,7 +6,7 @@
  * thread scales its elements. Rows are short (128 to a few thousand
  * elements), so one block per row keeps the whole row in one place.
  */
-#include "ops/kernel.cuh"
+#include "ops/cuda/kernel.cuh"
 
 #define NORM_THREADS 128
 

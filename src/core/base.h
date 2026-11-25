@@ -11,7 +11,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* C linkage when included from CUDA code (src/backend/gpu.cu), which nvcc
+/* C linkage when included from CUDA code (src/backend/cuda/gpu.cu), which nvcc
  * compiles as C++. */
 #ifdef __cplusplus
 extern "C" {

@@ -7,7 +7,7 @@
  *
  * Two versions compute the same sums with the same bits: the reference, one
  * output at a time, and ath_matmul_fast below. The GPU version is in
- * matmul.cu.
+ * cuda/matmul.cu.
  */
 #include "ops/check.h"
 #include "ops/launch.h"

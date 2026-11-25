@@ -4,7 +4,7 @@
  * cannot check them before the launch: an id outside the table gives a row
  * of NaN (visible downstream) instead of a read outside the table.
  */
-#include "ops/kernel.cuh"
+#include "ops/cuda/kernel.cuh"
 
 static __global__ void embed_kernel(const void *table, int tdt, const int32_t *ids, void *out, int odt, int64_t n,
                                     int64_t H, int64_t V)
