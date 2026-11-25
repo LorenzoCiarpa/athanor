@@ -120,10 +120,16 @@ typedef struct {
     int64_t t, c, e;     /* token, choice, expert */
 } item;
 
+/* The items of one expert: it[first … first + n − 1]. */
+typedef struct {
+    int64_t e, first, n;
+} group;
+
 typedef struct {
     const ath_moe_experts *ex;
     const item            *it;
-    int64_t                n_items, I, H;
+    const group           *gr;
+    int64_t                n_items, n_groups, I, H;
     ath_dtype              act;           /* the dtype of x and y: h and y are rounded to it */
     const float           *xt;            /* [T, H] transposed per token                      */
     float                 *h, *ht;        /* [n_items, I]: h, and h transposed                */
@@ -140,34 +146,56 @@ static float dot(const job *j, const uint8_t *row, const float *xt, int64_t K)
     return dot_r16_scalar(row, xt, K);
 }
 
-/* Task t of n, phase 1: rows i of every item's gate and up, h = silu(g) · u. */
+/* The items are sorted by expert, so that a row of an expert's weights is
+ * read once for all the tokens that chose it (it stays in the core's cache
+ * across them): at batch 1 that changes nothing, in a prompt it reads each
+ * expert once per chunk instead of once per token. */
+
+/* Task t of n, phase 1: row i of a group's gate and up for each of its
+ * items, h = silu(g) · u. */
 static void up_task(void *ctx, int32_t t, int32_t n)
 {
     const job *j = ctx;
-    const int64_t rows = j->n_items * j->I, rb = ath_dtype_bytes(ATH_DTYPE_Q8_0_R16, j->H);
+    const int64_t rows = j->n_groups * j->I, rb = ath_dtype_bytes(ATH_DTYPE_Q8_0_R16, j->H), E = j->ex->n_experts;
     for (int64_t r = rows * t / n; r < rows * (t + 1) / n; r++) {
-        const item *it = &j->it[r / j->I];
-        const int64_t i = r % j->I, E = j->ex->n_experts;
-        const uint8_t *g = (const uint8_t *)j->ex->host_tab[it->e] + i * rb;
-        const uint8_t *u = (const uint8_t *)j->ex->host_tab[E + it->e] + i * rb;
-        const float *xt = j->xt + it->t * j->H;
-        const float gv = ath_round_to(j->act, dot(j, g, xt, j->H)), uv = ath_round_to(j->act, dot(j, u, xt, j->H));
-        j->h[r] = ath_round_to(j->act, ath_q8_silu(gv) * uv);
+        const group *g = &j->gr[r / j->I];
+        const int64_t i = r % j->I;
+        const uint8_t *gw = (const uint8_t *)j->ex->host_tab[g->e] + i * rb;
+        const uint8_t *uw = (const uint8_t *)j->ex->host_tab[E + g->e] + i * rb;
+        for (int64_t m = g->first; m < g->first + g->n; m++) {
+            const float *xt = j->xt + j->it[m].t * j->H;
+            const float gv = ath_round_to(j->act, dot(j, gw, xt, j->H)), uv = ath_round_to(j->act, dot(j, uw, xt, j->H));
+            j->h[m * j->I + i] = ath_round_to(j->act, ath_q8_silu(gv) * uv);
+        }
     }
 }
 
-/* Task t of n, phase 2: rows of every item's down projection. */
+/* Task t of n, phase 2: row o of a group's down projection for each of its items. */
 static void down_task(void *ctx, int32_t t, int32_t n)
 {
     const job *j = ctx;
-    const int64_t rows = j->n_items * j->H, rb = ath_dtype_bytes(ATH_DTYPE_Q8_0_R16, j->I);
+    const int64_t rows = j->n_groups * j->H, rb = ath_dtype_bytes(ATH_DTYPE_Q8_0_R16, j->I);
     const int64_t k = j->y->shape[1];
     for (int64_t r = rows * t / n; r < rows * (t + 1) / n; r++) {
-        const int64_t m = r / j->H, o = r % j->H;
-        const item *it = &j->it[m];
-        const uint8_t *d = (const uint8_t *)j->ex->host_tab[2 * j->ex->n_experts + it->e] + o * rb;
-        st(j->y, (it->t * k + it->c) * j->H + o, dot(j, d, j->ht + m * j->I, j->I));
+        const group *g = &j->gr[r / j->H];
+        const int64_t o = r % j->H;
+        const uint8_t *d = (const uint8_t *)j->ex->host_tab[2 * j->ex->n_experts + g->e] + o * rb;
+        for (int64_t m = g->first; m < g->first + g->n; m++) {
+            const item *it = &j->it[m];
+            st(j->y, (it->t * k + it->c) * j->H + o, dot(j, d, j->ht + m * j->I, j->I));
+        }
     }
+}
+
+static int cmp_item(const void *a, const void *b, void *ctx)
+{
+    (void)ctx;
+    const item *x = a, *y = b;
+    if (x->e != y->e)
+        return x->e < y->e ? -1 : 1;
+    if (x->t != y->t)
+        return x->t < y->t ? -1 : 1;
+    return x->c < y->c ? -1 : (x->c > y->c);
 }
 
 ath_status ath_moe_experts_cpu(const ath_tensor *x, const ath_tensor *ids, const ath_moe_experts *ex, ath_tensor *y,
@@ -235,7 +263,21 @@ ath_status ath_moe_experts_cpu(const ath_tensor *x, const ath_tensor *ids, const
         goto done;
     }
 
-    job j = {.ex = ex, .it = it, .n_items = n, .I = I, .H = H, .act = x->dtype, .y = y, .r16 = true};
+    item tmp_item;
+    ath_sort(it, (size_t)n, sizeof *it, cmp_item, NULL, &tmp_item);
+    group *gr = ath_arena_alloc(a, (size_t)n * sizeof *gr, _Alignof(group));
+    if (!gr) {
+        status = ATH_ERR_NOMEM;
+        goto done;
+    }
+    int64_t ng = 0;
+    for (int64_t m = 0; m < n; m++) {
+        if (ng == 0 || gr[ng - 1].e != it[m].e)
+            gr[ng++] = (group){.e = it[m].e, .first = m, .n = 0};
+        gr[ng - 1].n++;
+    }
+    job j = {.ex = ex, .it = it, .gr = gr, .n_items = n, .n_groups = ng, .I = I, .H = H, .act = x->dtype, .y = y,
+             .r16 = true};
 #ifdef HAVE_X86
     /* ATH_CPU_NO_AVX512 set: the one-lane path, so that the tests compare both */
     j.avx512 = __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("f16c") &&

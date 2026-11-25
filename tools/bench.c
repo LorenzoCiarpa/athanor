@@ -65,6 +65,8 @@ void ath_cmd_bench_usage(FILE *out)
             "  --chunk <n>           prompt tokens per forward call (default 2048)\n"
             "  --device <cpu|gpu>    where the model runs (default: gpu if there is one)\n"
             "  --threads <n>         CPU threads (default: all)\n"
+            "  --experts <n>         MoE: routed experts per layer kept in device memory\n"
+            "                        (default: as many as fit; the rest run on the CPU)\n"
             "  --seed <n>            seed of the token ids (default 1)\n"
             "  --json <file>         write the report there\n"
             "  --direct              decode with one forward call per token and the logits on\n"
@@ -78,6 +80,7 @@ typedef struct {
     int64_t     prompts[MAX_LIST], depths[MAX_LIST];
     int32_t     n_prompts, n_depths;
     int32_t     gen, reps, warmup, chunk, threads;
+    int32_t     experts;    /* MoE: routed experts per layer in device memory; -1 as many as fit */
     uint64_t    seed;
     bool        hash, direct;
 } options;
@@ -456,7 +459,7 @@ static ath_status write_report(const bench *b, const options *o, const result *r
 
 static int parse(int argc, char **argv, options *o)
 {
-    *o = (options){.gen = 128, .reps = 5, .warmup = 1, .chunk = 2048, .seed = 1, .hash = true};
+    *o = (options){.gen = 128, .reps = 5, .warmup = 1, .chunk = 2048, .seed = 1, .hash = true, .experts = -1};
     parse_list("512,4096", false, o->prompts, &o->n_prompts);
     parse_list("0,4096,32768", true, o->depths, &o->n_depths);
     for (int i = 1; i < argc; i++) {
@@ -477,6 +480,8 @@ static int parse(int argc, char **argv, options *o)
             o->chunk = (int32_t)x;
         else if (!strcmp(a, "--threads") && v && parse_int(v, 1, 1024, &x))
             o->threads = (int32_t)x;
+        else if (!strcmp(a, "--experts") && v && parse_int(v, 0, 1 << 20, &x))
+            o->experts = (int32_t)x;
         else if (!strcmp(a, "--seed") && v && parse_int(v, 0, INT64_MAX, &x))
             o->seed = (uint64_t)x;
         else if (!strcmp(a, "--device") && v && (!strcmp(v, "cpu") || !strcmp(v, "gpu")))
@@ -534,7 +539,8 @@ int ath_cmd_bench(ath_arena *a, int argc, char **argv)
             ath_device_close(&probe);
         }
         b.e = ath_arena_zalloc(a, sizeof *b.e, _Alignof(ath_engine));
-        st = b.e ? ath_engine_open(b.e, &b.m, 0, a) : ATH_ERR_NOMEM;
+        const ath_place_opts po = {.slots = o.experts};
+        st = b.e ? ath_engine_open_tier(b.e, &b.m, 0, &po, a) : ATH_ERR_NOMEM;
         if (st == ATH_OK) {
             b.exec = b.e->exec;
             st = ath_engine_state(b.e, &b.st, ATH_DTYPE_BF16, (int32_t)ctx, a);

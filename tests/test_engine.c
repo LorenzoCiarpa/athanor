@@ -333,6 +333,82 @@ ATH_TEST(engine_decoder)
     tiny_close(&t);
 }
 
+/* ---- invariant 7 on Qwen3.6-35B-A3B (step 12) ------------------------------------ */
+
+/* The prompt's logits and those of 12 decoded steps (the decoder: the
+ * first step direct, then a captured graph replayed while the experts move
+ * between steps), with `slots` experts per layer in device memory. */
+static bool moe_run(ath_test *t_, const ath_model *m, int32_t slots, float *logits, int32_t *toks, ath_arena *a)
+{
+    enum { NP = 40, NG = 12 };
+    ath_engine e;
+    const ath_place_opts po = {.slots = slots, .period = 1, .moves = 4};
+    if (ath_engine_open_tier(&e, m, 0, &po, a) != ATH_OK)
+        return false;
+    ath_arena scratch;
+    ath_arena_init(&scratch, 0);
+    int32_t prompt[NP];
+    for (int i = 0; i < NP; i++)
+        prompt[i] = (int32_t)((i * 7919 + 13) % 151000);
+    ath_state s;
+    bool ok = ath_engine_state(&e, &s, ATH_DTYPE_BF16, NP + NG + 1, a) == ATH_OK;
+    ath_tensor l = f32_tensor(logits, NP, m->vocab_size);
+    ok = ok && ath_model_forward(m, &(ath_batch){.tokens = prompt, .n_tokens = NP, .logits = &l}, &s, NULL, &scratch,
+                                 &e.exec) == ATH_OK;
+    static const ath_sampler host_sampled = {0.8f, 0, 1, 0};
+    ath_decoder dc;
+    ok = ok && ath_decoder_open(&dc, &e, &s, &host_sampled, a) == ATH_OK;
+    int32_t tok = 42;
+    for (int i = 0; ok && i < NG; i++) {
+        ok = ath_decoder_step(&dc, tok, 0.25, &tok) == ATH_OK;
+        memcpy(logits + (int64_t)(NP + i) * m->vocab_size, dc.hlogits.data, (size_t)m->vocab_size * sizeof(float));
+        toks[i] = tok;
+    }
+    if (ok)
+        printf("    %3d experts per layer in device memory: %llu moved during the steps\n", e.tier->slots,
+               (unsigned long long)e.tier->moved);
+    ath_decoder_close(&dc);
+    ath_arena_free(&scratch);
+    ath_engine_close(&e);
+    ATH_EXPECT(ok);
+    return ok;
+}
+
+/* The same logits, bit for bit, whatever the number of experts in device
+ * memory: none (every expert on the CPU), some, as many as fit; the slots
+ * change between the decoder's steps. Skipped without the GGUF
+ * (ATH_MOE_DIR, default models/Qwen3.6-35B-A3B). */
+ATH_TEST(engine_moe_placement)
+{
+    GPU_OR_SKIP();
+    const char *dir = getenv("ATH_MOE_DIR") ? getenv("ATH_MOE_DIR") : "models/Qwen3.6-35B-A3B";
+    char p[1024];
+    if (ath_path_join(p, sizeof p, dir, "Qwen3.6-35B-A3B-Q8_0.gguf") != ATH_OK || !ath_file_exists(p))
+        ATH_SKIP("no Qwen3.6-35B-A3B GGUF");
+    ath_arena a;
+    ath_arena_init(&a, 0);
+    ath_model m;
+    ATH_REQUIRE_OK(ath_model_open(&m, &a, dir));
+    const int64_t n = (40 + 12) * (int64_t)m.vocab_size;
+    float *want = ath_arena_alloc(&a, (size_t)n * sizeof(float), 64), *got = ath_arena_alloc(&a, (size_t)n * sizeof(float), 64);
+    ATH_REQUIRE(want && got);
+    int32_t wt[12], gt[12];
+    static const int32_t slots[] = {-1, 0, 24};
+    ATH_REQUIRE(moe_run(t_, &m, slots[0], want, wt, &a));
+    for (size_t i = 1; i < ATH_ARRAY_LEN(slots); i++) {
+        ATH_REQUIRE(moe_run(t_, &m, slots[i], got, gt, &a));
+        int64_t differ = 0;
+        for (int64_t k = 0; k < n; k++)
+            differ += memcmp(&got[k], &want[k], sizeof(float)) != 0;
+        printf("    %d experts per layer against as many as fit: %lld of %lld logits differ\n", slots[i],
+               (long long)differ, (long long)n);
+        ATH_EXPECT(differ == 0);
+        ATH_EXPECT(memcmp(gt, wt, sizeof wt) == 0);
+    }
+    ath_model_close(&m);
+    ath_arena_free(&a);
+}
+
 /* ---- the gate: greedy generation on the real checkpoint ------------------------- */
 
 static const char *golden_dir(void)
@@ -505,6 +581,7 @@ ATH_TEST(generate_golden)
 static const ath_test_case tests[] = {
     ATH_TEST_ENTRY(engine_without_gpu), ATH_TEST_ENTRY(engine_weights), ATH_TEST_ENTRY(engine_state),
     ATH_TEST_ENTRY(engine_pieces),     ATH_TEST_ENTRY(engine_decoder),      ATH_TEST_ENTRY(generate_golden),
+    ATH_TEST_ENTRY(engine_moe_placement),
 };
 
 int main(int argc, char **argv)

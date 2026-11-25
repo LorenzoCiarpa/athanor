@@ -59,6 +59,8 @@ void ath_cmd_chat_usage(FILE *out)
             "  --ctx <n>            context length in tokens (default 8192)\n"
             "  --device <cpu|gpu>   where the model runs (default: gpu if there is one)\n"
             "  --threads <n>        CPU threads (default: all)\n"
+            "  --experts <n>        MoE: routed experts per layer kept in device memory\n"
+            "                       (default: as many as fit; the rest run on the CPU)\n"
             "  --f32                f32 activations instead of bf16 (slower)\n"
             "  --stats              print prompt and decode speed after each answer (stderr)\n");
 }
@@ -71,6 +73,7 @@ typedef struct {
     uint64_t     seed;
     bool         seed_set;
     int32_t      max_tokens, ctx, threads;
+    int32_t      experts;     /* routed experts per layer in device memory, -1: as many as fit */
 } options;
 
 /* ---- the conversation ------------------------------------------------------------ */
@@ -398,7 +401,7 @@ static bool num(const char *s, double lo, double hi, double *out)
 
 static int parse_options(options *o, int argc, char **argv)
 {
-    *o = (options){.max_tokens = 2048, .ctx = 8192, .sampler = {0.7f, 20, 0.8f, 0}};
+    *o = (options){.max_tokens = 2048, .ctx = 8192, .sampler = {0.7f, 20, 0.8f, 0}, .experts = -1};
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         const char *v = i + 1 < argc ? argv[i + 1] : NULL;
@@ -423,6 +426,7 @@ static int parse_options(options *o, int argc, char **argv)
         else if (!strcmp(a, "--max-tokens") && num(v, 1, 1e9, &x)) o->max_tokens = (int32_t)x;
         else if (!strcmp(a, "--ctx") && num(v, 16, 1 << 24, &x)) o->ctx = (int32_t)x;
         else if (!strcmp(a, "--threads") && num(v, 1, 4096, &x)) o->threads = (int32_t)x;
+        else if (!strcmp(a, "--experts") && num(v, 0, 1e6, &x)) o->experts = (int32_t)x;
         else if (!strcmp(a, "--device") && (!strcmp(v, "cpu") || !strcmp(v, "gpu"))) o->device = v;
         else if (a[0] == '-')
             return usage_error("bad option or value:", a);
@@ -530,7 +534,8 @@ int ath_cmd_chat(ath_arena *a, int argc, char **argv)
     bool gpu = o.device ? !strcmp(o.device, "gpu") : ath_gpu_count() > 0;
     if (st == ATH_OK && gpu) {
         s->engine = ath_arena_zalloc(a, sizeof *s->engine, _Alignof(ath_engine));
-        st = s->engine ? ath_engine_open(s->engine, &s->m, 0, a) : ATH_ERR_NOMEM;
+        const ath_place_opts po = {.slots = s->opt->experts};
+        st = s->engine ? ath_engine_open_tier(s->engine, &s->m, 0, &po, a) : ATH_ERR_NOMEM;
         if (st != ATH_OK) {
             fprintf(stderr, "athanor chat: no GPU (%s)%s\n", ath_status_str(st),
                     o.device ? "" : "; running on the CPU (--device cpu)");
