@@ -65,6 +65,8 @@ typedef struct {
     uint64_t         n_ids;          /* ids handed out, for unique ids                   */
     int64_t          started;        /* the server's start time, seconds                 */
     FILE            *log;            /* a line per request; NULL: none                   */
+    const char      *dump;           /* a folder where each request body is saved; NULL  */
+    uint64_t         n_req;
 } ath_api;
 
 void ath_api_init(ath_api *api, ath_gen *gen, const ath_api_defaults *d);

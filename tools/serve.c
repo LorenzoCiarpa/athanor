@@ -46,6 +46,7 @@ void ath_cmd_serve_usage(FILE *out)
             "                       top-k 20; otherwise 0.7, 0.8, 20)\n"
             "  --chunk <n>          prompt tokens per forward call (default 4096)\n"
             "  --seed <n>           random seed (default: from the clock)\n"
+            "  --dump <dir>         save every request body in dir (for debugging a client)\n"
             "  --quiet              no line per request on stderr\n");
 }
 
@@ -76,7 +77,7 @@ static int usage_error(const char *msg, const char *arg)
 
 int ath_cmd_serve(ath_arena *a, int argc, char **argv)
 {
-    const char *dir = NULL, *host = "127.0.0.1", *name = NULL, *device = NULL;
+    const char *dir = NULL, *host = "127.0.0.1", *name = NULL, *device = NULL, *dump = NULL;
     int port = 8080;
     bool think = true, quiet = false, server_sampling = false, seed_set = false;
     ath_gen_opts go = {.ctx = 65536, .experts = -1};
@@ -97,6 +98,7 @@ int ath_cmd_serve(ath_arena *a, int argc, char **argv)
         if (!strcmp(o, "--host")) host = v;
         else if (!strcmp(o, "--port") && num(v, 0, 65535, &x)) port = (int)x;
         else if (!strcmp(o, "--name")) name = v;
+        else if (!strcmp(o, "--dump")) dump = v;
         else if (!strcmp(o, "--ctx") && num(v, 64, 1 << 24, &x)) go.ctx = (int32_t)x;
         else if (!strcmp(o, "--experts") && num(v, 0, 1e6, &x)) go.experts = (int32_t)x;
         else if (!strcmp(o, "--threads") && num(v, 1, 4096, &x)) go.threads = (int32_t)x;
@@ -162,6 +164,7 @@ int ath_cmd_serve(ath_arena *a, int argc, char **argv)
     ath_api api;
     ath_api_init(&api, g, &d);
     api.log = quiet ? NULL : stderr;
+    api.dump = dump;
 
     struct sigaction sa = {.sa_handler = on_signal};
     sigemptyset(&sa.sa_mask);

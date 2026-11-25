@@ -278,8 +278,13 @@ static ath_status parse_anthropic(const ath_api *api, const ath_json *body, ath_
     if (sys && sys->type == ATH_JSON_STRING)
         add_system(b, sys->u.str.ptr);
     else if (sys && sys->type == ATH_JSON_ARRAY)
-        for (const ath_json *s = ath_json_first(sys); s; s = s->next)
-            add_system(b, content_text(s->type == ATH_JSON_STRING ? s : ath_json_get(s, "text"), a));
+        for (const ath_json *s = ath_json_first(sys); s; s = s->next) {
+            const char *t = content_text(s->type == ATH_JSON_STRING ? s : ath_json_get(s, "text"), a);
+            /* Claude Code's billing line is for Anthropic's API, which takes it
+             * out of the prompt; so does this server */
+            if (strncmp(t, "x-anthropic-billing-header:", 27) != 0)
+                add_system(b, t);
+        }
 
     const ath_json *msgs = ath_json_get(body, "messages");
     if (!msgs || msgs->type != ATH_JSON_ARRAY)
@@ -334,8 +339,13 @@ static ath_status parse_anthropic(const ath_api *api, const ath_json *body, ath_
             }
             b->v[i].content = ath_buf_str(&text);
             b->v[i].reasoning = think.len ? ath_buf_str(&think) : NULL;
+        } else if (is(role, "system")) {
+            /* a system message in the conversation (Claude Code sends the
+             * environment so): a user message where it stands, since the
+             * chat template takes a system message only at the start */
+            add_system(b, content_text(c, a));
         } else {
-            return *err = "messages: each role must be user or assistant", ATH_ERR_INVALID_ARG;
+            return *err = "messages: each role must be user, assistant or system", ATH_ERR_INVALID_ARG;
         }
     }
 
@@ -1282,6 +1292,9 @@ static void serve_generate(ath_api *api, ath_api_kind kind, const ath_http_req *
     const char *err;
     if (ath_api_parse(api, kind, body, &r, out->a, &err) != ATH_OK) {
         reply_error(out, kind, 400, "invalid_request_error", NULL, err);
+        if (api->log)
+            fprintf(api->log, "serve: %s: request %llu refused: %s\n", kind_name[kind], (unsigned long long)api->n_req,
+                    err);
         return;
     }
     writer w = {.api = api, .r = &r, .out = out, .a = out->a, .created = (int64_t)time(NULL)};
@@ -1379,9 +1392,29 @@ static void model_json(const ath_api *api, ath_buf *b)
     ath_buf_printf(b, ", \"created_at\": \"%s\", \"max_model_len\": %d}", date, api->gen->ctx);
 }
 
+/* The body of a request into the dump folder: <n>-<path>.json. */
+static void dump(ath_api *api, const ath_http_req *req)
+{
+    char name[1024], flat[64];
+    size_t k = 0;
+    for (const char *c = req->path; *c && k + 1 < sizeof flat; c++)
+        flat[k++] = (*c == '/' ? '_' : *c);
+    flat[k] = '\0';
+    snprintf(name, sizeof name, "%s/%04llu-%s%s.json", api->dump, (unsigned long long)api->n_req, req->method, flat);
+    FILE *f = fopen(name, "wb");
+    if (!f)
+        return;
+    if (req->body_len)
+        fwrite(req->body, 1, req->body_len, f);
+    fclose(f);
+}
+
 void ath_api_handle(void *ctx, const ath_http_req *req, ath_http_out *out)
 {
     ath_api *api = ctx;
+    api->n_req++;
+    if (api->dump)
+        dump(api, req);
     const char *p = req->path;
     if (!strncmp(p, "/v1/", 4))
         p += 3;
