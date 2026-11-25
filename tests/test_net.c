@@ -765,6 +765,70 @@ ATH_TEST(serve_real_model)
     ath_arena_free(&a);
 }
 
+/* ---- the draft head in the server: the same answers ---------------------------------- */
+
+typedef struct {
+    ath_buf text;
+} collect;
+
+static bool c_text(void *u, const char *s, size_t n) { return ath_buf_append(&((collect *)u)->text, s, n) == ATH_OK; }
+static bool c_think(void *u, const char *s, size_t n) { (void)u, (void)s, (void)n; return true; }
+static bool c_begin(void *u, const char *name) { return ath_buf_printf(&((collect *)u)->text, "<call %s>", name) == ATH_OK; }
+static bool c_end(void *u) { return ath_buf_puts(&((collect *)u)->text, "</call>") == ATH_OK; }
+
+/* Greedy answers to a few conversations, the second extending the first. */
+static bool answers(ath_test *t_, bool mtp, const char **out, int n, ath_arena *a)
+{
+    static ath_gen g;
+    const ath_gen_opts go = {.ctx = 1024, .experts = -1, .seed = 1, .mtp = mtp};
+    if (ath_gen_open(&g, model_dir(), &go, a) != ATH_OK) {
+        ATH_EXPECT(!"gen opens");
+        return false;
+    }
+    ATH_EXPECT(g.mtp == mtp);
+    const ath_msg m1[] = {{.role = ATH_MSG_USER, .content = "Write three sentences about the sea."}};
+    const ath_msg m2[] = {{.role = ATH_MSG_USER, .content = "Write three sentences about the sea."},
+                          {.role = ATH_MSG_ASSISTANT, .content = "The sea is wide."},
+                          {.role = ATH_MSG_USER, .content = "Now three about mountains, with a list."}};
+    const ath_msg *convs[] = {m1, m2, m1};
+    const int32_t lens[] = {1, 3, 1};
+    bool ok = true;
+    for (int i = 0; i < n && ok; i++) {
+        collect c;
+        ath_buf_init(&c.text, a);
+        const ath_gen_sink sink = {.text = c_text, .thinking = c_think, .tool_begin = c_begin, .tool_args = c_text,
+                                   .tool_end = c_end, .u = &c};
+        ath_gen_request r = {.msgs = convs[i], .n_msgs = lens[i], .sampler = {0, 0, 1, 0, i == 2 ? 1.5f : 0},
+                             .max_tokens = 60};
+        ath_gen_result res;
+        ok = ath_gen_run(&g, &r, &sink, &res, a) == ATH_OK;
+        out[i] = ath_buf_str(&c.text);
+    }
+    if (mtp)
+        printf("    with the draft head: %llu passes, %llu guesses kept\n", (unsigned long long)g.spec.passes,
+               (unsigned long long)g.spec.accepted);
+    ath_gen_close(&g);
+    ATH_EXPECT(ok);
+    return ok;
+}
+
+ATH_TEST(serve_mtp_same_answers)
+{
+    char cfg[1024];
+    if (!model_file(cfg, sizeof cfg, "config.json"))
+        ATH_SKIP("no checkpoint (ATH_MODEL_DIR)");
+    ath_arena a;
+    ath_arena_init(&a, 0);
+    const char *plain[3], *spec[3];
+    if (answers(t_, false, plain, 3, &a) && answers(t_, true, spec, 3, &a))
+        for (int i = 0; i < 3; i++) {
+            ATH_EXPECT_STR_EQ(spec[i], plain[i]);
+            if (i == 0)
+                printf("    answer: %.70s\n", plain[i]);
+        }
+    ath_arena_free(&a);
+}
+
 static const ath_test_case tests[] = {
     ATH_TEST_ENTRY(http_parse_whole_and_pipelined),
     ATH_TEST_ENTRY(http_parse_split),
@@ -776,6 +840,7 @@ static const ath_test_case tests[] = {
     ATH_TEST_ENTRY(api_responses_request),
     ATH_TEST_ENTRY(http_loopback),
     ATH_TEST_ENTRY(serve_real_model),
+    ATH_TEST_ENTRY(serve_mtp_same_answers),
 };
 
 int main(int argc, char **argv)

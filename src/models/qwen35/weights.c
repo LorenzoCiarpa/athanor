@@ -4,9 +4,11 @@
  * family knows which tensors must exist and what shape each one has, finds
  * them by name, and fails on the first one that is missing, has a non-float
  * dtype or has a shape that does not follow from config.json. The tensors
- * of the two ignored groups (vision encoder, MTP head: the prefixes the
- * reference text model drops) are bound too, each as one param flagged
- * ATH_P_UNUSED, after all the others. Any other tensor is caught afterwards
+ * of the ignored groups (vision encoder; the MTP head when the config has
+ * none: the prefixes the reference text model drops) are bound too, each as
+ * one param flagged ATH_P_UNUSED, after all the others. The MTP head, when
+ * there, is the draft head of step 13: its params come after the main ones,
+ * flagged ATH_P_DRAFT. Any other tensor is caught afterwards
  * by the registry's coverage check.
  *
  * Roles and flags per tensor: docs/contract/qwen35-0.8b.md (Parameter
@@ -49,6 +51,7 @@ typedef struct {
     const ath_qwen35_config *c;
     uint32_t                 cap;   /* capacity of m->params */
     bool                     gguf;  /* GGUF names (step 12)  */
+    bool                     draft; /* binding the draft head: ATH_P_DRAFT (step 13) */
 } binder;
 
 /* The name in the scheme of the checkpoint: Hugging Face's or GGUF's. */
@@ -72,7 +75,9 @@ static void fmt_shape(char *out, size_t cap, int32_t ndim, const int64_t *d)
 static ath_status tensor_name(char *out, size_t cap, const binder *b, int32_t layer, const char *suffix)
 {
     int n;
-    if (b->gguf)
+    if (!b->gguf && layer >= b->c->n_layers)   /* the draft head's layers: mtp.layers.<i>. */
+        n = snprintf(out, cap, "mtp.layers.%d.%s", layer - b->c->n_layers, suffix);
+    else if (b->gguf)
         n = layer >= 0 ? snprintf(out, cap, "blk.%d.%s", layer, suffix) : snprintf(out, cap, "%s", suffix);
     else
         n = layer >= 0 ? snprintf(out, cap, "%slayers.%d.%s", b->c->prefix, layer, suffix)
@@ -127,7 +132,8 @@ static const ath_param *add(binder *b, const ath_tensor *t, const char *name, at
     ATH_ASSERT(b->m->n_params < b->cap);
     ath_param *p = &b->m->params[b->m->n_params++];
     *p = (ath_param){
-        .t = *t, .role = role, .layer = layer, .expert = expert, .flags = flags, .name = name,
+        .t = *t, .role = role, .layer = layer, .expert = expert, .flags = flags | (b->draft ? ATH_P_DRAFT : 0),
+        .name = name,
     };
     return p;
 }
@@ -316,6 +322,67 @@ static ath_status bind_moe(binder *b, int32_t l, ath_qwen35_layer *L, ath_arena 
     return bind(b, l, "mlp.shared_expert_gate.weight", S2(1, h), ATH_ROLE_GATE, SHARED | SENS, &L->sh_gate_w);
 }
 
+/* ---- the draft head (multi-token prediction, step 13) ------------------------------ */
+
+/* Hugging Face: mtp.fc, mtp.pre_fc_norm_embedding, mtp.pre_fc_norm_hidden,
+ * mtp.norm and mtp.layers.<i>.*; GGUF: blk.<n_layers>.nextn.eh_proj, .enorm,
+ * .hnorm, .shared_head_norm and the layers' tensors under blk.<n_layers + i>
+ * (llama.cpp's converter stores these norms as 1 + w too: checked on the
+ * values of Qwen3.5-0.8B's two files). */
+static const char *draft_name(const binder *b, char *buf, size_t cap, const char *hf, const char *gg)
+{
+    if (b->gguf)
+        snprintf(buf, cap, "blk.%d.nextn.%s", b->c->n_layers, gg);
+    else
+        snprintf(buf, cap, "mtp.%s", hf);
+    return buf;
+}
+
+static bool has_draft(const binder *b)
+{
+    char name[96];
+    return b->c->n_draft > 0 &&
+           ath_ckpt_find(&b->m->ckpt, draft_name(b, name, sizeof name, "fc.weight", "eh_proj.weight"));
+}
+
+static ath_status bind_named(binder *b, const char *name, shape want, ath_role role, int32_t layer, slot out)
+{
+    const ath_ckpt_tensor *e;
+    ATH_CHECK(find(b, name, want, role, &e));
+    *out = add(b, &e->t, e->name, role, layer, -1, 0);
+    return ATH_OK;
+}
+
+static ath_status bind_draft(binder *b, ath_qwen35_model *q, ath_arena *a)
+{
+    const ath_qwen35_config *c = b->c;
+    const int64_t h = c->hidden;
+    const int32_t l0 = c->n_layers;
+    char name[96];
+    b->draft = true;
+    ATH_CHECK(bind_named(b, draft_name(b, name, sizeof name, "fc.weight", "eh_proj.weight"), S2(h, 2 * h),
+                         ATH_ROLE_MIX_IN, l0, &q->d_fc));
+    ATH_CHECK(bind_named(b, draft_name(b, name, sizeof name, "pre_fc_norm_embedding.weight", "enorm.weight"), S1(h),
+                         ATH_ROLE_NORM, l0, &q->d_enorm));
+    ATH_CHECK(bind_named(b, draft_name(b, name, sizeof name, "pre_fc_norm_hidden.weight", "hnorm.weight"), S1(h),
+                         ATH_ROLE_NORM, l0, &q->d_hnorm));
+    for (int32_t i = 0; i < c->n_draft; i++) {
+        const int32_t l = l0 + i;
+        ath_qwen35_layer *L = &q->draft[i];
+        ATH_CHECK(bind(b, l, NM(b, "input_layernorm.weight", "attn_norm.weight"), S1(h), ATH_ROLE_NORM, 0,
+                       &L->input_norm));
+        ATH_CHECK(bind_attention(b, l, L));
+        ATH_CHECK(bind(b, l, NM(b, "post_attention_layernorm.weight", "post_attention_norm.weight"), S1(h),
+                       ATH_ROLE_NORM, 0, &L->post_norm));
+        ATH_CHECK(c->moe ? bind_moe(b, l, L, a) : bind_mlp(b, l, L));
+    }
+    ATH_CHECK(bind_named(b, draft_name(b, name, sizeof name, "norm.weight", "shared_head_norm.weight"), S1(h),
+                         ATH_ROLE_NORM, l0, &q->d_norm));
+    b->draft = false;
+    q->n_draft = c->n_draft;
+    return ATH_OK;
+}
+
 /* ---- entry point -------------------------------------------------------------- */
 
 static const ath_ignored ignored_groups[] = {
@@ -392,11 +459,17 @@ ath_status ath_qwen35_bind(ath_model *m, ath_arena *a, ath_qwen35_model *q)
     if (q->gguf)
         ATH_CHECK(check_gguf(&m->ckpt.gguf, c));
 
-    /* the ignored groups: the static table, or for GGUF the MTP block */
+    binder b = {m, c, 0, q->gguf, false};
+    const bool draft = has_draft(&b);
+
+    /* the ignored groups: the static table, or for GGUF the MTP block; the
+     * MTP head is bound when the checkpoint has it (step 13) */
     const ath_ignored *groups = ignored_groups;
-    size_t n_groups = ATH_ARRAY_LEN(ignored_groups);
+    size_t n_groups = draft ? 1 : ATH_ARRAY_LEN(ignored_groups);   /* the vision encoder only */
     ath_ignored gguf_group;
-    if (q->gguf) {
+    if (q->gguf && draft) {
+        n_groups = 0;
+    } else if (q->gguf) {
         char prefix[32];
         snprintf(prefix, sizeof prefix, "blk.%d.", c->n_layers);
         gguf_group = (ath_ignored){.prefix = ath_arena_strndup(a, prefix, strlen(prefix)), .reason = MTP_REASON};
@@ -411,19 +484,21 @@ ath_status ath_qwen35_bind(ath_model *m, ath_arena *a, ath_qwen35_model *q)
      * param per tensor of the ignored groups. */
     uint64_t per_layer = 2 + 9 + (c->moe ? 5 + 3 * (uint64_t)c->n_experts : 3);
     uint64_t cap = 3 + (uint64_t)c->n_layers * per_layer;
+    if (draft)
+        cap += 4 + (uint64_t)c->n_draft * per_layer;
     for (size_t g = 0; g < n_groups; g++)
         cap += count_prefix(&m->ckpt, groups[g].prefix);
     if (cap > UINT32_MAX)
         return ATH_ERR_RANGE;
     m->params = ath_arena_alloc(a, (size_t)cap * sizeof *m->params, _Alignof(ath_param));
-    m->ignored = ath_arena_alloc(a, n_groups * sizeof *m->ignored, _Alignof(ath_ignored));
+    m->ignored = ath_arena_alloc(a, (n_groups ? n_groups : 1) * sizeof *m->ignored, _Alignof(ath_ignored));
     if (!m->params || !m->ignored)
         return ATH_ERR_NOMEM;
-    memcpy(m->ignored, groups, n_groups * sizeof *groups);
+    if (n_groups)
+        memcpy(m->ignored, groups, n_groups * sizeof *groups);
     m->n_ignored = (uint32_t)n_groups;
     m->n_params = 0;
-
-    binder b = {m, c, (uint32_t)cap, q->gguf};
+    b.cap = (uint32_t)cap;
     const int64_t h = c->hidden, v = c->vocab;
 
     /* With tied embeddings the table is also the output projection, which
@@ -459,6 +534,8 @@ ath_status ath_qwen35_bind(ath_model *m, ath_arena *a, ath_qwen35_model *q)
         q->head = add(&b, &e->t, e->name, ATH_ROLE_LM_HEAD, -1, -1, SENS);
     }
 
+    if (draft)
+        ATH_CHECK(bind_draft(&b, q, a));
     for (size_t g = 0; g < n_groups; g++)
         bind_unused(&b, groups[g].prefix);
     return ATH_OK;

@@ -122,7 +122,7 @@ The 36 f32 tensors of the checkpoint are exactly `A_log` and `linear_attn.norm.w
 | `layers.0.*` | bf16 | same 11 tensors and shapes as a full-attention layer | 36,705,280 |
 | `norm.weight` | bf16 | [1024] | 2,048 |
 
-`mtp_num_hidden_layers` is 1 and `mtp_use_dedicated_embeddings` is `false`.
+`mtp_num_hidden_layers` is 1 and `mtp_use_dedicated_embeddings` is `false`: the head uses the main model's embedding and output head. Since step 13 it is athanor's draft head (op contract below).
 
 ### Vision encoder (`model.visual.`, out of scope)
 
@@ -252,9 +252,24 @@ athanor's forward pass (`src/models/qwen35/forward.c`) composes the ops above in
 
 The chat prompt's first position (`<|im_start|>`) is ill-conditioned. In layer 15 (full attention) the attention output nearly cancels the residual stream (RMS 0.53 and 0.27 give a sum of RMS 0.13), so the relative error of one bf16 rounding at the layer input becomes about 10% at its output, and the KL at that position depends on which way the roundings fall. The reference itself goes from a KL of 2.7e-4 there to 5.5e-3 when `A_log` and `linear_attn.norm.weight` are rounded to bf16 as transformers does by default; athanor's is 7.3e-3. Without that position, athanor's mean KL on chat is 4.1e-4 against the reference's 4.5e-4.
 
-### MTP head
+### MTP head: the draft head (step 13)
 
-transformers 5.24.0 has no implementation of the MTP head: both `Qwen3_5ForConditionalGeneration` and `Qwen3_5ForCausalLM` drop `mtp.*` on load (`_keys_to_ignore_on_load_unexpected`). The MTP **verify** item stays open until step 13, which must pin another reference (an inference engine that implements MTP speculative decoding).
+transformers 5.24.0 has no implementation of the MTP head: both `Qwen3_5ForConditionalGeneration` and `Qwen3_5ForCausalLM` drop `mtp.*` on load (`_keys_to_ignore_on_load_unexpected`). The reference is vLLM 0.34.0 (`model_executor/models/qwen3_5_mtp.py`, `Qwen3_5MultiTokenPredictor`; the target's hidden states from `qwen3_next.py`, `Qwen3NextModel.forward`, and `v1/worker/gpu/spec_decode/utils.py`, `get_drafter_hidden_states`).
+
+For position p of the main model, with t the token after it and h the main model's output there **after the final norm** (the input of `lm_head`, which vLLM hands to the drafter):
+
+```
+e = rmsnorm(embed(t), pre_fc_norm_embedding)          zero-centered, as every norm here
+g = rmsnorm(h, pre_fc_norm_hidden)
+x = fc([e; g])                                         fc.weight [hidden, 2 hidden]: e first
+x = decoder_layer(x)                                   a full-attention layer with its MLP (MoE on MoE
+                                                       models), its own KV cache, RoPE at position p
+logits = rmsnorm(x, norm) · lm_headᵀ                   the guess at the token after t
+```
+
+The head's cache holds one row per position of the sequence: athanor runs it over every prompt position (with the next prompt token) and over every position decoding keeps, as vLLM's drafter does. In athanor: `ath_model_draft` (model.h), `ath_qwen35_draft` (forward.c); the state adds the head's KV cache (`ATH_STATE_KV`, layer 24) and its input waiting for the next token (`ATH_STATE_HIDDEN`, `hidden_size` elements).
+
+The guess never decides a token, only how many tokens a pass keeps (`src/infer/spec.h`), so its arithmetic follows the main layers' code without a tolerance of its own. **Verified** by its effect: on a coding prompt, greedy, the main model's next token equals the guess at 86% of the passes (Qwen3.6-35B-A3B: 98%; on a story 58% and 75%); and speculative decoding gives plain decoding's tokens, bit for bit (`tests/test_spec.c`).
 
 ## Tokenizer (step 5)
 
@@ -340,4 +355,4 @@ Step 2 binds every language-model tensor to an `ath_param` (`src/model/model.h`)
 | `mlp.gate_proj.weight`, `mlp.up_proj.weight` | mlp_in | |
 | `mlp.down_proj.weight` | mlp_out | residual |
 
-The other 168 tensors are in two declared ignored groups, exactly the prefixes the reference text model drops: `model.visual.` (153 tensors, vision encoder, text path only) and `mtp.` (15 tensors, MTP head, step 13). Since CHANGE-001 (2026-11-24) each of them is bound as a whole-tensor param flagged `unused` (`ATH_P_UNUSED`, role other, layer −1, after all the other params), so `inspect --roles` lists them and reports their count and size, and an export can carry them; before, they were left unbound. Any other tensor, a missing tensor, or a shape that does not follow from `config.json` makes loading fail. MoE checkpoints add the roles router, expert_in and expert_out: see `docs/contract/qwen35-35b-a3b.md`.
+The MTP head's 15 tensors are the draft head since step 13: flagged `draft` (`ATH_P_DRAFT`), after the main params, `fc` as mix_in, the norms as norm, `layers.0.*` with the roles of a full-attention layer, every one with layer 24 (the head's layer after the 24 main ones; `m->n_draft_layers` is 1). The other 153 tensors are the declared ignored group the reference text model drops: `model.visual.` (vision encoder, text path only); before step 13 `mtp.` was one too. Since CHANGE-001 (2026-11-24) each of them is bound as a whole-tensor param flagged `unused` (`ATH_P_UNUSED`, role other, layer −1, after all the other params), so `inspect --roles` lists them and reports their count and size, and an export can carry them; before, they were left unbound. Any other tensor, a missing tensor, or a shape that does not follow from `config.json` makes loading fail. MoE checkpoints add the roles router, expert_in and expert_out: see `docs/contract/qwen35-35b-a3b.md`.

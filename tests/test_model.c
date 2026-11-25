@@ -31,19 +31,21 @@ static ath_status parse_config(ath_arena *a, const tiny *c, ath_qwen35_config *o
 
 /* Params of role r that the text path uses (ATH_P_UNUSED ones are counted
  * with count_flag). */
+/* Params of the main path (not unused, not the draft head) with role r. */
 static uint32_t count_role(const ath_model *m, ath_role r)
 {
     uint32_t n = 0;
     for (uint32_t i = 0; i < m->n_params; i++)
-        n += m->params[i].role == r && !(m->params[i].flags & ATH_P_UNUSED);
+        n += m->params[i].role == r && !(m->params[i].flags & (ATH_P_UNUSED | ATH_P_DRAFT));
     return n;
 }
 
+/* Params with flag; the draft head's only when flag is ATH_P_DRAFT. */
 static uint32_t count_flag(const ath_model *m, uint32_t flag)
 {
     uint32_t n = 0;
     for (uint32_t i = 0; i < m->n_params; i++)
-        n += (m->params[i].flags & flag) != 0;
+        n += (m->params[i].flags & flag) != 0 && (flag == ATH_P_DRAFT || !(m->params[i].flags & ATH_P_DRAFT));
     return n;
 }
 
@@ -474,8 +476,17 @@ ATH_TEST(qwen35_real_model)
     if (m.n_experts == 0)
         ATH_EXPECT_EQ_INT(count_flag(&m, ATH_P_WRITES_RESIDUAL), 1 + 2 * m.n_layers);
     for (uint32_t i = 0; i < m.n_params; i++) {
-        ATH_EXPECT(m.params[i].layer >= -1 && m.params[i].layer < m.n_layers);
+        const bool draft = m.params[i].flags & ATH_P_DRAFT;
+        ATH_EXPECT(draft ? m.params[i].layer >= m.n_layers && m.params[i].layer < m.n_layers + m.n_draft_layers
+                         : m.params[i].layer >= -1 && m.params[i].layer < m.n_layers);
         ATH_EXPECT(m.params[i].t.data != NULL);
+    }
+    /* the MTP head, as the draft head (step 13): fc, three norms, and one
+     * full-attention layer (2 norms, 6 attention params, 3 MLP params) */
+    if (m.n_draft_layers) {
+        ATH_EXPECT_EQ_INT(m.n_draft_layers, 1);
+        ATH_EXPECT_EQ_INT(count_flag(&m, ATH_P_DRAFT), m.n_experts ? 4 + 8 + 5 + 3 * m.n_experts : 4 + 11);
+        ATH_EXPECT_STR_EQ(m.layers[m.n_layers].mixer, "attention");
     }
     ath_model_close(&m);
     ath_arena_free(&a);
@@ -485,7 +496,8 @@ ATH_TEST(qwen35_real_model)
 
 /* Qwen3.6-35B-A3B from its Q8_0 GGUF (step 12), when the file is there
  * (ATH_MOE_DIR, default models/Qwen3.6-35B-A3B): every tensor bound, the
- * per-expert views of the fused GGUF tensors, the MTP block ignored. */
+ * per-expert views of the fused GGUF tensors, the MTP block as the draft
+ * head (step 13). */
 ATH_TEST(qwen36_gguf_binds)
 {
     const char *dir = getenv("ATH_MOE_DIR") ? getenv("ATH_MOE_DIR") : "models/Qwen3.6-35B-A3B";
@@ -503,9 +515,13 @@ ATH_TEST(qwen36_gguf_binds)
     ATH_EXPECT_EQ_INT(count_role(&m, ATH_ROLE_EXPERT_IN), 40 * 2 * 256);
     ATH_EXPECT_EQ_INT(count_role(&m, ATH_ROLE_EXPERT_OUT), 40 * 256);
     ATH_EXPECT_EQ_INT(count_role(&m, ATH_ROLE_ROUTER), 40);
-    ATH_EXPECT_EQ_INT(count_flag(&m, ATH_P_UNUSED), 20);
-    ATH_REQUIRE(m.n_ignored == 1);
-    ATH_EXPECT_STR_EQ(m.ignored[0].prefix, "blk.40.");
+    ATH_EXPECT_EQ_INT(count_flag(&m, ATH_P_UNUSED), 0);
+    ATH_EXPECT_EQ_INT(m.n_ignored, 0);
+    ATH_EXPECT_EQ_INT(m.n_draft_layers, 1);
+    /* blk.40: eh_proj, enorm, hnorm, shared_head_norm; attention; MoE */
+    ATH_EXPECT_EQ_INT(count_flag(&m, ATH_P_DRAFT), 4 + 8 + 5 + 3 * 256);
+    const ath_param *fc = find_param(&m, "blk.40.nextn.eh_proj.weight", -1);
+    ATH_EXPECT(fc && fc->t.shape[0] == 2048 && fc->t.shape[1] == 4096 && (fc->flags & ATH_P_DRAFT));
     const ath_param *e = find_param(&m, "blk.7.ffn_down_exps.weight", 255);
     ATH_REQUIRE(e);
     ATH_EXPECT(e->t.dtype == ATH_DTYPE_Q8_0 && e->t.shape[0] == 2048 && e->t.shape[1] == 512);

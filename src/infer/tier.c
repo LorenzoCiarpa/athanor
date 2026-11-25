@@ -77,7 +77,7 @@ ath_status ath_place_open(ath_placement *t, const ath_model *m, const ath_device
         t->o.period = 4;
     if (!t->o.moves)
         t->o.moves = 2;
-    t->n_layers = m->n_layers;
+    t->n_layers = m->n_layers + (t->o.draft ? m->n_draft_layers : 0);
     t->n_experts = m->n_experts;
     const int64_t E = t->n_experts, L = t->n_layers;
 
@@ -92,6 +92,8 @@ ath_status ath_place_open(ath_placement *t, const ath_model *m, const ath_device
         const ath_param *q = &m->params[i];
         if (q->role != ATH_ROLE_EXPERT_IN && q->role != ATH_ROLE_EXPERT_OUT)
             continue;
+        if ((q->flags & ATH_P_DRAFT) && !t->o.draft)
+            continue;   /* the draft head stays out unless asked for */
         if (q->layer < 0 || q->layer >= L || q->expert < 0 || q->expert >= E || q->t.ndim != 2) {
             ath_log(ATH_LOG_ERROR, "tier: expert param %s has no layer or expert", q->name);
             return ATH_ERR_INVALID_ARG;

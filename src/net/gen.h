@@ -21,6 +21,7 @@
 
 #include "core/rng.h"
 #include "infer/engine.h"
+#include "infer/spec.h"
 #include "model/model.h"
 #include "text/bpe.h"
 
@@ -77,6 +78,7 @@ typedef struct {
     int32_t chunk;           /* prompt tokens per forward call, 0: 4096            */
     uint64_t seed;           /* of the sampling                                    */
     bool    cpu;             /* run on the CPU even with a GPU                     */
+    bool    mtp;             /* decode speculatively with the draft head (step 13) */
 } ath_gen_opts;
 
 typedef struct {
@@ -98,6 +100,8 @@ typedef struct {
     ath_arena       scratch;
     ath_rng         rng;
     int32_t         eos[2];
+    ath_spec        spec;            /* with mtp: the speculative decoder               */
+    bool            mtp;
     int32_t         ctx;
     int32_t         chunk;
     ath_arena      *a;

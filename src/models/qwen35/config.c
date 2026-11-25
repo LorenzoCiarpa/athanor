@@ -291,5 +291,8 @@ ath_status ath_qwen35_config_parse(ath_qwen35_config *c, ath_arena *a, const ath
 
     ATH_CHECK(parse_ffn(c, &k));
     ATH_CHECK(parse_tie(c, config, &k));
+    /* the multi-token prediction head (step 13): optional, absent in older configs */
+    if (get(&k, "mtp_num_hidden_layers", false))
+        ATH_CHECK(get_int(&k, "mtp_num_hidden_layers", 0, &c->n_draft));
     return parse_schedule(c, a, &k);
 }

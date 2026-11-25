@@ -46,7 +46,7 @@ Verified against the converter's source (`conversion/qwen.py`, `conversion/base.
 | `blk.N.ffn_down_exps.weight` [E, H, I] | `mlp.experts.down_proj` | Q8_0 | per expert a [H, I] view |
 | `blk.N.ffn_gate_shexp`, `ffn_up_shexp` [Is, H], `ffn_down_shexp` [H, Is] | `mlp.shared_expert.*` | Q8_0 | as before |
 | `blk.N.ffn_gate_inp_shexp.weight` [H] | `mlp.shared_expert_gate.weight` [1, H] | squeezed; F32 | bound as a [1, H] view |
-| `blk.40.*` (20 tensors, `nextn.*` among them) | `mtp.*` | the MTP head as one more block | an ignored group (`blk.40.`), bound as `unused` params until step 13 |
+| `blk.40.*` (20 tensors, `nextn.*` among them) | `mtp.*` | the MTP head as one more block: `nextn.eh_proj` = `fc`, `nextn.enorm` = `pre_fc_norm_embedding`, `nextn.hnorm` = `pre_fc_norm_hidden`, `nextn.shared_head_norm` = `norm`, the layer's tensors under their usual names; every norm stored as 1 + w, these three too (checked on the values: in Qwen3.5-0.8B's bf16 GGUF each equals the safetensors' value + 1 exactly) | the draft head (step 13): flagged `draft`, layer 40, its routed experts placed with the others when the engine is asked for the head |
 
 **Value heads in tiled order.** The converter reorders the Gated DeltaNet's value heads when the key heads are fewer (16 key heads, 32 value heads here; `_LinearAttentionVReorderBase`, for ggml's broadcast). The reference groups them by key head: value head h reads key head h / 2. The GGUF tiles them: value head h reads key head h mod 16.
 

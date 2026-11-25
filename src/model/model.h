@@ -68,6 +68,9 @@ const char *ath_role_name(ath_role r);
                                    * pipelines on the text path skip it, an export copies it
                                    * unchanged. Role other, layer -1, expert -1; it belongs
                                    * to exactly one ignored group                          */
+#define ATH_P_DRAFT          16u  /* part of the draft head (multi-token prediction, step 13):
+                                   * read by ath_model_draft, never by the forward pass; its
+                                   * layer params have layers n_layers and on               */
 
 typedef struct {
     ath_tensor  t;        /* contiguous view of checkpoint memory, possibly a slice of a
@@ -111,6 +114,9 @@ typedef enum {
                             * size; activation dtype                                 */
     ATH_STATE_RECURRENT,   /* the recurrent state of a linear-attention layer; fixed
                             * size; always fp32                                      */
+    ATH_STATE_HIDDEN,      /* the draft head's input waiting for the next token: the
+                            * main model's output, after the final norm, at the last
+                            * position it ran (step 13); fixed size; activation dtype */
     ATH_STATE_KIND_COUNT
 } ath_state_kind;
 
@@ -200,8 +206,10 @@ typedef struct {
     ath_param        *params;            /* global params and each layer's params, in
                                           * forward order; then the ATH_P_UNUSED ones */
     uint32_t          n_params;
-    ath_layer        *layers;
+    ath_layer        *layers;            /* [n_layers + n_draft_layers]                */
     int32_t           n_layers;
+    int32_t           n_draft_layers;    /* the draft head's layers after the main ones
+                                          * (multi-token prediction, step 13); 0: none */
     ath_ignored      *ignored;
     uint32_t          n_ignored;
     uint32_t          n_bound;           /* checkpoint tensors viewed by some param:
@@ -227,6 +235,7 @@ typedef struct {
                                  * reference runs) or ATH_DTYPE_F32 (an exact forward pass)   */
     int32_t           capacity; /* tokens the KV buffers hold                                 */
     int32_t           n_past;   /* tokens processed so far: the position of the next token    */
+    int32_t           n_draft;  /* positions the draft head has run: [0, n_draft) (step 13)   */
     void            **buf;      /* [n_states]: buf[i] holds m->states[i] (the pointer array
                                  * itself is always in host memory)                           */
     const ath_device *dev;      /* NULL: the buffers are in host memory; otherwise on dev     */
@@ -260,6 +269,10 @@ typedef struct {
                              * token) or [1, vocab_size] (the last token only)            */
     const int32_t *pos;     /* ATH_BATCH_DEVICE: [n_tokens] positions; NULL otherwise    */
     uint32_t       flags;   /* ATH_BATCH_*                                               */
+    ath_tensor    *hidden;  /* NULL, or [n_tokens, hidden_size] in the state's activation
+                             * dtype, where the pass runs (device memory on a GPU): every
+                             * token's output after the final norm, the input of the
+                             * output projection, which the draft head reads (step 13)   */
 } ath_batch;
 
 /* A batch whose tokens, positions and logits are in the memory of the
@@ -270,6 +283,23 @@ typedef struct {
  * n_past, n_past + 1, ... when the work runs, and the token ids must be in
  * the vocabulary: the host cannot read them to check. */
 #define ATH_BATCH_DEVICE 1u
+
+/* Rows for the draft head (multi-token prediction, step 13). Row i is the
+ * main model's position pos[i]: the head reads the token after it, tokens[i],
+ * and the main model's output there, hidden row i (ath_batch.hidden), and
+ * guesses the token after tokens[i]. It writes its own cache at pos[i] (the
+ * state's draft layers) and reads it at earlier positions, so the rows of a
+ * sequence must have been run in order, each position once (or again, to
+ * replace it with another next token). */
+typedef struct {
+    const int32_t    *tokens;  /* [n_tokens]: the token after each row's position          */
+    const ath_tensor *hidden;  /* [n_tokens, hidden_size], activation dtype, where it runs */
+    int32_t           n_tokens;
+    int32_t           pos0;    /* host batch: pos[i] = pos0 + i                            */
+    const int32_t    *pos;     /* ATH_BATCH_DEVICE: [n_tokens] positions; NULL otherwise    */
+    ath_tensor       *logits;  /* NULL, or f32 [1, vocab_size]: the guess of the last row   */
+    uint32_t          flags;   /* ATH_BATCH_DEVICE: tokens, positions, logits on the device */
+} ath_draft;
 
 /* Callbacks from inside the forward pass. Every member may be NULL; the
  * tensors are valid during the call only and must not be written. */
@@ -307,6 +337,11 @@ struct ath_family {
      * run models yet. */
     ath_status (*forward)(const ath_model *m, const ath_batch *b, ath_state *s, const ath_hooks *h,
                           ath_arena *scratch, const ath_exec *x);
+    /* The draft head's rows (ath_draft), through ath_model_draft, which has
+     * checked every argument; the state's n_past and n_draft are the
+     * caller's. NULL if the family has no draft head. */
+    ath_status (*draft)(const ath_model *m, const ath_draft *d, ath_state *s, ath_arena *scratch,
+                        const ath_exec *x);
 
     /* ---- text (step 5); NULL if the family has none ---- */
 
@@ -376,6 +411,15 @@ ath_status ath_state_reset(ath_state *s, const ath_model *m);
  * capacity or device. On a device the copy is queued on its compute
  * stream, in order with the forward passes. */
 ath_status ath_state_copy(ath_state *dst, const ath_state *src, const ath_model *m);
+
+/* Run the draft head's rows d (ath_draft): its cache at their positions, and
+ * the guess of the last row in d->logits. Checks the arguments like
+ * ath_model_forward (ATH_ERR_UNSUPPORTED without a draft head, or on a GPU
+ * whose engine did not place it); leaves n_past and n_draft to the caller.
+ * Positions must be below n_past + capacity's room: a row's position can be
+ * at most n_past (the token after it has not been run yet). */
+ath_status ath_model_draft(const ath_model *m, const ath_draft *d, ath_state *s, ath_arena *scratch,
+                           const ath_exec *x);
 
 /* Run one batch through the model. Checks the arguments (ATH_ERR_INVALID_ARG,
  * ATH_ERR_TYPE; ATH_ERR_RANGE for a token id outside the vocabulary or a

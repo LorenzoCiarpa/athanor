@@ -94,7 +94,7 @@ static ath_status mark_params(const ath_model *m, uint8_t *mark)
     for (uint32_t i = 0; i < m->n_params; i++) {
         const ath_param *p = &m->params[i];
         ATH_ASSERT((unsigned)p->role < ATH_ROLE_COUNT);
-        ATH_ASSERT(p->layer >= -1 && p->layer < m->n_layers);
+        ATH_ASSERT(p->layer >= -1 && p->layer < m->n_layers + m->n_draft_layers);
         ATH_ASSERT(p->expert >= -1 && (p->expert < m->n_experts || p->expert == -1));
         const ath_ckpt_tensor *e = p->name ? ath_ckpt_find(st, p->name) : NULL;
         if (!e) {

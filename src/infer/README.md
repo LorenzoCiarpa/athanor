@@ -8,7 +8,7 @@ The inference engine. Decode at batch 1 is limited by memory bandwidth, so the g
 | `state.c` | paged KV cache, snapshots for prefix reuse; on-disk persistence of prefix snapshots (hash of token prefix → KV pages + recurrent and conv state), with a size budget and LRU eviction. The plain state of one sequence on a device is `ath_state_init_gpu` in `src/model/state.c` (step 8), next to the host one | 13, 14 |
 | `sched.c` | request queue, small continuous batching for the server | 13 |
 | `tier.h`, `tier.c` | MoE expert placement (`ath_placement`, step 12): every routed expert in pinned RAM, regrouped for the CPU; slots in VRAM for as many as fit; the tables a pass reads (`ath_exec.experts`); the slots follow use between passes. Disk and a copy-or-compute cost model: not yet (below) | 12 |
-| `spec.c` | speculative decoding with the MTP head | 13 |
+| `spec.h`, `spec.c` | speculative decoding with the model's draft head (the MTP head): a guess verified in the same pass as the next token, the tokens of plain decoding whatever the guesses; driven from the host for now | 13 |
 
 ## Sequence state
 
@@ -48,7 +48,7 @@ ATH_CHECK(ath_model_forward(&model, &batch, &s, NULL, &scratch, &e.exec));
 ath_engine_close(&e);
 ```
 
-- **Weights.** Every param not flagged `ATH_P_UNUSED` is copied from the memory-mapped checkpoint to the device, once, with its dtype and bytes unchanged (bf16). The copies are indexed like `m->params`, which is how a family's forward pass finds them (`ath_exec.weights`). The vision encoder and the MTP head stay on the host.
+- **Weights.** Every param not flagged `ATH_P_UNUSED` is copied from the memory-mapped checkpoint to the device, once, with its dtype and bytes unchanged (bf16). The copies are indexed like `m->params`, which is how a family's forward pass finds them (`ath_exec.weights`). The vision encoder stays on the host, and so does the draft head (`ATH_P_DRAFT`, step 13) unless the engine is opened with `ath_place_opts.draft`, which also places its layer's routed experts with the others.
 - **Memory.** Three device arenas: the weights for the engine's life, the states, and the scratch memory of one pass, released after every call.
 - **One sequence per batch.** Batches of several sequences, paged KV memory, graph capture and sampling on the GPU come with fast decode and the server (steps 9 and 13).
 - **Checked** by `tests/test_engine.c` (the copies byte for byte, states on the device, sequences in pieces, and the gate: greedy generation against the reference on 50 prompts of 256 tokens) and by the GPU runs of `tests/test_forward.c` (`tests/README.md`, Engine).
@@ -60,3 +60,24 @@ ath_engine_close(&e);
 - **One launch per token.** Some 300 kernels, recorded once. The step 8 decode launched them one by one from the host and waited for the logits at every token.
 - **The same bits.** A replayed step gives the logits of the same step run directly (`tests/test_engine.c`, `engine_decoder`), and the tokens `ath_sample_ref` chooses with the same uniform numbers.
 - **What may change between steps.** The state may be reset or copied into, and other forward calls on it may come between steps: its buffers and the engine's scratch memory stay where they are, which is what the recording relies on. Another state or another sampler needs another decoder.
+
+## Speculative decoding (step 13)
+
+`ath_spec` (`spec.h`) decodes with the model's draft head (multi-token prediction: `ath_model_draft`, `docs/contract/qwen35-0.8b.md`, Draft head). A step runs the next token and the head's guess at the token after it through the main model in one pass, chooses the token after the next token from the first row's logits as plain decoding would (the same sampler, the same uniform number), and keeps the second row's choice too when the first choice equals the guess. So the tokens are plain decoding's, whatever the guesses: `tests/test_spec.c` checks it bit for bit on the CPU and the GPU, greedy, sampled and with a presence penalty. It holds because a pass of two or three tokens gives each row the bits of a pass of one: the GEMV kernels take up to 8 rows with each row's arithmetic unchanged, and the Gated DeltaNet runs its recurrent kernel below `ATH_GDN_CHUNK_MIN_T` tokens.
+
+| Case | What happens |
+| --- | --- |
+| guess kept | two tokens for one pass; the head then runs over the pass's positions and guesses again |
+| guess wrong | one token; the convolution and recurrent states and the head's waiting input are copied back from before the pass (the attention caches need nothing: rows past `n_past` are never read); the next pass runs the pending token, the new one and the next guess (three tokens) |
+| wrong twice in a row | the two pending tokens run in a pass of their own, so that a pass never holds more than three |
+
+`ath_spec_feed` runs a prompt through the main model and the head, so that the head's cache covers it; the state keeps where the head stands (`n_draft`, `ATH_STATE_HIDDEN`), which makes snapshots work unchanged.
+
+Measured on the RTX 5080 (greedy, a coding prompt of 63 tokens, 256 and 128 generated tokens; `docs/results/2026-11-25-step13-server/`):
+
+| Model | guesses kept | speculative (host-driven) | plain, host-driven (`--direct`) | plain, decoder (recorded graph) |
+| --- | --- | --- | --- | --- |
+| Qwen3.5-0.8B | 86% | 427 tok/s | 357 tok/s | 438 tok/s |
+| Qwen3.6-35B-A3B | 98% | 54.9 tok/s | 44.4 tok/s | 79.1 tok/s |
+
+Against the plain decode of the same kind (forward calls from the host), speculative decoding is 1.2× faster; against the decoder's recorded graph it is not yet, since each of its passes pays the launches the graph saves. Recording the verifying and drafting passes (four shapes: 2 or 3 tokens, 1 to 3 rows of the head) is the next step for it (`docs/STATUS.md`, Possible later work). On the 35B a pass of two tokens also reads up to twice the routed experts on the CPU, which limits what a guess can save.

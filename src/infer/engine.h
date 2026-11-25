@@ -38,6 +38,7 @@ typedef struct {
     uint64_t         weight_bytes;   /* bytes copied to the device                    */
     uint32_t         n_copied;       /* params copied                                 */
     ath_placement        *tier;           /* the routed experts of a MoE model (step 12)   */
+    bool             draft;          /* the draft head is on the device (step 13)     */
     ath_exec         exec;           /* pass &exec to ath_model_forward               */
 } ath_engine;
 

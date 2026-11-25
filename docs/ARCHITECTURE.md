@@ -191,6 +191,8 @@ Step 8 put the forward pass on the GPU without a second composition. The pool be
 
 Step 12 added the routed experts of a MoE model to `ath_exec`, by addition: `experts` ([n_layers], each layer's `ath_moe_experts`, src/ops/ops.h: a table in device memory of where each expert's gate, up and down are on the device, NULL where they are not, and their copies in host memory with flags) and `moe_ws` (the working state of the CPU's share). The engine fills them through a placement (`src/infer/tier.c`); a family reads its experts there on a GPU, never in `weights`, whose entries for routed experts stay empty. The contract states the order a placement relies on: a routed expert's params, in param order, are its gate, up and down projections. Where an expert is never changes a result (AGENTS.md invariant 7, read as option (b) at step 12: the CPU and GPU expert paths follow one arithmetic order).
 
+Step 13 added the draft head (multi-token prediction), by addition: a flag `ATH_P_DRAFT` for its params, which come after the main ones with layers `n_layers` and on (`ath_model.n_draft_layers` of them; `ath_model.layers` lists them after the main ones); a state kind `ATH_STATE_HIDDEN` for the head's input waiting for the next token, and `ath_state.n_draft`, the positions the head has run, which `ath_state_copy` carries with `n_past`; `ath_batch.hidden`, every token's output after the final norm; and `ath_draft` with `ath_model_draft`, through the family's new `draft` member, which runs rows of the head (a position, the token after it, the main model's output there) and gives the last row's guess. The engine copies the head's params, and its placement places the head's routed experts, only when asked (`ath_place_opts.draft`), so a run without the head is as before. Speculative decoding (`src/infer/spec.c`) is written once over these, for every family that has a draft head. `ath_sampler` gained `presence` (the presence penalty), which the caller applies before choosing (`ath_presence_ref`, `ath_presence_gpu`; the decoder does).
+
 Step 9 made a decode step something that can be recorded once and replayed, for the decoder of `src/infer/` (one graph launch per token, the next token chosen on the GPU). Two additions to the contract, both by addition: `ath_batch` gained `pos` and `flags`, and a device batch (`ATH_BATCH_DEVICE`) has its tokens, positions and logits in the memory of the device the pass runs on, so the pass copies nothing to or from the host and waits for nothing; the host cannot check its token ids or positions, which the caller guarantees. And no op argument depends on `n_past` any more: the family writes the new keys and values into the cache at their positions (`ath_scatter_rows`) and gives attention the whole cache with the queries' positions (`ath_attn` with `pos`), so the work of a step is the same whatever the length of the sequence. A replayed step gives the logits of the same step run directly, bit for bit.
 
 ### Text
@@ -220,7 +222,7 @@ The family list is compiled in from the Makefile: `FAMILIES=qwen35` generates `b
 | quant | params by `role` and `flags` to choose formats; `on_matmul_in` to collect activation statistics for importance-weighted RTN, GPTQ and AWQ; `ATH_P_UNUSED` params copied unchanged into the container |
 | ablit | `on_residual` to capture activations; every param with `ATH_P_WRITES_RESIDUAL` is orthogonalized; `ATH_P_UNUSED` params exported unchanged |
 | train | `backward`; LoRA targets by `role`; hot/cold blocks by `layer`; `ATH_P_UNUSED` params frozen and never loaded |
-| net | `chat` with the request's tool definitions to render the prompt; `parse` to turn the output into text, thinking and tool-call events, which `api.c` converts to OpenAI and Anthropic formats |
+| net | `chat` with the request's tool definitions to render the prompt; `parse` to turn the output into text, thinking and tool-call events, which `api.c` converts to the Anthropic Messages, OpenAI Chat Completions and OpenAI Responses formats; through `gen.c`, the engine's decoder or the speculative decoder (step 13) |
 | `athanor chat` (step 5) | `ath_model_tokenizer`, `ath_model_chat`, `ath_model_forward`, `ath_sample_ref`, `ath_model_parse`; `ath_state_copy` to resume a conversation; the engine's exec and states on the GPU (step 8) |
 
 ## Common versus family-specific
@@ -267,11 +269,11 @@ athanor/
 │   ├── model/     model.h registry.c state.c text.c
 │   ├── models/
 │   │   └── qwen35/  qwen35.h family.c config.c weights.c forward.c text.c [backward.c] [cuda/fused.cu]
-│   ├── infer/     engine.h engine.c (step 8; the decoder, step 9), tier.h tier.c (step 12), state.c sched.c spec.c (later)
+│   ├── infer/     engine.h engine.c (step 8; the decoder, step 9), tier.h tier.c (step 12), spec.h spec.c (step 13), state.c sched.c (later)
 │   ├── quant/     formats.c rtn.c gptq.c awq.c recipe.c container.c gguf.c eval.c
 │   ├── ablit/     capture.c direction.c edit.c search.c eval.c
 │   ├── train/     loop.c optim.c lora.c hotcold.c data.c planner.c ckpt.c
-│   └── net/       http.c api.c
+│   └── net/       http.c api.c gen.c (step 13)
 ├── tools/         athanor.c (dispatch), one file per subcommand (inspect.c, chat.c, devices.c, bench.c, ...), dev/ (development helpers)
 ├── tests/         test.h (runner) util.h tiny.h test_core.c test_model.c test_ops.c test_golden.c test_forward.c
 │                  test_text.c test_backend.c test_gpu_ops.c test_engine.c ...; golden/ (dump.py, text.py, generate.py, requirements.txt; data/ not committed)

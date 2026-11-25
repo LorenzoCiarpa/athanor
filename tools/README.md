@@ -9,7 +9,8 @@ One binary, `athanor`, with subcommands. `athanor.c` holds only the dispatch tab
 | `inspect.c` | `athanor inspect` |
 | `chat.c` | `athanor chat` (step 5; on the GPU since step 8, through the decoder since step 9) |
 | `devices.c` | `athanor devices` (step 6) |
-| `bench.c` | `athanor bench` (step 9): ppN and tgN@dD as llama-bench names them, median of measured runs, the JSON report of `docs/BENCHMARKS.md` |
+| `bench.c` | `athanor bench` (step 9): ppN and tgN@dD as llama-bench names them, median of measured runs, the JSON report of `docs/BENCHMARKS.md`; `--mtp` decodes with the draft head (step 13) |
+| `serve.c` | `athanor serve` (step 13): the HTTP APIs of `src/net` |
 | `dev/` | development-only helpers, never built into `athanor` |
 
 | Subcommand | Purpose | Step |
@@ -28,7 +29,7 @@ Planned usage (flags are illustrative until each step lands):
 ```
 athanor inspect models/Qwen3.5-0.8B --roles
 athanor chat    models/Qwen3.5-9B --format q4
-athanor serve   models/Qwen3.6-35B-A3B --vram 14G --ram 48G --port 8080
+athanor serve   models/Qwen3.6-35B-A3B --ctx 65536 --port 8080
 athanor bench   decode models/Qwen3.5-9B --ctx 0,4k,32k --batch 1,4
 athanor quant   plan models/Qwen3.5-9B --budget 5.5G --calib data/calib.txt
 athanor ablit   search models/Qwen3.5-2B --trials 200
@@ -108,4 +109,27 @@ athanor bench models/Qwen3.5-0.8B -p 512,4096 -n 128 -d 0,4096,32768 -r 5 --json
 - `ppN`: a prompt of N tokens into an empty state, in pieces of `--chunk` (2048); prefill tokens/s and the time to the first token (the prompt and the choice of the first token).
 - `tgN@dD`: N tokens decoded one at a time, greedy, after a prompt of D tokens; decode tokens/s. On a GPU through the decoder (`src/infer/README.md`); `--direct` runs step 8's way, one forward call per token with the logits on the host. The prompt is finished before the clock starts.
 - Token ids are pseudo-random (`--seed`), as llama-bench's. Every test runs `--warmup` times unmeasured, then `--reps` times measured from a reset state: the median with min and max.
+- `--mtp` (step 13): the tg tests decode speculatively with the model's draft head (`src/infer/README.md`, Speculative decoding); the context and one more token are the prompt, so that the head runs over it, and the share of passes whose guess was kept is printed and reported (`guesses_kept`).
 - `--json` writes the report `docs/BENCHMARKS.md` asks for: the hardware (GPU, PCIe link, driver, CPU, RAM, storage), the software (the commit, from `build/gen/version.h`, the compiler, runtime and cuBLASLt versions), the model files with their SHA-256 and Hugging Face revision (`--no-hash` skips the hashes), the workload, the method, every run, and memory from the driver and the kernel.
+
+## `athanor serve` (step 13)
+
+```
+athanor serve <model_dir> [--host 127.0.0.1] [--port 8080] [--ctx 65536] [--experts n] [--no-think]
+              [--max-tokens n] [--server-sampling] [--mtp] [--dump dir] [--quiet]
+```
+
+The model behind the HTTP APIs of coding agents: Anthropic Messages (`/v1/messages`, Claude Code), OpenAI Responses (`/v1/responses`, Codex CLI) and OpenAI Chat Completions (`/v1/chat/completions`, OpenCode and most clients), streamed or whole, with tool calls; `/v1/models`. One request at a time; the server never runs a tool. `src/net/README.md` has the endpoints, how requests become messages, the prompt's snapshots and the clients' configuration; `tests/conformance/` runs a task set through the three harnesses.
+
+```
+$ athanor serve models/Qwen3.6-35B-A3B --ctx 65536
+athanor serve: loading models/Qwen3.6-35B-A3B
+athanor serve: Qwen3.6-35B-A3B on NVIDIA GeForce RTX 5080, context 65536; listening on http://127.0.0.1:8080 (Ctrl-C stops)
+serve: messages stream think: prompt 13025 (0 cached) in 56.72 s, 114 out in 2.74 s (41.5/s), tool_calls
+serve: messages stream think: prompt 13267 (13138 cached) in 0.95 s, 129 out in 2.67 s (48.2/s), tool_calls
+```
+
+- `--ctx`: the context of the server's two states (the conversation and its snapshot), on the GPU before the experts take the rest.
+- `--no-think`: requests that do not say get no thinking. `--server-sampling`: the model card's sampling for every request.
+- `--mtp`: decode with the draft head: the same tokens; on a GPU slower than the default decoder until its passes are recorded too (`src/infer/README.md`).
+- `--dump <dir>`: every request body saved there, to see what a client sends.

@@ -52,6 +52,10 @@ typedef struct {
     int32_t     shared_inter;     /* shared_expert_intermediate_size  */
 
     ath_qwen35_mixer *mixer;      /* [n_layers], the layer schedule   */
+
+    /* multi-token prediction head (step 13): mtp_num_hidden_layers, full
+     * attention and the MLP or MoE of the main layers; 0 without one */
+    int32_t     n_draft;
 } ath_qwen35_config;
 
 /* The params of one decoder layer, by what the forward pass does with them,
@@ -88,6 +92,14 @@ typedef struct {
     const ath_param  *embed;
     const ath_param  *norm;     /* final norm                                        */
     const ath_param  *head;     /* output projection: lm_head, or embed when tied    */
+    /* The draft head (multi-token prediction, step 13), when the checkpoint
+     * has it (n_draft > 0): x = fc([norm_e(embed(t + 1)); norm_h(h_t)]), its
+     * layers, then norm and the shared output projection. The embedding and
+     * head are the main model's. */
+    int32_t           n_draft;
+    ath_qwen35_layer *draft;    /* [n_draft], params of layers n_layers + i          */
+    const ath_param  *d_fc, *d_enorm, *d_hnorm, *d_norm;
+    int32_t           d_hidden; /* the state's ATH_STATE_HIDDEN buffer               */
 } ath_qwen35_model;
 
 /* config.c */
@@ -106,6 +118,9 @@ ath_status ath_qwen35_bind(ath_model *m, ath_arena *a, ath_qwen35_model *q);
 /* forward.c: the family's forward (model.h, ath_family.forward). */
 ath_status ath_qwen35_forward(const ath_model *m, const ath_batch *b, ath_state *s, const ath_hooks *h,
                               ath_arena *scratch, const ath_exec *x);
+/* forward.c: the draft head (model.h, ath_family.draft). */
+ath_status ath_qwen35_draft(const ath_model *m, const ath_draft *d, ath_state *s, ath_arena *scratch,
+                            const ath_exec *x);
 
 /* text.c: pre-tokenization, chat template and output parser (model.h,
  * ath_family). */

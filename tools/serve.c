@@ -46,6 +46,9 @@ void ath_cmd_serve_usage(FILE *out)
             "                       top-k 20; otherwise 0.7, 0.8, 20 and presence penalty\n"
             "                       1.5), which also fill what a request leaves out\n"
             "  --chunk <n>          prompt tokens per forward call (default 4096)\n"
+            "  --mtp                decode speculatively with the model's draft head (multi-token\n"
+            "                       prediction): the same tokens, fewer passes; without recorded\n"
+            "                       graphs yet, so slower than the default decoder on a GPU\n"
             "  --seed <n>           random seed (default: from the clock)\n"
             "  --dump <dir>         save every request body in dir (for debugging a client)\n"
             "  --quiet              no line per request on stderr\n");
@@ -94,6 +97,7 @@ int ath_cmd_serve(ath_arena *a, int argc, char **argv)
         if (!strcmp(o, "--no-think")) { think = false; continue; }
         if (!strcmp(o, "--quiet")) { quiet = true; continue; }
         if (!strcmp(o, "--server-sampling")) { server_sampling = true; continue; }
+        if (!strcmp(o, "--mtp")) { go.mtp = true; continue; }
         if (o[0] == '-' && !v)
             return usage_error("missing value for", o);
         if (!strcmp(o, "--host")) host = v;

@@ -32,6 +32,7 @@
 #include "core/sha256.h"
 #include "core/threads.h"
 #include "infer/engine.h"
+#include "infer/spec.h"
 #include "model/model.h"
 #include "ops/ops.h"
 #include "version.h"
@@ -74,6 +75,8 @@ void ath_cmd_bench_usage(FILE *out)
             "  --json <file>         write the report there\n"
             "  --direct              decode with one forward call per token and the logits on\n"
             "                        the host (step 8), not with the decoder's graph\n"
+            "  --mtp                 decode speculatively with the model's draft head (multi-token\n"
+            "                        prediction, step 13): tg tests also report the guesses kept\n"
             "  --no-hash             do not hash the weight files for the report\n",
             MAX_REPS);
 }
@@ -87,6 +90,7 @@ typedef struct {
     int32_t     experts;    /* MoE: routed experts per layer in device memory; -1 as many as fit */
     uint64_t    seed;
     bool        hash, direct;
+    bool        mtp;        /* decode with the draft head (step 13) */
 } options;
 
 typedef struct {
@@ -97,6 +101,7 @@ typedef struct {
     double  s[MAX_REPS]; /* seconds of each measured run                              */
     double  ttft[MAX_REPS];
     int32_t runs;
+    double  kept;        /* --mtp: the share of passes whose guess was kept           */
 } result;
 
 typedef struct {
@@ -113,6 +118,9 @@ typedef struct {
     ath_sampler  greedy;
     ath_decoder  dc;
     bool         decoder;      /* tg through dc */
+    ath_spec     sp;
+    bool         spec;         /* tg through sp (--mtp) */
+    uint64_t     passes, kept; /* sp's counts over a test's measured runs */
     uint64_t     dev_used_before, dev_used_peak;
 } bench;
 
@@ -184,8 +192,33 @@ static ath_status run_pp(bench *b, const options *o, int64_t n, double *secs, do
     return ATH_OK;
 }
 
+/* Speculative decode: the context and one more token as the prompt (the
+ * draft head runs over it), then gen tokens. */
+static ath_status run_tg_spec(bench *b, const options *o, int64_t depth, double *secs)
+{
+    ATH_CHECK(ath_state_reset(&b->st, &b->m));
+    ATH_CHECK(ath_spec_feed(&b->sp, b->ids, (int32_t)depth + 1, b->logits.data));
+    int32_t tok;
+    ATH_CHECK(ath_sample_ref(&b->logits, &b->greedy, 0.0, b->scratch, &tok));
+    const uint64_t p0 = b->sp.passes, k0 = b->sp.accepted;
+    double t0 = now_s();
+    ATH_CHECK(ath_spec_begin(&b->sp, tok));
+    for (int32_t i = 1; i < o->gen;) {
+        const double u[2] = {0, 0};
+        int32_t out[2], k;
+        ATH_CHECK(ath_spec_step(&b->sp, u, out, &k));
+        i += k;
+    }
+    *secs = now_s() - t0;
+    b->passes += b->sp.passes - p0;
+    b->kept += b->sp.accepted - k0;
+    return ATH_OK;
+}
+
 static ath_status run_tg(bench *b, const options *o, int64_t depth, double *secs)
 {
+    if (b->spec)
+        return run_tg_spec(b, o, depth, secs);
     ATH_CHECK(ath_state_reset(&b->st, &b->m));
     ATH_CHECK(feed(b, b->ids, depth, o->chunk, false));
     if (b->e)   /* a pass without logits returns once queued: the prompt must be done first */
@@ -224,6 +257,8 @@ static ath_status run_test(bench *b, const options *o, result *r)
 {
     for (int32_t i = 0; i < o->warmup + o->reps; i++) {
         double secs = 0, ttft = 0;
+        if (i == o->warmup)
+            b->passes = b->kept = 0;
         ATH_CHECK(r->decode ? run_tg(b, o, r->depth, &secs) : run_pp(b, o, r->n, &secs, &ttft));
         note_memory(b);
         if (i >= o->warmup) {
@@ -236,7 +271,10 @@ static ath_status run_test(bench *b, const options *o, result *r)
         tps[i] = (double)r->n / r->s[i];
     stats(tps, r->runs, &med, &lo, &hi);
     printf("%-16s %8.1f tok/s  (min %.1f, max %.1f)", r->name, med, lo, hi);
-    if (r->decode)
+    if (r->decode && b->spec) {
+        r->kept = b->passes ? (double)b->kept / (double)b->passes : 0;
+        printf("  %.3f ms/token, %.0f%% of the guesses kept\n", 1e3 / med, 100 * r->kept);
+    } else if (r->decode)
         printf("  %.3f ms/token\n", 1e3 / med);
     else {
         stats(r->ttft, r->runs, &med, &lo, &hi);
@@ -425,8 +463,10 @@ static ath_status write_report(const bench *b, const options *o, const result *r
                              "\"batch\": 1, \"prompt_chunk\": %d, \"context\": %d, \"activations\": \"bf16\", "
                              "\"sampling\": \"greedy\", \"decode\": \"%s\", \"device\": \"%s\"}",
                              (unsigned long long)o->seed, o->chunk, b->st.capacity,
-                             b->decoder ? "decoder: one recorded graph per token, the choice on the GPU (step 9)"
-                                        : "one forward call per token, logits to the host, ath_sample_ref (step 8)",
+                             b->spec      ? "speculative: the draft head's guess verified in one pass with the "
+                                            "next token, forward calls from the host, ath_sample_ref (step 13)"
+                             : b->decoder ? "decoder: one recorded graph per token, the choice on the GPU (step 9)"
+                                          : "one forward call per token, logits to the host, ath_sample_ref (step 8)",
                              b->e ? "gpu" : "cpu"));
     if (o->prompt_ids) {
         ATH_CHECK(ath_buf_puts(j, ",\n  \"prompt_ids\": "));
@@ -463,6 +503,8 @@ static ath_status write_report(const bench *b, const options *o, const result *r
         } else {
             ATH_CHECK(ath_buf_puts(j, ", "));
             ATH_CHECK(write_stats(j, "ms_per_token", r->s, r->runs, 1e3 / (double)r->n, false));
+            if (b->spec)
+                ATH_CHECK(ath_buf_printf(j, ", \"guesses_kept\": %.4f", r->kept));
         }
         ATH_CHECK(ath_buf_puts(j, "}"));
     }
@@ -522,6 +564,8 @@ static int parse(int argc, char **argv, options *o)
             o->json = v;
         else if (!strcmp(a, "--direct"))
             o->direct = true, takes = false;
+        else if (!strcmp(a, "--mtp"))
+            o->mtp = true, takes = false;
         else if (!strcmp(a, "--no-hash"))
             o->hash = false, takes = false;
         else if (a[0] != '-' && !o->model)
@@ -601,13 +645,13 @@ int ath_cmd_bench(ath_arena *a, int argc, char **argv)
             ath_device_close(&probe);
         }
         b.e = ath_arena_zalloc(a, sizeof *b.e, _Alignof(ath_engine));
-        const ath_place_opts po = {.slots = o.experts};
+        const ath_place_opts po = {.slots = o.experts, .draft = o.mtp};
         st = b.e ? ath_engine_open_tier(b.e, &b.m, 0, &po, a) : ATH_ERR_NOMEM;
         if (st == ATH_OK) {
             b.exec = b.e->exec;
             st = ath_engine_state(b.e, &b.st, ATH_DTYPE_BF16, (int32_t)ctx, a);
         }
-        if (st == ATH_OK && !o.direct) {
+        if (st == ATH_OK && !o.direct && !o.mtp) {
             st = ath_decoder_open(&b.dc, b.e, &b.st, &b.greedy, a);
             b.decoder = st == ATH_OK;
         }
@@ -617,6 +661,12 @@ int ath_cmd_bench(ath_arena *a, int argc, char **argv)
         b.exec = (ath_exec){.pool = &b.pool};
         if (st == ATH_OK)
             st = ath_state_init(&b.st, &b.m, ATH_DTYPE_BF16, (int32_t)ctx, a);
+    }
+    if (st == ATH_OK && o.mtp) {
+        st = ath_spec_open(&b.sp, &b.m, &b.st, &b.exec, &b.greedy, o.chunk, a);
+        b.spec = st == ATH_OK;
+        if (st == ATH_ERR_UNSUPPORTED)
+            fprintf(stderr, "athanor bench: --mtp: the model has no draft head\n");
     }
     if (st == ATH_OK) {
         float *lg = ath_arena_alloc(a, (size_t)b.m.vocab_size * sizeof(float), 64);
@@ -663,6 +713,8 @@ int ath_cmd_bench(ath_arena *a, int argc, char **argv)
 
     if (b.decoder)
         ath_decoder_close(&b.dc);
+    if (b.spec)
+        ath_spec_close(&b.sp);
     if (b.e)
         ath_engine_close(b.e);
     if (b.pool_open)

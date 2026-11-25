@@ -38,6 +38,8 @@ ath_status ath_engine_open_tier(ath_engine *e, const ath_model *m, int32_t devic
         const ath_param *p = &m->params[i];
         if (p->flags & ATH_P_UNUSED)
             continue;
+        if ((p->flags & ATH_P_DRAFT) && !(tier && tier->draft))
+            continue;                  /* the draft head on request (step 13) */
         if (m->n_experts > 0 && (p->role == ATH_ROLE_EXPERT_IN || p->role == ATH_ROLE_EXPERT_OUT))
             continue;                  /* the tier places them, below */
         if (!ath_tensor_is_contiguous(&p->t) || (p->t.tier != ATH_TIER_RAM && p->t.tier != ATH_TIER_PINNED)) {
@@ -72,6 +74,7 @@ ath_status ath_engine_open_tier(ath_engine *e, const ath_model *m, int32_t devic
         ath_engine_close(e);
         return st;
     }
+    e->draft = tier && tier->draft && m->n_draft_layers > 0;
     e->exec = (ath_exec){.dev = &e->dev, .weights = e->weights, .scratch = &e->scratch};
     if (e->tier) {
         e->exec.experts = e->tier->layers;

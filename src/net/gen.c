@@ -41,7 +41,8 @@ ath_status ath_gen_open(ath_gen *g, const char *dir, const ath_gen_opts *o, ath_
          * the working memory */
         size_t sb = 0;
         ath_state_bytes(&g->m, ATH_DTYPE_BF16, g->ctx, &sb);
-        const ath_place_opts po = {.slots = o->experts, .vram_reserve = ATH_PLACE_RESERVE + 2 * (uint64_t)sb};
+        const ath_place_opts po = {.slots = o->experts, .vram_reserve = ATH_PLACE_RESERVE + 2 * (uint64_t)sb,
+                                   .draft = o->mtp};
         ath_log(ATH_LOG_INFO, "serve: a state of %d tokens takes %.2f GiB; two are kept", g->ctx,
                 (double)sb / 1073741824.0);
         st = g->engine ? ath_engine_open_tier(g->engine, &g->m, 0, &po, a) : ATH_ERR_NOMEM;
@@ -69,6 +70,15 @@ ath_status ath_gen_open(ath_gen *g, const char *dir, const ath_gen_opts *o, ath_
         if (st == ATH_OK)
             st = ath_state_init(&g->snap, &g->m, ATH_DTYPE_BF16, g->ctx, a);
     }
+    if (st == ATH_OK && o->mtp) {
+        static const ath_sampler greedy = {0, 0, 1, 0, 0};
+        st = ath_spec_open(&g->spec, &g->m, &g->state, &g->exec, &greedy, g->chunk, a);
+        g->mtp = st == ATH_OK;
+        if (st == ATH_ERR_UNSUPPORTED) {
+            ath_log(ATH_LOG_WARN, "serve: the model has no draft head; decoding without one");
+            st = ATH_OK;
+        }
+    }
     if (st == ATH_OK) {
         ath_tokens_init(&g->seen, a);
         ath_tokens_init(&g->snap_ids, a);
@@ -82,6 +92,9 @@ ath_status ath_gen_open(ath_gen *g, const char *dir, const ath_gen_opts *o, ath_
 
 void ath_gen_close(ath_gen *g)
 {
+    if (g->mtp)
+        ath_spec_close(&g->spec);
+    g->mtp = false;
     if (g->dec_open)
         ath_decoder_close(&g->dec);
     g->dec_open = false;
@@ -125,7 +138,9 @@ static ath_status feed(ath_gen *g, const int32_t *ids, size_t from, size_t to, b
         ath_batch b = {.tokens = ids + from,
                        .n_tokens = (int32_t)(end - from),
                        .logits = want && end == to ? &g->logits : NULL};
-        ath_status st = ath_model_forward(&g->m, &b, &g->state, NULL, &g->scratch, &g->exec);
+        /* with the draft head, it runs over the prompt too (spec.h) */
+        ath_status st = g->mtp ? ath_spec_feed(&g->spec, b.tokens, b.n_tokens, b.logits ? g->logits.data : NULL)
+                               : ath_model_forward(&g->m, &b, &g->state, NULL, &g->scratch, &g->exec);
         ath_arena_reset(&g->scratch, (ath_arena_pos){0});
         ATH_CHECK(st);
         from = end;
@@ -210,7 +225,7 @@ static bool same_sampler(const ath_sampler *a, const ath_sampler *b)
  * another sampler means another decoder. */
 static ath_status decoder_for(ath_gen *g, const ath_sampler *p)
 {
-    if (!g->engine || (g->dec_open && same_sampler(&g->dec_sampler, p)))
+    if (!g->engine || g->mtp || (g->dec_open && same_sampler(&g->dec_sampler, p)))
         return ATH_OK;
     if (g->dec_open)
         ath_decoder_close(&g->dec);
@@ -395,10 +410,32 @@ ath_status ath_gen_run(ath_gen *g, const ath_gen_request *r, const ath_gen_sink 
     const int32_t limit = r->max_tokens > 0 && r->max_tokens < room ? r->max_tokens : room;
     int32_t next = 0, n_gen = 0;
     bool ended = false;
+    /* with the draft head: the tokens of a speculative step, one or two, and
+     * the uniform number a one-token step left unused */
+    ath_tokens emitted;
+    ath_tokens_init(&emitted, a);
+    const size_t prompt_n = g->seen.n;
+    int32_t queue[2], nq = 0, qi = 0;
+    double carry = -1;
+    if (g->mtp)
+        g->spec.p = r->sampler;
     if (limit > 0)
         ATH_CHECK(ath_sample_ref(&g->logits, &r->sampler, ath_rng_uniform(&g->rng), &g->scratch, &next));
     for (; n_gen < limit && !e.cancel && e.stop_hit < 0; n_gen++) {
-        if (n_gen > 0 && !g->engine) {   /* on the GPU the decoder applies the penalty */
+        if (n_gen > 0 && g->mtp) {
+            if (qi == nq) {
+                if (g->state.n_past + ATH_SPEC_ROWS > g->ctx)
+                    break;   /* no room for a pass: the context is full */
+                double u[2];
+                u[0] = carry >= 0 ? carry : ath_rng_uniform(&g->rng);
+                u[1] = ath_rng_uniform(&g->rng);
+                int32_t k = 0;
+                ATH_CHECK(ath_spec_step(&g->spec, u, queue, &k));
+                nq = k, qi = 0;
+                carry = k == 1 ? u[1] : -1;
+            }
+            next = queue[qi++];
+        } else if (n_gen > 0 && !g->engine) {   /* on the GPU the decoder applies the penalty */
             if (r->sampler.presence != 0)
                 ATH_CHECK(ath_presence_ref(&g->logits, g->generated, r->sampler.presence));
             ATH_CHECK(ath_sample_ref(&g->logits, &r->sampler, ath_rng_uniform(&g->rng), &g->scratch, &next));
@@ -409,17 +446,25 @@ ath_status ath_gen_run(ath_gen *g, const ath_gen_request *r, const ath_gen_sink 
             ended = true;
             break;
         }
+        ATH_CHECK(ath_tokens_push(&emitted, next));
         size_t len;
         const char *piece = ath_tokenizer_token(&g->tok, next, &len);
         ATH_CHECK(ath_model_parse(&g->m, &ps, piece, len, ev, 64, &ne));
         out_events(&e, ev, ne);
-        if (n_gen + 1 < limit && g->engine) {
+        if (g->mtp) {
+            if (n_gen == 0 && n_gen + 1 < limit)
+                ATH_CHECK(ath_spec_begin(&g->spec, next));
+        } else if (n_gen + 1 < limit && g->engine) {
             ATH_CHECK(ath_tokens_push(&g->seen, next));
             ATH_CHECK(ath_decoder_step(&g->dec, next, ath_rng_uniform(&g->rng), &next));
         } else if (n_gen + 1 < limit) {
             ATH_CHECK(feed(g, &next, 0, 1, true, NULL, &cancel));
         }
     }
+    /* what the state holds: the prompt and the answer's tokens up to n_past
+     * (a speculative step leaves its last token for the next pass) */
+    for (size_t i = g->seen.n - prompt_n; g->mtp && g->seen.n < (size_t)g->state.n_past && i < emitted.n; i++)
+        ATH_CHECK(ath_tokens_push(&g->seen, emitted.ids[i]));
     if (!e.cancel && e.stop_hit < 0) {
         ATH_CHECK(ath_model_parse(&g->m, &ps, NULL, 0, ev, 64, &ne));
         out_events(&e, ev, ne);

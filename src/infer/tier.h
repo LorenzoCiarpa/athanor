@@ -38,6 +38,8 @@ typedef struct {
     int64_t  cpu_tokens;     /* tokens per chunk of the CPU's share; 0: 512                */
     int32_t  period;         /* passes between two updates of the slots; 0: 4              */
     int32_t  moves;          /* moves per layer and update at most; 0: 2                   */
+    bool     draft;          /* the draft head too (step 13): the engine copies its params
+                              * and places its layers' experts like the others             */
 } ath_place_opts;
 
 #define ATH_PLACE_RESERVE ((uint64_t)2 << 30)   /* 2 GiB */

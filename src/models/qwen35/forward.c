@@ -123,6 +123,22 @@ static ath_status copy_cols(const fwd *f, const ath_tensor *src, int64_t col, at
     return ATH_OK;
 }
 
+/* dst[r, col : col + n] = src[r, :] for every row r, n the last dimension
+ * of src: the reverse of copy_cols, to lay tensors side by side. */
+static ath_status put_cols(const fwd *f, const ath_tensor *src, int64_t col, ath_tensor *dst)
+{
+    const size_t es = ath_dtype_size(src->dtype);
+    const int64_t sc = src->shape[src->ndim - 1], dc = dst->shape[dst->ndim - 1];
+    const int64_t rows = ath_tensor_numel(src) / sc;
+    if (f->dev)
+        return ath_copy_2d(f->dev, (char *)dst->data + (size_t)col * es, (size_t)dc * es, src->data, (size_t)sc * es,
+                           (size_t)sc * es, (size_t)rows, ATH_STREAM_COMPUTE);
+    for (int64_t r = 0; r < rows; r++)
+        memcpy((char *)dst->data + (size_t)(r * dc + col) * es, (const char *)src->data + (size_t)(r * sc) * es,
+               (size_t)sc * es);
+    return ATH_OK;
+}
+
 /* The matmuls of rmsnorm(x) (norm: the param of its weights, zero-centered):
  * the norm into a temporary, then the projections that share it. A
  * projection waiting to join x (matmul_add) is added in the norm's launch
@@ -487,19 +503,126 @@ ath_status ath_qwen35_forward(const ath_model *m, const ath_batch *b, ath_state 
     if (h && h->on_residual)
         h->on_residual(h->u, c->n_layers, &x);
 
+    /* every token's output after the final norm, for the draft head (step
+     * 13): the norm of every row (the norm of each row is the same whatever
+     * the rows around it), the logits from its rows */
+    ath_tensor xn;
+    if (b->hidden) {
+        ATH_CHECK(norm_into(&f, &x, q->norm, &xn));
+        ATH_CHECK(f.dev ? ath_copy(f.dev, b->hidden->data, xn.data, ath_tensor_nbytes(&xn), ATH_STREAM_COMPUTE)
+                        : (memcpy(b->hidden->data, xn.data, ath_tensor_nbytes(&xn)), ATH_OK));
+    }
     if (!b->logits)
         return ATH_OK;
     /* final norm and output projection on the rows that need logits */
-    ath_tensor rows = x, logits = *b->logits;
+    ath_tensor rows = b->hidden ? xn : x, logits = *b->logits;
     if (b->logits->shape[0] == 1)
-        ATH_CHECK(ath_tensor_slice(&x, 0, T - 1, 1, &rows));
+        ATH_CHECK(ath_tensor_slice(b->hidden ? &xn : &x, 0, T - 1, 1, &rows));
     if (f.dev && !on_dev)
         ATH_CHECK(tmp(&f, &logits, ATH_DTYPE_F32, 2, rows.shape[0], m->vocab_size, 0));
     const ath_tensor *hw[] = {W(&f, q->head)};
     ath_tensor *ho[] = {&logits};
-    ATH_CHECK(norm_matmuls(&f, &rows, q->norm, 1, hw, ho));
+    if (b->hidden)
+        ATH_CHECK(ath_matmul_n(f.dev, f.pool, &rows, 1, hw, ho));
+    else
+        ATH_CHECK(norm_matmuls(&f, &rows, q->norm, 1, hw, ho));
     if (!f.dev || on_dev)
         return ATH_OK;          /* a device batch: no copy and no wait */
     ATH_CHECK(ath_copy(f.dev, b->logits->data, logits.data, ath_tensor_nbytes(&logits), ATH_STREAM_COMPUTE));
+    return ath_stream_sync(f.dev, ATH_STREAM_COMPUTE);
+}
+
+/* ---- the draft head (multi-token prediction, step 13) ------------------------------
+
+ * Row i is position p of the main model: the token after it, t = tokens[i],
+ * and the main model's output there, h = hidden row i (vLLM 0.34.0,
+ * qwen3_5_mtp.py; contract qwen35-0.8b.md, Draft head):
+ *
+ *   x = fc([rmsnorm_e(embed(t)); rmsnorm_h(h)])      [2 hidden] -> [hidden]
+ *   x = layer(x)          full attention (its own cache, at position p) and
+ *                         the main layers' MLP or MoE
+ *   logits = rmsnorm(x) · headᵀ                      the main model's head
+ *
+ * The guess only decides how many tokens a decode step keeps, never which
+ * (src/infer/spec.c), so its arithmetic is free; it follows the main
+ * layers' code. */
+ath_status ath_qwen35_draft(const ath_model *m, const ath_draft *d, ath_state *s, ath_arena *scratch,
+                            const ath_exec *x_)
+{
+    const ath_qwen35_model *q = m->family_data;
+    const ath_qwen35_config *c = &q->c;
+    if (!q->n_draft)
+        return ATH_ERR_UNSUPPORTED;
+    fwd f = {
+        .m = m, .c = c, .s = s, .a = scratch, .pool = x_->pool, .dev = x_->dev, .da = x_->scratch,
+        .w = x_->dev ? x_->weights : NULL, .x = x_, .act = s->act, .T = d->n_tokens, .P = d->pos0,
+        .eps = (float)c->rms_eps, .noff = q->norm_offset, .gguf = q->gguf,
+    };
+    if (f.dev && !W(&f, q->d_fc)->data) {
+        ath_log(ATH_LOG_ERROR, "qwen35: the draft head is not on the device (the engine places it on request)");
+        return ATH_ERR_UNSUPPORTED;
+    }
+    const int64_t T = f.T, H = c->hidden;
+    const bool on_dev = d->flags & ATH_BATCH_DEVICE;
+    const int64_t one[1] = {T};
+    ath_tensor ids;
+    if (on_dev) {
+        ATH_CHECK(ath_tensor_init(&ids, ATH_DTYPE_I32, 1, one, (void *)d->tokens, ATH_TIER_VRAM));
+        ATH_CHECK(ath_tensor_init(&f.pos, ATH_DTYPE_I32, 1, one, (void *)d->pos, ATH_TIER_VRAM));
+    } else {
+        ath_tensor pos_host;
+        ATH_CHECK(ath_tensor_init(&pos_host, ATH_DTYPE_I32, 1, one, NULL, ATH_TIER_RAM));
+        pos_host.data = ath_arena_alloc(scratch, (size_t)T * sizeof(int32_t), 64);
+        if (!pos_host.data)
+            return ATH_ERR_NOMEM;
+        for (int64_t i = 0; i < T; i++)
+            ((int32_t *)pos_host.data)[i] = (int32_t)(d->pos0 + i);
+        if (f.dev) {
+            ATH_CHECK(tmp(&f, &ids, ATH_DTYPE_I32, 1, T, 0, 0));
+            ATH_CHECK(tmp(&f, &f.pos, ATH_DTYPE_I32, 1, T, 0, 0));
+            ATH_CHECK(ath_copy(f.dev, ids.data, d->tokens, (size_t)T * sizeof(int32_t), ATH_STREAM_COMPUTE));
+            ATH_CHECK(ath_copy(f.dev, f.pos.data, pos_host.data, (size_t)T * sizeof(int32_t), ATH_STREAM_COMPUTE));
+        } else {
+            ATH_CHECK(ath_tensor_init(&ids, ATH_DTYPE_I32, 1, one, (void *)d->tokens, ATH_TIER_RAM));
+            f.pos = pos_host;
+        }
+    }
+    /* fc of the two normalized halves side by side */
+    ath_tensor e, en, hn, cat, x;
+    ATH_CHECK(tmp(&f, &e, f.act, 2, T, H, 0));
+    ATH_CHECK(ath_embed(f.dev, W(&f, q->embed), &ids, &e));
+    ATH_CHECK(tmp(&f, &en, f.act, 2, T, H, 0));
+    ATH_CHECK(tmp(&f, &hn, f.act, 2, T, H, 0));
+    ATH_CHECK(ath_rmsnorm(f.dev, &e, W(&f, q->d_enorm), f.noff, f.eps, &en));
+    ATH_CHECK(ath_rmsnorm(f.dev, d->hidden, W(&f, q->d_hnorm), f.noff, f.eps, &hn));
+    ATH_CHECK(tmp(&f, &cat, f.act, 2, T, 2 * H, 0));
+    ATH_CHECK(put_cols(&f, &en, 0, &cat));
+    ATH_CHECK(put_cols(&f, &hn, H, &cat));
+    ATH_CHECK(tmp(&f, &x, f.act, 2, T, H, 0));
+    ATH_CHECK(ath_matmul(f.dev, f.pool, &cat, W(&f, q->d_fc), &x));
+    for (int32_t i = 0; i < q->n_draft; i++) {
+        const ath_qwen35_layer *L = &q->draft[i];
+        ath_arena_pos mark = ath_arena_mark(scratch);
+        ath_dev_arena_pos dmark = f.dev ? ath_dev_arena_mark(f.da) : (ath_dev_arena_pos){0};
+        ath_status st = attention(&f, L, &x);
+        if (st == ATH_OK)
+            st = c->moe ? moe(&f, c->n_layers + i, L, &x) : mlp(&f, L, &x);
+        if (f.dev)
+            ath_dev_arena_reset(f.da, dmark);
+        ath_arena_reset(scratch, mark);
+        ATH_CHECK(st);
+    }
+    if (!d->logits)
+        return ATH_OK;
+    ath_tensor rows, logits = *d->logits;
+    ATH_CHECK(ath_tensor_slice(&x, 0, T - 1, 1, &rows));
+    if (f.dev && !on_dev)
+        ATH_CHECK(tmp(&f, &logits, ATH_DTYPE_F32, 2, 1, m->vocab_size, 0));
+    const ath_tensor *hw[] = {W(&f, q->head)};
+    ath_tensor *ho[] = {&logits};
+    ATH_CHECK(norm_matmuls(&f, &rows, q->d_norm, 1, hw, ho));
+    if (!f.dev || on_dev)
+        return ATH_OK;
+    ATH_CHECK(ath_copy(f.dev, d->logits->data, logits.data, ath_tensor_nbytes(&logits), ATH_STREAM_COMPUTE));
     return ath_stream_sync(f.dev, ATH_STREAM_COMPUTE);
 }

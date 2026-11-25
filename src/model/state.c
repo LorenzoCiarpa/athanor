@@ -16,7 +16,7 @@
 /* Buffers start on a cache line, which also satisfies every element type. */
 #define STATE_ALIGN 64
 
-static const char *const kind_names[] = {"kv", "conv", "recurrent"};
+static const char *const kind_names[] = {"kv", "conv", "recurrent", "hidden"};
 _Static_assert(ATH_ARRAY_LEN(kind_names) == ATH_STATE_KIND_COUNT, "one name per state kind");
 
 const char *ath_state_kind_name(ath_state_kind k)
@@ -135,6 +135,7 @@ ath_status ath_state_reset(ath_state *s, const ath_model *m)
     if (!s || !m || !s->buf)
         return ATH_ERR_INVALID_ARG;
     s->n_past = 0;
+    s->n_draft = 0;
     for (uint32_t i = 0; i < m->n_states; i++) {
         const ath_state_spec *sp = &m->states[i];
         if (sp->kind == ATH_STATE_KV)
@@ -165,6 +166,7 @@ ath_status ath_state_copy(ath_state *dst, const ath_state *src, const ath_model 
             memcpy(dst->buf[i], src->buf[i], b);
     }
     dst->n_past = src->n_past;
+    dst->n_draft = src->n_draft;
     return ATH_OK;
 }
 
@@ -201,6 +203,69 @@ static ath_status check_logits(const ath_model *m, const ath_batch *b)
     return ATH_OK;
 }
 
+/* An activation tensor [rows, hidden_size] in the state's dtype, where the
+ * pass runs. */
+static ath_status check_hidden(const ath_model *m, const ath_tensor *t, int32_t rows, const ath_state *s,
+                               const char *what)
+{
+    if (!t->data)
+        return bad(ATH_ERR_INVALID_ARG, "%s: no data", what);
+    if (t->dtype != s->act)
+        return bad(ATH_ERR_TYPE, "%s: dtype %s; the state's is %s", what, ath_dtype_name(t->dtype),
+                   ath_dtype_name(s->act));
+    if (s->dev ? t->tier != ATH_TIER_VRAM : t->tier != ATH_TIER_RAM && t->tier != ATH_TIER_PINNED)
+        return bad(ATH_ERR_UNSUPPORTED, "%s: tensor in %s; expected %s memory", what, ath_tier_name(t->tier),
+                   s->dev ? "device" : "host");
+    if (t->ndim != 2 || t->shape[0] != rows || t->shape[1] != m->hidden_size || !ath_tensor_is_contiguous(t))
+        return bad(ATH_ERR_INVALID_ARG, "%s: expected a contiguous [%d, %d] tensor", what, rows, m->hidden_size);
+    return ATH_OK;
+}
+
+ath_status ath_model_draft(const ath_model *m, const ath_draft *d, ath_state *s, ath_arena *scratch,
+                           const ath_exec *x)
+{
+    if (!m || !m->family || !d || !s || !scratch)
+        return bad(ATH_ERR_INVALID_ARG, "draft: missing model, rows, state or scratch arena");
+    if (!m->family->draft || m->n_draft_layers < 1)
+        return bad(ATH_ERR_UNSUPPORTED, "draft: the model has no draft head");
+    if (!s->buf || !act_ok(s->act))
+        return bad(ATH_ERR_INVALID_ARG, "draft: state not initialized (ath_state_init)");
+    if (d->n_tokens < 1 || !d->tokens || !d->hidden)
+        return bad(ATH_ERR_INVALID_ARG, "draft: empty rows");
+    if (d->flags & ~ATH_BATCH_DEVICE)
+        return bad(ATH_ERR_INVALID_ARG, "draft: unknown flags 0x%x", d->flags);
+    const bool on_dev = d->flags & ATH_BATCH_DEVICE;
+    if (on_dev ? !d->pos || !x || !x->dev : d->pos != NULL)
+        return bad(ATH_ERR_INVALID_ARG, "draft: positions are given with a device batch, on a GPU, and only then");
+    if (!on_dev) {
+        if (d->pos0 < 0 || d->pos0 + d->n_tokens > s->n_past + 1 || d->pos0 + d->n_tokens > s->capacity)
+            return bad(ATH_ERR_RANGE, "draft: rows at %d to %d with %d tokens run (state of %d)", d->pos0,
+                       d->pos0 + d->n_tokens - 1, s->n_past, s->capacity);
+        for (int32_t i = 0; i < d->n_tokens; i++)
+            if (d->tokens[i] < 0 || d->tokens[i] >= m->vocab_size)
+                return bad(ATH_ERR_RANGE, "draft: token %d at index %d is outside the vocabulary", d->tokens[i], i);
+    }
+    ATH_CHECK(check_hidden(m, d->hidden, d->n_tokens, s, "draft hidden"));
+    if (d->logits) {
+        const ath_batch lb = {.n_tokens = 1, .logits = d->logits, .flags = d->flags};
+        ATH_CHECK(check_logits(m, &lb));
+    }
+    const ath_exec cpu = {.pool = NULL};
+    if (!x)
+        x = &cpu;
+    if (x->dev != s->dev)
+        return bad(ATH_ERR_INVALID_ARG, "draft: the state and the pass are not on the same side");
+    if (x->dev && (!x->weights || !x->scratch))
+        return bad(ATH_ERR_INVALID_ARG, "draft: a GPU pass needs the weights on the device and a device scratch arena");
+    ath_arena_pos mark = ath_arena_mark(scratch);
+    ath_dev_arena_pos dmark = x->dev ? ath_dev_arena_mark(x->scratch) : (ath_dev_arena_pos){0};
+    ath_status st = m->family->draft(m, d, s, scratch, x);
+    if (x->dev)
+        ath_dev_arena_reset(x->scratch, dmark);
+    ath_arena_reset(scratch, mark);
+    return st;
+}
+
 ath_status ath_model_forward(const ath_model *m, const ath_batch *b, ath_state *s, const ath_hooks *h,
                              ath_arena *scratch, const ath_exec *x)
 {
@@ -225,6 +290,8 @@ ath_status ath_model_forward(const ath_model *m, const ath_batch *b, ath_state *
             return bad(ATH_ERR_RANGE, "token %d at index %d is outside the vocabulary [0, %d)", b->tokens[i], i,
                        m->vocab_size);
     ATH_CHECK(check_logits(m, b));
+    if (b->hidden)
+        ATH_CHECK(check_hidden(m, b->hidden, b->n_tokens, s, "hidden"));
     const ath_exec cpu = {.pool = NULL};
     if (!x)
         x = &cpu;

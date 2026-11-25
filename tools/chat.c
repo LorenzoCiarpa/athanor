@@ -28,6 +28,7 @@
 #include "core/json.h"
 #include "core/rng.h"
 #include "infer/engine.h"
+#include "infer/spec.h"
 #include "model/model.h"
 #include "ops/ops.h"
 
@@ -62,12 +63,15 @@ void ath_cmd_chat_usage(FILE *out)
             "  --experts <n>        MoE: routed experts per layer kept in device memory\n"
             "                       (default: as many as fit; the rest run on the CPU)\n"
             "  --f32                f32 activations instead of bf16 (slower)\n"
+            "  --mtp                decode speculatively with the model's draft head: the same\n"
+            "                       tokens, fewer passes (on a GPU slower than the default\n"
+            "                       decoder until its passes are recorded too)\n"
             "  --stats              print prompt and decode speed after each answer (stderr)\n");
 }
 
 typedef struct {
     const char  *dir, *prompt, *system, *tools_file, *device;
-    bool         think, f32, stats;
+    bool         think, f32, stats, mtp;
     ath_sampler  sampler;
     bool         temp_set, top_p_set;
     uint64_t     seed;
@@ -145,6 +149,7 @@ typedef struct {
     ath_pool         pool;
     ath_engine      *engine;        /* NULL on the CPU                               */
     ath_decoder     *dec;           /* the engine's decoder of state (step 9)         */
+    ath_spec        *spec;          /* with --mtp: the speculative decoder (step 13)  */
     ath_exec         exec;          /* where the forward pass runs                   */
     ath_state        state, snap;
     ath_tokens       seen;          /* the tokens the state holds                    */
@@ -173,6 +178,8 @@ static ath_status feed(session *s, const int32_t *ids, size_t from, size_t to, b
     if (from == to)
         return ATH_OK;
     ath_batch b = {.tokens = ids + from, .n_tokens = (int32_t)(to - from), .logits = want ? &s->logits : NULL};
+    if (s->spec)   /* the draft head runs over the tokens too */
+        return ath_spec_feed(s->spec, b.tokens, b.n_tokens, want ? s->logits.data : NULL);
     return ath_model_forward(&s->m, &b, &s->state, NULL, s->scratch, &s->exec);
 }
 
@@ -310,10 +317,30 @@ static ath_status turn(session *s, history *h, ath_arena *tmp)
      * runs each token and chooses the next on the device (one u per token
      * chosen, as on the CPU) */
     int32_t next = 0;
+    /* with --mtp: a speculative step's tokens, and the uniform number a
+     * one-token step left unused */
+    int32_t queue[2], nq = 0, qi = 0;
+    double carry = -1;
+    ath_tokens emitted;
+    ath_tokens_init(&emitted, tmp);
+    const size_t prompt_n = s->seen.n;
     if (limit > 0)
         ATH_CHECK(ath_sample_ref(&s->logits, &o->sampler, ath_rng_uniform(&s->rng), s->scratch, &next));
     for (; n_gen < limit; n_gen++) {
-        if (n_gen > 0 && !s->dec)
+        if (n_gen > 0 && s->spec) {
+            if (qi == nq) {
+                if (s->state.n_past + ATH_SPEC_ROWS > o->ctx)
+                    break;
+                double u[2];
+                u[0] = carry >= 0 ? carry : ath_rng_uniform(&s->rng);
+                u[1] = ath_rng_uniform(&s->rng);
+                int32_t k = 0;
+                ATH_CHECK(ath_spec_step(s->spec, u, queue, &k));
+                nq = k, qi = 0;
+                carry = k == 1 ? u[1] : -1;
+            }
+            next = queue[qi++];
+        } else if (n_gen > 0 && !s->dec)
             ATH_CHECK(ath_sample_ref(&s->logits, &o->sampler, ath_rng_uniform(&s->rng), s->scratch, &next));
         if (next == s->eos[0] || next == s->eos[1])
             break;
@@ -321,13 +348,21 @@ static ath_status turn(session *s, history *h, ath_arena *tmp)
         const char *piece = ath_tokenizer_token(&s->tok, next, &len);
         ATH_CHECK(ath_model_parse(&s->m, &ps, piece, len, ev, 64, &ne));
         show(s, &ans, ev, ne, h->a);
-        if (n_gen + 1 < limit && s->dec) {
+        ATH_CHECK(ath_tokens_push(&emitted, next));
+        if (s->spec) {
+            if (n_gen == 0 && n_gen + 1 < limit)
+                ATH_CHECK(ath_spec_begin(s->spec, next));
+        } else if (n_gen + 1 < limit && s->dec) {
             ATH_CHECK(ath_tokens_push(&s->seen, next));
             ATH_CHECK(ath_decoder_step(s->dec, next, ath_rng_uniform(&s->rng), &next));
         } else if (n_gen + 1 < limit) {
             ATH_CHECK(feed(s, &next, 0, 1, true));
         }
     }
+    /* the state holds the prompt and the answer up to n_past (a speculative
+     * step leaves its last token for the next pass) */
+    for (size_t i = s->seen.n - prompt_n; s->spec && s->seen.n < (size_t)s->state.n_past && i < emitted.n; i++)
+        ATH_CHECK(ath_tokens_push(&s->seen, emitted.ids[i]));
     ATH_CHECK(ath_model_parse(&s->m, &ps, NULL, 0, ev, 64, &ne));
     show(s, &ans, ev, ne, h->a);
     if (ans.in_thinking && s->tty)
@@ -413,6 +448,7 @@ static int parse_options(options *o, int argc, char **argv)
         if (!strcmp(a, "--think")) { o->think = true; continue; }
         if (!strcmp(a, "--f32")) { o->f32 = true; continue; }
         if (!strcmp(a, "--stats")) { o->stats = true; continue; }
+        if (!strcmp(a, "--mtp")) { o->mtp = true; continue; }
         if (a[0] == '-' && !v)
             return usage_error("missing value for", a);
         if (!strcmp(a, "-p") || !strcmp(a, "--prompt")) o->prompt = v;
@@ -534,7 +570,7 @@ int ath_cmd_chat(ath_arena *a, int argc, char **argv)
     bool gpu = o.device ? !strcmp(o.device, "gpu") : ath_gpu_count() > 0;
     if (st == ATH_OK && gpu) {
         s->engine = ath_arena_zalloc(a, sizeof *s->engine, _Alignof(ath_engine));
-        const ath_place_opts po = {.slots = s->opt->experts};
+        const ath_place_opts po = {.slots = s->opt->experts, .draft = o.mtp};
         st = s->engine ? ath_engine_open_tier(s->engine, &s->m, 0, &po, a) : ATH_ERR_NOMEM;
         if (st != ATH_OK) {
             fprintf(stderr, "athanor chat: no GPU (%s)%s\n", ath_status_str(st),
@@ -549,7 +585,7 @@ int ath_cmd_chat(ath_arena *a, int argc, char **argv)
         st = ath_engine_state(s->engine, &s->state, act, o.ctx, a);
         if (st == ATH_OK && !o.prompt)
             st = ath_engine_state(s->engine, &s->snap, act, o.ctx, a);
-        if (st == ATH_OK) {
+        if (st == ATH_OK && !o.mtp) {
             ath_decoder *dec = ath_arena_zalloc(a, sizeof *dec, _Alignof(ath_decoder));
             st = dec ? ath_decoder_open(dec, s->engine, &s->state, &o.sampler, a) : ATH_ERR_NOMEM;
             if (st == ATH_OK)
@@ -567,6 +603,14 @@ int ath_cmd_chat(ath_arena *a, int argc, char **argv)
         st = ath_pool_init(&s->pool, o.threads, a);
     if (st == ATH_OK && !s->engine)
         s->exec = (ath_exec){.pool = &s->pool};
+    if (st == ATH_OK && o.mtp) {
+        ath_spec *sp = ath_arena_zalloc(a, sizeof *sp, _Alignof(ath_spec));
+        st = sp ? ath_spec_open(sp, &s->m, &s->state, &s->exec, &o.sampler, 4096, a) : ATH_ERR_NOMEM;
+        if (st == ATH_OK)
+            s->spec = sp;
+        else if (st == ATH_ERR_UNSUPPORTED)
+            fprintf(stderr, "athanor chat: --mtp: the model has no draft head\n");
+    }
     if (st == ATH_OK) {
         ath_tokens_init(&s->seen, a);
         s->eos[0] = ath_tokenizer_added(&s->tok, "<|im_end|>");
@@ -578,6 +622,12 @@ int ath_cmd_chat(ath_arena *a, int argc, char **argv)
     }
     if (s->dec)
         ath_decoder_close(s->dec);
+    if (s->spec) {
+        if (o.stats)
+            fprintf(stderr, "athanor chat: %llu passes, %llu guesses kept\n", (unsigned long long)s->spec->passes,
+                    (unsigned long long)s->spec->accepted);
+        ath_spec_close(s->spec);
+    }
     if (s->engine)
         ath_engine_close(s->engine);
     ath_model_close(&s->m);

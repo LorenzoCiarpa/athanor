@@ -389,15 +389,17 @@ ATH_TEST(real_state_specs)
     int n[ATH_STATE_KIND_COUNT] = {0};
     for (uint32_t i = 0; i < m.n_states; i++)
         n[m.states[i].kind]++;
-    printf("  %u state specs: %d kv, %d conv, %d recurrent\n", m.n_states, n[ATH_STATE_KV], n[ATH_STATE_CONV],
-           n[ATH_STATE_RECURRENT]);
-    /* one KV per attention layer, conv and recurrent per Gated DeltaNet layer */
+    printf("  %u state specs: %d kv, %d conv, %d recurrent, %d hidden\n", m.n_states, n[ATH_STATE_KV],
+           n[ATH_STATE_CONV], n[ATH_STATE_RECURRENT], n[ATH_STATE_HIDDEN]);
+    /* one KV per attention layer, conv and recurrent per Gated DeltaNet
+     * layer; the draft head's layers (attention) and its waiting input */
     int attention = 0;
     for (int32_t l = 0; l < m.n_layers; l++)
         attention += strcmp(m.layers[l].mixer, "attention") == 0;
-    ATH_EXPECT(n[ATH_STATE_KV] == attention);
+    ATH_EXPECT(n[ATH_STATE_KV] == attention + m.n_draft_layers);
     ATH_EXPECT(n[ATH_STATE_CONV] == m.n_layers - attention);
     ATH_EXPECT(n[ATH_STATE_RECURRENT] == m.n_layers - attention);
+    ATH_EXPECT(n[ATH_STATE_HIDDEN] == (m.n_draft_layers ? 1 : 0));
     size_t b1, b2;
     ATH_EXPECT_OK(ath_state_bytes(&m, ATH_DTYPE_BF16, 1, &b1));
     ATH_EXPECT_OK(ath_state_bytes(&m, ATH_DTYPE_BF16, 4097, &b2));
