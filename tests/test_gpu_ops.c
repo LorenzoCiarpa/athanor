@@ -226,7 +226,7 @@ ATH_TEST(gpu_argument_checks)
     /* limits of the kernels beyond the reference's */
     ath_tensor q = fake(ATH_DTYPE_BF16, ATH_TIER_VRAM, SHAPE(1, 1, ATH_ATTN_MAX_DV + 1));
     ath_tensor v = fake(ATH_DTYPE_BF16, ATH_TIER_VRAM, SHAPE(1, 1, 64)), o = fake(ATH_DTYPE_BF16, ATH_TIER_VRAM, SHAPE(1, 1, 64));
-    ATH_EXPECT_STATUS(ath_attn_gpu(d, &q, &q, &v, 1.0f, &o), ATH_ERR_UNSUPPORTED);
+    ATH_EXPECT_STATUS(ath_attn_gpu(d, &q, &q, &v, NULL, 1.0f, NULL, &o), ATH_ERR_UNSUPPORTED);
     ath_tensor gq = fake(ATH_DTYPE_F32, ATH_TIER_VRAM, SHAPE(1, 1, ATH_GDN_MAX_DK + 1));
     ath_tensor gv = fake(ATH_DTYPE_F32, ATH_TIER_VRAM, SHAPE(1, 1, 8)), gg = fake(ATH_DTYPE_F32, ATH_TIER_VRAM, SHAPE(1, 1));
     ath_tensor gs = fake(ATH_DTYPE_F32, ATH_TIER_VRAM, SHAPE(1, ATH_GDN_MAX_DK + 1, 8));
@@ -311,11 +311,74 @@ ATH_TEST(gpu_matmul)
             ATH_REQUIRE_OK(ath_tensor_slice(&xbd, 0, 1, N, &xd));
             ATH_EXPECT_OK(ath_matmul_gpu(&g.d, &xd, &wd, &out));
             char what[96];
+            /* the GEMV kernel takes a few rows of 16-byte pieces against bf16 weights (step 9) */
+            const bool gemv = N <= 8 && kinds[k].w == ATH_DTYPE_BF16 && K % 8 == 0;
             snprintf(what, sizeof what, "matmul %lldx%lldx%lld %s·%s %s", (long long)N, (long long)K, (long long)M,
-                     dt_name(kinds[k].x), dt_name(kinds[k].w), kinds[k].path);
+                     dt_name(kinds[k].x), dt_name(kinds[k].w), gemv ? "GEMV" : kinds[k].path);
             EXPECT_CLOSE(g, what, out, want, 2e-5, 1);
             ath_dev_arena_reset(&g.dev, mark);   /* the comparison has waited for the stream */
         }
+    gpu_close(&g);
+}
+
+/* The GEMV kernel (step 9): every row count it takes, K from one 16-byte
+ * piece to more than a lane's four, odd M, both activation dtypes into
+ * both output dtypes; an x that is not on a 16-byte boundary goes to the
+ * other kernels and gives the same answer within the tolerance; and a row
+ * gives the same bits alone as among others, since the order of its sum
+ * depends on K only. */
+ATH_TEST(gpu_gemv)
+{
+    gpu g;
+    GPU_OR_SKIP(g);
+    static const int64_t Ks[] = {8, 1024, 1032, 3584};
+    static const int64_t Ms[] = {1, 37, 1000};
+    static const ath_dtype xs[] = {ATH_DTYPE_BF16, ATH_DTYPE_F32};
+    static const ath_dtype outs[] = {ATH_DTYPE_BF16, ATH_DTYPE_F32};
+    const ath_dev_arena_pos mark = ath_dev_arena_mark(&g.dev);
+    for (size_t ki = 0; ki < ATH_ARRAY_LEN(Ks); ki++)
+        for (size_t mi = 0; mi < ATH_ARRAY_LEN(Ms); mi++)
+            for (size_t xi = 0; xi < ATH_ARRAY_LEN(xs); xi++)
+                for (size_t oi = 0; oi < ATH_ARRAY_LEN(outs); oi++)
+                    for (int64_t N = 1; N <= 9; N++) {
+                        const int64_t K = Ks[ki], M = Ms[mi];
+                        ath_tensor x = rand_t(&g, xs[xi], -1, 1, SHAPE(N, K));
+                        ath_tensor w = rand_t(&g, ATH_DTYPE_BF16, -1, 1, SHAPE(M, K));
+                        ath_tensor want = host(&g, outs[oi], SHAPE(N, M));
+                        ATH_REQUIRE_OK(ath_matmul_ref(&x, &w, &want));
+                        ath_tensor xd = up(&g, &x), wd = up(&g, &w), out = up(&g, &want);
+                        ATH_EXPECT_OK(ath_matmul_gpu(&g.d, &xd, &wd, &out));
+                        char what[96];
+                        snprintf(what, sizeof what, "gemv %lldx%lldx%lld %s→%s%s", (long long)N, (long long)K,
+                                 (long long)M, dt_name(xs[xi]), dt_name(outs[oi]), N > 8 ? " (9 rows: not GEMV)" : "");
+                        EXPECT_CLOSE(g, what, out, want, 2e-5, 1);
+                        if (N > 1 && N <= 8) {   /* the last row alone: the same bits */
+                            ath_tensor xl, ol, one = host(&g, outs[oi], SHAPE(1, M));
+                            ATH_REQUIRE_OK(ath_tensor_slice(&xd, 0, N - 1, 1, &xl));
+                            ath_tensor od = up(&g, &one);
+                            ATH_EXPECT_OK(ath_matmul_gpu(&g.d, &xl, &wd, &od));
+                            ATH_REQUIRE_OK(ath_tensor_slice(&out, 0, N - 1, 1, &ol));
+                            ATH_EXPECT(same_bits(&g, &od, &ol));
+                        }
+                        ath_dev_arena_reset(&g.dev, mark);
+                    }
+    /* x four bytes past a 16-byte boundary: not the GEMV kernel, the same answer */
+    {
+        const int64_t N = 2, K = 1024, M = 333;
+        ath_tensor xbig = rand_t(&g, ATH_DTYPE_F32, -1, 1, SHAPE(N * K + 1)), x;
+        ath_tensor flat;
+        ATH_REQUIRE_OK(ath_tensor_slice(&xbig, 0, 1, N * K, &flat));
+        ATH_REQUIRE_OK(ath_tensor_reshape(&flat, 2, (const int64_t[]){N, K}, &x));
+        ath_tensor w = rand_t(&g, ATH_DTYPE_BF16, -1, 1, SHAPE(M, K));
+        ath_tensor want = host(&g, ATH_DTYPE_F32, SHAPE(N, M));
+        ATH_REQUIRE_OK(ath_matmul_ref(&x, &w, &want));
+        ath_tensor xbd = up(&g, &xbig), xfd, xd, wd = up(&g, &w), out = up(&g, &want);
+        ATH_REQUIRE_OK(ath_tensor_slice(&xbd, 0, 1, N * K, &xfd));
+        ATH_REQUIRE_OK(ath_tensor_reshape(&xfd, 2, (const int64_t[]){N, K}, &xd));
+        ATH_EXPECT_OK(ath_matmul_gpu(&g.d, &xd, &wd, &out));
+        EXPECT_CLOSE(g, "gemv, x not on a 16-byte boundary (own kernel)", out, want, 2e-5, 1);
+        ath_dev_arena_reset(&g.dev, mark);
+    }
     gpu_close(&g);
 }
 
@@ -432,13 +495,38 @@ static void attn_case(ath_test *t_, gpu *g, ath_dtype in, ath_dtype ot, int64_t 
     ath_tensor q = rand_t(g, in, -1, 1, SHAPE(T, nh, d)), k = rand_t(g, in, -1, 1, SHAPE(S, nkv, d));
     ath_tensor v = rand_t(g, in, -1, 1, SHAPE(S, nkv, dv)), want = host(g, ot, SHAPE(T, nh, dv));
     const float scale = 1.0f / sqrtf((float)d);
-    ATH_REQUIRE_OK(ath_attn_ref(&q, &k, &v, scale, &want));
-    ath_tensor qd = up(g, &q), kd = up(g, &k), vd = up(g, &v), out = up(g, &want);
-    ATH_EXPECT_OK(ath_attn_gpu(&g->d, &qd, &kd, &vd, scale, &out));
+    ATH_REQUIRE_OK(ath_attn_ref(&q, &k, &v, NULL, scale, &want));
+    ath_tensor qd = up(g, &q), kd = up(g, &k), vd = up(g, &v), out = up(g, &want), split = up(g, &want);
+    ATH_EXPECT_OK(ath_attn_gpu(&g->d, &qd, &kd, &vd, NULL, scale, NULL, &out));
     char what[96];
     snprintf(what, sizeof what, "attn T %lld S %lld heads %lld/%lld d %lld/%lld, %s in", (long long)T, (long long)S,
              (long long)nh, (long long)nkv, (long long)d, (long long)dv, dt_name(in));
     expect_close(t_, g, what, &out, &want, 1e-5, 1);
+    /* with scratch, a few queries go split-K: the same bits as the rows */
+    ATH_EXPECT_OK(ath_attn_gpu(&g->d, &qd, &kd, &vd, NULL, scale, &g->dev, &split));
+    ATH_EXPECT(same_bits(g, &split, &out));
+}
+
+/* Positions (step 9): queries anywhere in a whole cache whose other rows
+ * are noise, against the reference with the same positions, rows and
+ * split-K alike and with the same bits; a position outside the cache gives
+ * a row of NaN on the GPU. */
+static void attn_pos_case(ath_test *t_, gpu *g, int64_t T, int64_t S, const int32_t *p)
+{
+    const int64_t nh = 8, nkv = 2, d = 256;
+    ath_tensor q = rand_t(g, ATH_DTYPE_BF16, -1, 1, SHAPE(T, nh, d)), k = rand_t(g, ATH_DTYPE_BF16, -1, 1, SHAPE(S, nkv, d));
+    ath_tensor v = rand_t(g, ATH_DTYPE_BF16, -1, 1, SHAPE(S, nkv, d)), want = host(g, ATH_DTYPE_BF16, SHAPE(T, nh, d));
+    ath_tensor pos = host(g, ATH_DTYPE_I32, SHAPE(T));
+    memcpy(pos.data, p, (size_t)T * sizeof *p);
+    ATH_REQUIRE_OK(ath_attn_ref(&q, &k, &v, &pos, 0.0625f, &want));
+    ath_tensor qd = up(g, &q), kd = up(g, &k), vd = up(g, &v), pd = up(g, &pos), rows = up(g, &want),
+               split = up(g, &want);
+    ATH_EXPECT_OK(ath_attn_gpu(&g->d, &qd, &kd, &vd, &pd, 0.0625f, NULL, &rows));
+    ATH_EXPECT_OK(ath_attn_gpu(&g->d, &qd, &kd, &vd, &pd, 0.0625f, &g->dev, &split));
+    char what[96];
+    snprintf(what, sizeof what, "attn with positions, T %lld in a cache of %lld", (long long)T, (long long)S);
+    expect_close(t_, g, what, &rows, &want, 1e-5, 1);
+    ATH_EXPECT(same_bits(g, &split, &rows));
 }
 
 ATH_TEST(gpu_attn)
@@ -457,13 +545,53 @@ ATH_TEST(gpu_attn)
     ath_tensor q = rand_t(&g, ATH_DTYPE_BF16, -1, 1, SHAPE(70, 8, 256)), k = rand_t(&g, ATH_DTYPE_BF16, -1, 1, SHAPE(70, 2, 256));
     ath_tensor v = rand_t(&g, ATH_DTYPE_BF16, -1, 1, SHAPE(70, 2, 256)), o = host(&g, ATH_DTYPE_BF16, SHAPE(70, 8, 256));
     ath_tensor qd = up(&g, &q), kd = up(&g, &k), vd = up(&g, &v), od = up(&g, &o), q1, o1, last;
-    ATH_EXPECT_OK(ath_attn_gpu(&g.d, &qd, &kd, &vd, 0.0625f, &od));
+    ATH_EXPECT_OK(ath_attn_gpu(&g.d, &qd, &kd, &vd, NULL, 0.0625f, NULL, &od));
     ATH_REQUIRE_OK(ath_tensor_slice(&qd, 0, 69, 1, &q1));
     ath_tensor o1h = host(&g, ATH_DTYPE_BF16, SHAPE(1, 8, 256));
     o1 = up(&g, &o1h);
-    ATH_EXPECT_OK(ath_attn_gpu(&g.d, &q1, &kd, &vd, 0.0625f, &o1));
+    ATH_EXPECT_OK(ath_attn_gpu(&g.d, &q1, &kd, &vd, NULL, 0.0625f, &g.dev, &o1));   /* split-K */
     ATH_REQUIRE_OK(ath_tensor_slice(&od, 0, 69, 1, &last));
     ATH_EXPECT(same_bits(&g, &o1, &last));
+    /* the same token given its position, over the cache as a whole */
+    ath_tensor ph = host(&g, ATH_DTYPE_I32, SHAPE(1));
+    ((int32_t *)ph.data)[0] = 69;
+    ath_tensor pd = up(&g, &ph), o2 = up(&g, &o1h);
+    ATH_EXPECT_OK(ath_attn_gpu(&g.d, &q1, &kd, &vd, &pd, 0.0625f, &g.dev, &o2));
+    ATH_EXPECT(same_bits(&g, &o2, &last));
+
+    static const int32_t p1[] = {0}, p3[] = {7, 300, 999}, p8[] = {0, 1, 255, 256, 257, 511, 512, 1999};
+    attn_pos_case(t_, &g, 1, 1, p1);
+    attn_pos_case(t_, &g, 3, 1000, p3);
+    attn_pos_case(t_, &g, 8, 2000, p8);
+
+    /* a position outside the cache: NaN, not a read outside it */
+    ((int32_t *)ph.data)[0] = 70;
+    pd = up(&g, &ph);
+    ATH_EXPECT_OK(ath_attn_gpu(&g.d, &q1, &kd, &vd, &pd, 0.0625f, &g.dev, &o2));
+    ath_tensor nan_row = down(&g, &o2);
+    ATH_EXPECT(isnan(ath_load_f32(nan_row.data, nan_row.dtype, 0)));
+    gpu_close(&g);
+}
+
+/* ---- scatter (step 9) ------------------------------------------------------------------ */
+
+ATH_TEST(gpu_scatter_rows)
+{
+    gpu g;
+    GPU_OR_SKIP(g);
+    static const struct { ath_dtype dt; int64_t row; } kinds[] = {{ATH_DTYPE_BF16, 512}, {ATH_DTYPE_F32, 7},
+                                                                    {ATH_DTYPE_BF16, 3}};
+    for (size_t i = 0; i < ATH_ARRAY_LEN(kinds); i++) {
+        ath_tensor src = rand_t(&g, kinds[i].dt, -1, 1, SHAPE(4, kinds[i].row));
+        ath_tensor dst = rand_t(&g, kinds[i].dt, -1, 1, SHAPE(10, kinds[i].row));
+        ath_tensor idx = host(&g, ATH_DTYPE_I32, SHAPE(4));
+        static const int32_t rows[] = {9, 0, 4, 5};
+        memcpy(idx.data, rows, sizeof rows);
+        ath_tensor sd = up(&g, &src), dd = up(&g, &dst), id = up(&g, &idx);
+        ATH_REQUIRE_OK(ath_scatter_rows_ref(&src, &idx, &dst));
+        ATH_EXPECT_OK(ath_scatter_rows_gpu(&g.d, &sd, &id, &dd));
+        EXPECT_CLOSE(g, "scatter_rows", dd, dst, 0, 0);
+    }
     gpu_close(&g);
 }
 
@@ -608,7 +736,7 @@ ATH_TEST(gpu_gdn)
 }
 
 static const ath_test_case tests[] = {
-    ATH_TEST_ENTRY(gpu_argument_checks), ATH_TEST_ENTRY(gpu_embed),       ATH_TEST_ENTRY(gpu_matmul),
+    ATH_TEST_ENTRY(gpu_argument_checks), ATH_TEST_ENTRY(gpu_embed),       ATH_TEST_ENTRY(gpu_matmul),      ATH_TEST_ENTRY(gpu_gemv), ATH_TEST_ENTRY(gpu_scatter_rows),
     ATH_TEST_ENTRY(gpu_norms),           ATH_TEST_ENTRY(gpu_rope),        ATH_TEST_ENTRY(gpu_elementwise),
     ATH_TEST_ENTRY(gpu_attn),            ATH_TEST_ENTRY(gpu_conv),        ATH_TEST_ENTRY(gpu_gdn_gates),
     ATH_TEST_ENTRY(gpu_gdn),

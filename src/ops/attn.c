@@ -16,8 +16,8 @@
 
 static const char op[] = "attn";
 
-static ath_status args(const ath_tensor *q, const ath_tensor *k, const ath_tensor *v, const ath_tensor *out,
-                       ops_where where)
+static ath_status args(const ath_tensor *q, const ath_tensor *k, const ath_tensor *v, const ath_tensor *pos,
+                       const ath_tensor *out, ops_where where)
 {
     ATH_CHECK(ops_float(q, op, "q"));
     ATH_CHECK(ops_float(k, op, "k"));
@@ -28,26 +28,36 @@ static ath_status args(const ath_tensor *q, const ath_tensor *k, const ath_tenso
     const int64_t T = q->shape[0], nh = q->shape[1], d = q->shape[2];
     const int64_t S = k->shape[0], nkv = k->shape[1], dv = v->shape[2];
     if (k->shape[2] != d || v->shape[0] != S || v->shape[1] != nkv || out->shape[0] != T ||
-        out->shape[1] != nh || out->shape[2] != dv || S < T || nkv <= 0 || nh % nkv != 0)
+        out->shape[1] != nh || out->shape[2] != dv || (!pos && S < T) || nkv <= 0 || nh % nkv != 0)
         return ops_fail(ATH_ERR_INVALID_ARG, op,
-                        "q [T, nh, d], k [S, nkv, d], v [S, nkv, dv], out [T, nh, dv], S >= T, "
-                        "nh a multiple of nkv");
+                        "q [T, nh, d], k [S, nkv, d], v [S, nkv, dv], out [T, nh, dv], nh a multiple of nkv, "
+                        "S >= T without positions");
+    if (pos) {
+        ATH_CHECK(ops_tensor(pos, ATH_DTYPE_I32, op, "pos"));
+        if (pos->ndim != 1 || pos->shape[0] != T)
+            return ops_fail(ATH_ERR_INVALID_ARG, op, "pos must be [T]");
+        ATH_CHECK(OPS_PLACE(op, where, pos));
+        for (int64_t t = 0; where == OPS_HOST && t < T; t++)
+            if (((const int32_t *)pos->data)[t] < 0 || ((const int32_t *)pos->data)[t] >= S)
+                return ops_fail(ATH_ERR_RANGE, op, "position %d of query %lld outside the %lld keys",
+                                ((const int32_t *)pos->data)[t], (long long)t, (long long)S);
+    }
     if (dv > ATH_ATTN_MAX_DV)
         return ops_fail(ATH_ERR_UNSUPPORTED, op, "value head dim %lld > %d", (long long)dv,
                         ATH_ATTN_MAX_DV);
     return OPS_PLACE(op, where, q, k, v, out);
 }
 
-ath_status ath_attn_ref(const ath_tensor *q, const ath_tensor *k, const ath_tensor *v, float scale,
-                        ath_tensor *out)
+ath_status ath_attn_ref(const ath_tensor *q, const ath_tensor *k, const ath_tensor *v, const ath_tensor *pos,
+                        float scale, ath_tensor *out)
 {
-    ATH_CHECK(args(q, k, v, out, OPS_HOST));
+    ATH_CHECK(args(q, k, v, pos, out, OPS_HOST));
     const int64_t T = q->shape[0], nh = q->shape[1], d = q->shape[2];
     const int64_t S = k->shape[0], nkv = k->shape[1], dv = v->shape[2];
     const int64_t group = nh / nkv;
     float acc[ATH_ATTN_MAX_DV];
     for (int64_t t = 0; t < T; t++) {
-        const int64_t last = S - T + t;                 /* last key this query sees */
+        const int64_t last = pos ? ((const int32_t *)pos->data)[t] : S - T + t;   /* last key it sees */
         for (int64_t h = 0; h < nh; h++) {
             const int64_t kh = h / group;
             const int64_t qb = (t * nh + h) * d;
@@ -80,11 +90,25 @@ ath_status ath_attn_ref(const ath_tensor *q, const ath_tensor *k, const ath_tens
 }
 
 ath_status ath_attn_gpu(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
-                        float scale, ath_tensor *out)
+                        const ath_tensor *pos, float scale, ath_dev_arena *scratch, ath_tensor *out)
 {
-    ATH_CHECK(args(q, k, v, out, OPS_GPU));
+    ATH_CHECK(args(q, k, v, pos, out, OPS_GPU));
     if (q->shape[2] > ATH_ATTN_MAX_DV)
         return ops_fail(ATH_ERR_UNSUPPORTED, op, "head dim %lld > %d on the GPU", (long long)q->shape[2],
                         ATH_ATTN_MAX_DV);
-    return ath_attn_launch(d, q, k, v, scale, out);
+    /* split-K: the partial softmax of every piece of every query, from scratch */
+    const int64_t T = q->shape[0], nh = q->shape[1], S = k->shape[0], dv = v->shape[2];
+    float *part = NULL;
+    ath_dev_arena_pos mark = {0};
+    if (scratch && T <= ATH_ATTN_SPLIT_MAX_T && T > 0) {
+        const int64_t pieces = (S + ATH_ATTN_SPLIT - 1) / ATH_ATTN_SPLIT;
+        mark = ath_dev_arena_mark(scratch);
+        part = ath_dev_arena_alloc(scratch, (size_t)(T * nh * pieces * (dv + 2)) * sizeof(float), 0);
+        if (!part)
+            return ATH_ERR_NOMEM;
+    }
+    ath_status st = ath_attn_launch(d, q, k, v, pos, scale, part, out);
+    if (part)
+        ath_dev_arena_reset(scratch, mark);   /* the next work on the stream comes after the kernels */
+    return st;
 }

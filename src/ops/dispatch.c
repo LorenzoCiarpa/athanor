@@ -56,10 +56,15 @@ ath_status ath_add(const ath_device *d, const ath_tensor *a, const ath_tensor *b
     return d ? ath_add_gpu(d, a, b, out) : ath_add_ref(a, b, out);
 }
 
-ath_status ath_attn(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v, float scale,
-                    ath_tensor *out)
+ath_status ath_attn(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
+                    const ath_tensor *pos, float scale, ath_dev_arena *scratch, ath_tensor *out)
 {
-    return d ? ath_attn_gpu(d, q, k, v, scale, out) : ath_attn_ref(q, k, v, scale, out);
+    return d ? ath_attn_gpu(d, q, k, v, pos, scale, scratch, out) : ath_attn_ref(q, k, v, pos, scale, out);
+}
+
+ath_status ath_scatter_rows(const ath_device *d, const ath_tensor *src, const ath_tensor *idx, ath_tensor *dst)
+{
+    return d ? ath_scatter_rows_gpu(d, src, idx, dst) : ath_scatter_rows_ref(src, idx, dst);
 }
 
 ath_status ath_conv(const ath_device *d, const ath_tensor *x, const ath_tensor *w, ath_tensor *state, ath_act act,

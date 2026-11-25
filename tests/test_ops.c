@@ -363,7 +363,7 @@ ATH_TEST(attn_hand)
     ath_tensor k = random_tensor(ATH_DTYPE_F32, 3, (int64_t[]){3, 1, 2});
     ath_tensor v = F(SHAPE(3, 1, 1), VALS(1, 2, 6));
     ath_tensor out = F(SHAPE(3, 1, 1), NULL);
-    ATH_REQUIRE_OK(ath_attn_ref(&q, &k, &v, 1.0f, &out));
+    ATH_REQUIRE_OK(ath_attn_ref(&q, &k, &v, NULL, 1.0f, &out));
     ATH_EXPECT_NEAR(at(&out, 0), 1.0, 1e-6);
     ATH_EXPECT_NEAR(at(&out, 1), 1.5, 1e-6);
     ATH_EXPECT_NEAR(at(&out, 2), 3.0, 1e-6);
@@ -373,7 +373,7 @@ ATH_TEST(attn_hand)
     ath_tensor k2 = random_tensor(ATH_DTYPE_F32, 3, (int64_t[]){1, 2, 2});
     ath_tensor v2 = F(SHAPE(1, 2, 1), VALS(10, 20));
     ath_tensor o4 = F(SHAPE(1, 4, 1), NULL);
-    ATH_REQUIRE_OK(ath_attn_ref(&q4, &k2, &v2, 1.0f, &o4));
+    ATH_REQUIRE_OK(ath_attn_ref(&q4, &k2, &v2, NULL, 1.0f, &o4));
     ATH_EXPECT(at(&o4, 0) == 10.0f && at(&o4, 1) == 10.0f && at(&o4, 2) == 20.0f && at(&o4, 3) == 20.0f);
 
     /* A large score selects its value. */
@@ -381,14 +381,14 @@ ATH_TEST(attn_hand)
     ath_tensor ks = F(SHAPE(2, 1, 2), VALS(0, 1, 50, 0));
     ath_tensor vs = F(SHAPE(2, 1, 2), VALS(1, 2, 3, 4));
     ath_tensor os = F(SHAPE(1, 1, 2), NULL);
-    ATH_REQUIRE_OK(ath_attn_ref(&qs, &ks, &vs, 1.0f, &os));
+    ATH_REQUIRE_OK(ath_attn_ref(&qs, &ks, &vs, NULL, 1.0f, &os));
     ATH_EXPECT_NEAR(at(&os, 0), 3.0, 1e-6);
     ATH_EXPECT_NEAR(at(&os, 1), 4.0, 1e-6);
 
     ath_tensor q3 = F(SHAPE(1, 3, 2), NULL), o3 = F(SHAPE(1, 3, 1), NULL);
-    ATH_EXPECT_STATUS(ath_attn_ref(&q3, &k2, &v2, 1.0f, &o3), ATH_ERR_INVALID_ARG);   /* 3 % 2 */
+    ATH_EXPECT_STATUS(ath_attn_ref(&q3, &k2, &v2, NULL, 1.0f, &o3), ATH_ERR_INVALID_ARG);   /* 3 % 2 */
     ath_tensor qlong = F(SHAPE(2, 4, 2), NULL), olong = F(SHAPE(2, 4, 1), NULL);
-    ATH_EXPECT_STATUS(ath_attn_ref(&qlong, &k2, &v2, 1.0f, &olong), ATH_ERR_INVALID_ARG);  /* S < T */
+    ATH_EXPECT_STATUS(ath_attn_ref(&qlong, &k2, &v2, NULL, 1.0f, &olong), ATH_ERR_INVALID_ARG);  /* S < T */
 }
 
 ATH_TEST(attn_decode_matches_prefill)
@@ -400,16 +400,39 @@ ATH_TEST(attn_decode_matches_prefill)
     ath_tensor k = random_tensor(ATH_DTYPE_BF16, 3, (int64_t[]){S, nkv, d});
     ath_tensor v = random_tensor(ATH_DTYPE_BF16, 3, (int64_t[]){S, nkv, d});
     ath_tensor full = B(SHAPE(S, nh, d), NULL), one = B(SHAPE(1, nh, d), NULL);
-    ATH_REQUIRE_OK(ath_attn_ref(&q, &k, &v, 0.35f, &full));
+    ATH_REQUIRE_OK(ath_attn_ref(&q, &k, &v, NULL, 0.35f, &full));
     ath_tensor qlast = rows(&q, S - 1, 1);
-    ATH_REQUIRE_OK(ath_attn_ref(&qlast, &k, &v, 0.35f, &one));
+    ATH_REQUIRE_OK(ath_attn_ref(&qlast, &k, &v, NULL, 0.35f, &one));
     ath_tensor flast = rows(&full, S - 1, 1);
     ATH_EXPECT(same_bits(&flast, &one));
     /* And a query never sees later keys: changing the last key leaves the
      * first S - 1 outputs unchanged. */
     ath_tensor full2 = B(SHAPE(S, nh, d), NULL);
     ath_store_f32(k.data, k.dtype, (S - 1) * nkv * d, 9.0f);
-    ATH_REQUIRE_OK(ath_attn_ref(&q, &k, &v, 0.35f, &full2));
+    ATH_REQUIRE_OK(ath_attn_ref(&q, &k, &v, NULL, 0.35f, &full2));
+    {
+        /* positions (step 9): the same queries over a longer cache, whose
+         * other rows are never read, give the same bits */
+        const int64_t T = q.shape[0], S2 = S + 5;
+        ath_tensor kbig = mk(k.dtype, 3, (int64_t[]){S2, nkv, d}, NULL);
+        ath_tensor vbig = mk(v.dtype, 3, (int64_t[]){S2, nkv, d}, NULL);
+        memcpy(kbig.data, k.data, ath_tensor_nbytes(&k));
+        memcpy(vbig.data, v.data, ath_tensor_nbytes(&v));
+        for (int64_t i = ath_tensor_numel(&k); i < ath_tensor_numel(&kbig); i++) {
+            ath_store_f32(kbig.data, kbig.dtype, i, 1e30f);
+            ath_store_f32(vbig.data, vbig.dtype, i, 1e30f);
+        }
+        int32_t pv[16];
+        for (int64_t t = 0; t < T; t++)
+            pv[t] = (int32_t)(S - T + t);
+        ath_tensor pos = ids_tensor(T, pv), withpos = B(SHAPE(S, nh, d), NULL);
+        ATH_REQUIRE_OK(ath_attn_ref(&q, &kbig, &vbig, &pos, 0.35f, &withpos));
+        ATH_EXPECT(same_bits(&withpos, &full2));
+        ((int32_t *)pos.data)[0] = (int32_t)S2;
+        ATH_EXPECT_STATUS(ath_attn_ref(&q, &kbig, &vbig, &pos, 0.35f, &withpos), ATH_ERR_RANGE);
+        ath_tensor pos2 = ids_tensor(2, pv);
+        ATH_EXPECT_STATUS(ath_attn_ref(&q, &kbig, &vbig, &pos2, 0.35f, &withpos), ATH_ERR_INVALID_ARG);
+    }
     ath_tensor a = rows(&full, 0, S - 1), b = rows(&full2, 0, S - 1);
     ATH_EXPECT(same_bits(&a, &b));
 }
@@ -552,6 +575,24 @@ ATH_TEST(gdn_heads_and_streaming)
     ATH_EXPECT(same_bits(&S, &S3));
 }
 
+/* ---- scatter (step 9) ---------------------------------------------------- */
+
+ATH_TEST(scatter_rows)
+{
+    ath_tensor src = F(SHAPE(2, 3), ((float[]){1, 2, 3, 4, 5, 6}));
+    ath_tensor dst = F(SHAPE(4, 3), ((float[]){0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}));
+    ath_tensor idx = ids_tensor(2, (int32_t[]){3, 1});
+    ATH_REQUIRE_OK(ath_scatter_rows_ref(&src, &idx, &dst));
+    static const float want[] = {0, 0, 0, 4, 5, 6, 0, 0, 0, 1, 2, 3};
+    for (int i = 0; i < 12; i++)
+        ATH_EXPECT(at(&dst, i) == want[i]);
+    ath_tensor bad_idx = ids_tensor(2, (int32_t[]){4, 0});
+    ATH_EXPECT_STATUS(ath_scatter_rows_ref(&src, &bad_idx, &dst), ATH_ERR_RANGE);
+    ath_tensor narrow = F(SHAPE(4, 2), NULL), other = B(SHAPE(4, 3), NULL);
+    ATH_EXPECT_STATUS(ath_scatter_rows_ref(&src, &idx, &narrow), ATH_ERR_INVALID_ARG);
+    ATH_EXPECT_STATUS(ath_scatter_rows_ref(&src, &idx, &other), ATH_ERR_TYPE);
+}
+
 static const ath_test_case tests[] = {
     ATH_TEST_ENTRY(bf16_rounding),
     ATH_TEST_ENTRY(op_argument_checks),
@@ -570,6 +611,7 @@ static const ath_test_case tests[] = {
     ATH_TEST_ENTRY(gdn_gates_hand),
     ATH_TEST_ENTRY(gdn_hand),
     ATH_TEST_ENTRY(gdn_heads_and_streaming),
+    ATH_TEST_ENTRY(scatter_rows),
 };
 
 int main(int argc, char **argv)

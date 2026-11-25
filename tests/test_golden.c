@@ -553,12 +553,13 @@ static void run_attn(ctx *c)
     ath_tensor *y = out(c, "out");
     float scale = (float)num(c, "scale");
     NEED(q, k, v, y);
-    RUN(ath_attn_ref(q, k, v, scale, y));
+    RUN(ath_attn_ref(q, k, v, NULL, scale, y));
     compare(c, "out", y);
     if (c->gpu) {
         ath_tensor *yg = dev_out(c, y);
         NEED(yg);
-        GPU_RUN(ath_attn_gpu(&c->gpu->d, dev(c, q), dev(c, k), dev(c, v), scale, yg));
+        /* with scratch: split-K for the decode record (step 9), rows for the prompt */
+        GPU_RUN(ath_attn_gpu(&c->gpu->d, dev(c, q), dev(c, k), dev(c, v), NULL, scale, &c->gpu->mem, yg));
         gpu_compare(c, "out", yg, y);
     }
 }

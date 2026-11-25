@@ -157,18 +157,40 @@ ath_status ath_add_gpu(const ath_device *d, const ath_tensor *a, const ath_tenso
 /* ---- attn.c ---------------------------------------------------------------- */
 
 /* Causal softmax attention with grouped-query heads.
- *   q [T, nh, d], k [S, nkv, d], v [S, nkv, dv], out [T, nh, dv], S >= T,
- *   nh a multiple of nkv. The T queries are the last T of the S positions:
- *   query t sits at position S − T + t and sees keys 0 … S − T + t.
+ *   q [T, nh, d], k [S, nkv, d], v [S, nkv, dv], out [T, nh, dv], nh a
+ *   multiple of nkv. Query t sits at position p_t and sees keys 0 … p_t:
+ *   pos NULL: the T queries are the last T of the S positions, p_t = S − T + t
+ *             (S >= T);
+ *   pos i32 [T] (step 9): p_t = pos[t] < S, so k and v may be a whole cache
+ *             of which each query reads the rows up to its position.
  *   Query head h reads key/value head h / (nh / nkv).
  *   out = Σ_j exp(s_j − max s) v_j / Σ_j exp(s_j − max s),  s_j = scale (q · k_j)
  * Scores, softmax and the weighted sum are fp32; dv <= ATH_ATTN_MAX_DV. */
 #define ATH_ATTN_MAX_DV 1024
-ath_status ath_attn_ref(const ath_tensor *q, const ath_tensor *k, const ath_tensor *v, float scale,
-                        ath_tensor *out);
-/* GPU: the query/key head dim d is also at most ATH_ATTN_MAX_DV. */
-ath_status ath_attn_gpu(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
+ath_status ath_attn_ref(const ath_tensor *q, const ath_tensor *k, const ath_tensor *v, const ath_tensor *pos,
                         float scale, ath_tensor *out);
+/* GPU: the query/key head dim d is also at most ATH_ATTN_MAX_DV. The keys
+ * are taken in pieces of ATH_ATTN_SPLIT, each reduced to a partial softmax
+ * and combined in order; with a scratch arena, up to ATH_ATTN_SPLIT_MAX_T
+ * queries spread their pieces over blocks (split-K, for decode over a long
+ * cache), and the result has the same bits as without. Positions in device
+ * memory cannot be checked by the host: a query whose position is outside
+ * [0, S) gets a row of NaN. */
+#define ATH_ATTN_SPLIT 256
+#define ATH_ATTN_SPLIT_MAX_T 8
+ath_status ath_attn_gpu(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
+                        const ath_tensor *pos, float scale, ath_dev_arena *scratch, ath_tensor *out);
+
+/* ---- scatter.c (step 9) ---------------------------------------------------- */
+
+/* dst[idx[i]] = src[i] for every row i: src [n, ...] and dst [R, ...] of the
+ * same dtype with rows of the same number of elements, idx i32 [n] with
+ * values in [0, R). Rows are copied byte for byte. The KV cache takes the
+ * keys and values of new tokens at their positions this way. On the GPU idx
+ * is in device memory and cannot be checked: a row whose index is outside
+ * [0, R) is not written. */
+ath_status ath_scatter_rows_ref(const ath_tensor *src, const ath_tensor *idx, ath_tensor *dst);
+ath_status ath_scatter_rows_gpu(const ath_device *d, const ath_tensor *src, const ath_tensor *idx, ath_tensor *dst);
 
 /* ---- conv.c ---------------------------------------------------------------- */
 
@@ -231,10 +253,11 @@ ath_status ath_rope(const ath_device *d, const ath_tensor *x, const ath_tensor *
 ath_status ath_swiglu(const ath_device *d, const ath_tensor *gate, const ath_tensor *up, ath_tensor *out);
 ath_status ath_sigmoid_mul(const ath_device *d, const ath_tensor *x, const ath_tensor *gate, ath_tensor *out);
 ath_status ath_add(const ath_device *d, const ath_tensor *a, const ath_tensor *b, ath_tensor *out);
-ath_status ath_attn(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v, float scale,
-                    ath_tensor *out);
+ath_status ath_attn(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
+                    const ath_tensor *pos, float scale, ath_dev_arena *scratch, ath_tensor *out);
 ath_status ath_conv(const ath_device *d, const ath_tensor *x, const ath_tensor *w, ath_tensor *state, ath_act act,
                     ath_tensor *out);
+ath_status ath_scatter_rows(const ath_device *d, const ath_tensor *src, const ath_tensor *idx, ath_tensor *dst);
 ath_status ath_gdn_gates(const ath_device *d, const ath_tensor *a, const ath_tensor *b, const ath_tensor *a_log,
                          const ath_tensor *dt_bias, ath_tensor *g, ath_tensor *beta);
 ath_status ath_gdn(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,

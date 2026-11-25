@@ -44,9 +44,9 @@ ath_status ath_elem_launch(const ath_device *d, ath_elem_kind kind, const ath_te
 }
 
 ath_status ath_attn_launch(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
-                           float scale, ath_tensor *out)
+                           const ath_tensor *pos, float scale, float *part, ath_tensor *out)
 {
-    (void)d, (void)q, (void)k, (void)v, (void)scale, (void)out;
+    (void)d, (void)q, (void)k, (void)v, (void)pos, (void)scale, (void)part, (void)out;
     return none("attn");
 }
 
@@ -70,4 +70,10 @@ ath_status ath_gdn_launch(const ath_device *d, const ath_tensor *q, const ath_te
 {
     (void)d, (void)q, (void)k, (void)v, (void)g, (void)beta, (void)q_scale, (void)state, (void)out;
     return none("gdn");
+}
+
+ath_status ath_scatter_rows_launch(const ath_device *d, const ath_tensor *src, const ath_tensor *idx, ath_tensor *dst)
+{
+    (void)d, (void)src, (void)idx, (void)dst;
+    return none("scatter_rows");
 }

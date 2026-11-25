@@ -40,8 +40,12 @@ typedef enum { ATH_ELEM_SWIGLU, ATH_ELEM_SIGMOID_MUL, ATH_ELEM_ADD } ath_elem_ki
 ath_status ath_elem_launch(const ath_device *d, ath_elem_kind kind, const ath_tensor *a, const ath_tensor *b,
                            ath_tensor *out);
 
+/* part: NULL, or [T, nh, pieces, dv + 2] floats of device scratch for split-K
+ * (pieces = ceil(S / ATH_ATTN_SPLIT)); pos may be NULL. */
 ath_status ath_attn_launch(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
-                           float scale, ath_tensor *out);
+                           const ath_tensor *pos, float scale, float *part, ath_tensor *out);
+ath_status ath_scatter_rows_launch(const ath_device *d, const ath_tensor *src, const ath_tensor *idx,
+                                   ath_tensor *dst);
 ath_status ath_conv_launch(const ath_device *d, const ath_tensor *x, const ath_tensor *w, ath_tensor *state,
                            ath_act act, ath_tensor *out);
 ath_status ath_gdn_gates_launch(const ath_device *d, const ath_tensor *a, const ath_tensor *b,

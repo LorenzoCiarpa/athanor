@@ -144,6 +144,104 @@ static __global__ void matmul_kernel(const void *x, int xdt, const void *w, int 
     }
 }
 
+/* ---- GEMV: a few rows of x against bf16 weights (step 9) ----------------------- */
+
+/* Decode multiplies one row of activations (a few, for a few sequences) by
+ * every weight matrix: each weight is read once per token and used for one
+ * multiply-add per row, so the time is the time to read the weights. A
+ * library GEMM tiles for reuse that is not there; this kernel only streams.
+ *
+ * One warp per output column m (row m of w): the lanes read the row in
+ * 16-byte pieces (8 bf16), lane l the pieces l, l + 32, ..., four at a time
+ * so that several loads are in flight, and multiply each piece with the
+ * same 8 elements of every row of x (x is small and stays in the caches).
+ * Each lane sums its products in fp32 in order of k, then the warp adds the
+ * 32 sums (k_warp_sum): the order is fixed by K alone, so the result does
+ * not depend on M, N or the launch, and a row gives the same bits whether
+ * it comes alone or with others. */
+#define GEMV_ROWS 8      /* the most rows of x one launch takes      */
+#define GEMV_WARPS 8     /* warps per block, one output column each  */
+#define GEMV_UNROLL 4    /* 16-byte pieces each lane loads at a time */
+
+static __device__ __forceinline__ void k_unpack_bf16x8(uint4 u, float f[8])
+{
+    const uint32_t v[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        f[2 * i] = __uint_as_float(v[i] << 16);              /* element 2i: the low half */
+        f[2 * i + 1] = __uint_as_float(v[i] & 0xffff0000u);
+    }
+}
+
+/* Elements 8c … 8c + 7 of row r of x (bf16 or f32), as floats. */
+static __device__ __forceinline__ void k_x8(const void *x, int xdt, int64_t K, int r, int64_t c, float f[8])
+{
+    if (xdt == ATH_DTYPE_BF16) {
+        k_unpack_bf16x8(((const uint4 *)x)[(r * K) / 8 + c], f);
+    } else {
+        const float4 a = ((const float4 *)x)[(r * K) / 4 + 2 * c], b = ((const float4 *)x)[(r * K) / 4 + 2 * c + 1];
+        f[0] = a.x, f[1] = a.y, f[2] = a.z, f[3] = a.w, f[4] = b.x, f[5] = b.y, f[6] = b.z, f[7] = b.w;
+    }
+}
+
+static __global__ void __launch_bounds__(GEMV_WARPS * ATH_WARP)
+gemv_kernel(const void *x, int xdt, const uint4 *w, void *out, int odt, int N, int64_t M, int64_t K)
+{
+    const int lane = threadIdx.x % ATH_WARP;
+    const int64_t m = (int64_t)blockIdx.x * GEMV_WARPS + threadIdx.x / ATH_WARP;
+    if (m >= M)
+        return;
+    const int64_t pieces = K / 8;
+    const uint4 *row = w + m * pieces;
+    float acc[GEMV_ROWS];
+#pragma unroll
+    for (int r = 0; r < GEMV_ROWS; r++)
+        acc[r] = 0.0f;
+    for (int64_t c0 = lane; c0 < pieces; c0 += (int64_t)ATH_WARP * GEMV_UNROLL) {
+        uint4 wv[GEMV_UNROLL];
+#pragma unroll
+        for (int u = 0; u < GEMV_UNROLL; u++) {
+            const int64_t c = c0 + (int64_t)u * ATH_WARP;
+            wv[u] = c < pieces ? row[c] : make_uint4(0, 0, 0, 0);
+        }
+#pragma unroll
+        for (int u = 0; u < GEMV_UNROLL; u++) {
+            const int64_t c = c0 + (int64_t)u * ATH_WARP;
+            if (c >= pieces)
+                break;
+            float wf[8];
+            k_unpack_bf16x8(wv[u], wf);
+#pragma unroll
+            for (int r = 0; r < GEMV_ROWS; r++) {
+                if (r < N) {
+                    float xf[8];
+                    k_x8(x, xdt, K, r, c, xf);
+#pragma unroll
+                    for (int i = 0; i < 8; i++)
+                        acc[r] += wf[i] * xf[i];
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < GEMV_ROWS; r++) {
+        if (r < N) {
+            const float s = k_warp_sum(acc[r]);
+            if (lane == 0)
+                k_st(out, odt, r * M + m, s);
+        }
+    }
+}
+
+/* The GEMV kernel takes the product: few rows, bf16 weights, rows of 16-byte
+ * pieces on 16-byte boundaries. */
+static bool gemv_fits(const ath_tensor *x, const ath_tensor *w, int64_t N, int64_t K)
+{
+    return N <= GEMV_ROWS && w->dtype == ATH_DTYPE_BF16 && K % 8 == 0 &&
+           (x->dtype == ATH_DTYPE_BF16 || x->dtype == ATH_DTYPE_F32) && (uintptr_t)w->data % 16 == 0 &&
+           (uintptr_t)x->data % 16 == 0;
+}
+
 extern "C" ath_status ath_matmul_launch(const ath_device *d, const ath_tensor *x, const ath_tensor *w,
                                         ath_tensor *out)
 {
@@ -154,6 +252,12 @@ extern "C" ath_status ath_matmul_launch(const ath_device *d, const ath_tensor *x
     if (K == 0)                                    /* empty sums: zeros, in either dtype */
         return ath_memset(d, out->data, 0, ath_tensor_nbytes(out), ATH_STREAM_COMPUTE);
     ATH_CHECK(ath_gpu_use(d));
+    if (gemv_fits(x, w, N, K)) {
+        const int64_t blocks = (M + GEMV_WARPS - 1) / GEMV_WARPS;
+        gemv_kernel<<<(unsigned)blocks, GEMV_WARPS * ATH_WARP, 0, k_stream(d)>>>(
+            x->data, x->dtype, (const uint4 *)w->data, out->data, out->dtype, (int)N, M, K);
+        return ath_gpu_launched("gemv_kernel");
+    }
     const bool bf16_in = x->dtype == ATH_DTYPE_BF16 && w->dtype == ATH_DTYPE_BF16;
     const bool f32_all = x->dtype == ATH_DTYPE_F32 && w->dtype == ATH_DTYPE_F32 && out->dtype == ATH_DTYPE_F32;
     if (bf16_in || f32_all)
