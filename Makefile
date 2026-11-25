@@ -50,8 +50,10 @@ CFLAGS += -Isrc
 LDLIBS := -lm -lpthread
 
 # Device code: CUDA C (the C subset of CUDA C++), machine code for one
-# architecture. The CUDA runtime is linked statically, so the binary needs
-# only the driver at run time, which the runtime loads itself.
+# architecture. The CUDA runtime is linked statically and loads the driver
+# itself. cuBLASLt (the dense matmul) is linked as a shared library found
+# through the toolkit's path recorded in the binary: statically it would add
+# about 560 MB to every binary (src/backend/README.md, Linking).
 NVCCFLAGS := -std=c++17 -gencode arch=compute_$(CUDA_ARCH),code=sm_$(CUDA_ARCH) -Werror all-warnings \
              -Xcompiler -Wall,-Wextra,-Werror,-fno-exceptions,-fno-rtti -Isrc -MMD -MP
 ifeq ($(DEBUG),1)
@@ -60,7 +62,8 @@ else
 NVCCFLAGS += -O2 -lineinfo
 endif
 ifeq ($(GPU),cuda)
-LDLIBS += $(CUDA_HOME)/lib64/libcudart_static.a -ldl -lrt
+LDLIBS += -L$(CUDA_HOME)/lib64 -lcublasLt -Wl,-rpath,$(CUDA_HOME)/lib64 \
+          $(CUDA_HOME)/lib64/libcudart_static.a -ldl -lrt
 endif
 
 # Families are selected at compile time (docs/ARCHITECTURE.md, rule 1): each

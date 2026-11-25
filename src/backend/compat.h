@@ -1,10 +1,11 @@
 /* compat.h: one source for CUDA and HIP.
  *
  * GPU code (src/backend/gpu.cu, and the .cu kernels of src/ops from step 7)
- * is written once against the CUDA runtime API and includes this header
- * instead of a vendor header. nvcc compiles it as CUDA. hipcc compiles the
- * same files for AMD with __HIP_PLATFORM_AMD__ defined, and the names below
- * map every CUDA call in use to its HIP twin, which has the same arguments.
+ * is written once against the CUDA runtime API and cuBLASLt, and includes
+ * this header instead of a vendor header. nvcc compiles it as CUDA. hipcc
+ * compiles the same files for AMD with __HIP_PLATFORM_AMD__ defined, and the
+ * names below map every CUDA call in use to its HIP twin (hipBLASLt for
+ * cuBLASLt), which has the same arguments.
  *
  * Only what the code uses is mapped: a new runtime call in GPU code needs
  * its line here, or the HIP build (step 11) stops with an undefined name.
@@ -17,6 +18,7 @@
 #if defined(__HIP_PLATFORM_AMD__)
 
 #include <hip/hip_runtime.h>
+#include <hipblaslt/hipblaslt.h>
 
 #define ATH_GPU_BACKEND "hip"
 
@@ -62,16 +64,57 @@ typedef hipDeviceProp_t cudaDeviceProp;
 #define cudaEventSynchronize         hipEventSynchronize
 #define cudaEventElapsedTime         hipEventElapsedTime
 
+/* the matmul library */
+typedef hipblasLtHandle_t                 cublasLtHandle_t;
+typedef hipblasStatus_t                   cublasStatus_t;
+typedef hipblasOperation_t                cublasOperation_t;
+typedef hipDataType                       cudaDataType_t;
+typedef hipblasLtMatmulDesc_t             cublasLtMatmulDesc_t;
+typedef hipblasLtMatrixLayout_t           cublasLtMatrixLayout_t;
+typedef hipblasLtMatmulPreference_t       cublasLtMatmulPreference_t;
+typedef hipblasLtMatmulHeuristicResult_t  cublasLtMatmulHeuristicResult_t;
+
+#define CUBLAS_STATUS_SUCCESS                     HIPBLAS_STATUS_SUCCESS
+#define CUBLAS_COMPUTE_32F                        HIPBLAS_COMPUTE_32F
+#define CUBLAS_OP_N                               HIPBLAS_OP_N
+#define CUBLAS_OP_T                               HIPBLAS_OP_T
+#define CUDA_R_32F                                HIP_R_32F
+#define CUDA_R_16BF                               HIP_R_16BF
+#define CUBLASLT_MATMUL_DESC_TRANSA               HIPBLASLT_MATMUL_DESC_TRANSA
+#define CUBLASLT_MATMUL_DESC_TRANSB               HIPBLASLT_MATMUL_DESC_TRANSB
+#define CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES  HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES
+
+#define cublasLtCreate                    hipblasLtCreate
+#define cublasLtDestroy                   hipblasLtDestroy
+#define cublasLtMatmulDescCreate          hipblasLtMatmulDescCreate
+#define cublasLtMatmulDescDestroy         hipblasLtMatmulDescDestroy
+#define cublasLtMatmulDescSetAttribute    hipblasLtMatmulDescSetAttribute
+#define cublasLtMatrixLayoutCreate        hipblasLtMatrixLayoutCreate
+#define cublasLtMatrixLayoutDestroy       hipblasLtMatrixLayoutDestroy
+#define cublasLtMatmulPreferenceCreate    hipblasLtMatmulPreferenceCreate
+#define cublasLtMatmulPreferenceDestroy   hipblasLtMatmulPreferenceDestroy
+#define cublasLtMatmulPreferenceSetAttribute hipblasLtMatmulPreferenceSetAttribute
+#define cublasLtMatmulAlgoGetHeuristic    hipblasLtMatmulAlgoGetHeuristic
+#define cublasLtMatmul                    hipblasLtMatmul
+#define cublasLtGetStatusString           hipblasStatusToString
+
 /* Threads per wave. RDNA runs kernels in wave32 mode, the size the kernels
  * are written for; CDNA (wave64) is not a target. */
 #define ATH_WARP 32
 
+/* Exchange between the lanes of a wave (all lanes take part). */
+#define ath_shfl_xor(v, mask) __shfl_xor((v), (mask))
+
 #else
 
+#include <cublasLt.h>
 #include <cuda_runtime.h>
 
 #define ATH_GPU_BACKEND "cuda"
 #define ATH_WARP 32
+
+/* Exchange between the lanes of a warp (all lanes take part). */
+#define ath_shfl_xor(v, mask) __shfl_xor_sync(0xffffffffu, (v), (mask))
 
 #endif
 

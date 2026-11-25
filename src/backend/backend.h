@@ -14,7 +14,7 @@
  * Streams. Each open device has three streams, one per kind of work, so
  * that copies overlap computation (src/backend/README.md):
  *
- *   ATH_STREAM_COMPUTE  kernels and device-to-device copies
+ *   ATH_STREAM_COMPUTE  kernels (every GPU op of src/ops) and device-to-device copies
  *   ATH_STREAM_H2D      host-to-device copies (weights, prefetched experts)
  *   ATH_STREAM_D2H      device-to-host copies (logits, captured activations)
  *
@@ -63,7 +63,18 @@ typedef struct {
     int32_t  driver_version;         /* 13000 for CUDA 13.0                           */
     int32_t  runtime_version;        /* the runtime this binary was built with         */
     void    *stream[ATH_STREAM_COUNT];
+    /* The vendor's dense matmul library (cuBLASLt; hipBLASLt from step 11)
+     * and its workspace, used by the GPU matmul (src/ops/matmul.cu). One
+     * workspace per device is enough because ops run on ATH_STREAM_COMPUTE
+     * only, one after the other. */
+    void    *blas;
+    void    *blas_ws;
+    size_t   blas_ws_bytes;
 } ath_device;
+
+/* Workspace of the matmul library: what cuBLASLt's documentation
+ * recommends for Hopper and later, so that it can choose any algorithm. */
+#define ATH_BLAS_WORKSPACE ((size_t)32 << 20)
 
 /* An event: a point in a stream's work, used to order streams and to time
  * work. */
@@ -79,8 +90,9 @@ const char *ath_gpu_backend(void);
  * without a device (the reason is logged at info level). */
 int32_t ath_gpu_count(void);
 
-/* Open device `index`: query its properties and create its streams.
- * ATH_ERR_INVALID_ARG for an index out of range. */
+/* Open device `index`: query its properties, create its streams, the matmul
+ * library's handle and its workspace. ATH_ERR_INVALID_ARG for an index out
+ * of range. */
 ath_status ath_device_open(ath_device *d, int32_t index);
 
 /* Wait for every stream, then destroy them. Safe on a zeroed device. */
