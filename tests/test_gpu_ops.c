@@ -506,9 +506,9 @@ ATH_TEST(gpu_moe_split)
         ATH_REQUIRE_OK(ath_copy(&g.d, dev_tab, dev_h, sizeof dev_h, ATH_STREAM_COMPUTE));              \
         ATH_REQUIRE_OK(ath_stream_sync(&g.d, ATH_STREAM_COMPUTE));                                     \
     } while (0)
-    const ath_moe_experts ex = {.n_experts = E, .inter = I, .hidden = H, .dev_dtype = ATH_DTYPE_Q8_0,
-                                .dev_tab = (const void *const *)dev_tab, .host_dtype = ATH_DTYPE_Q8_0_R16,
-                                .host_tab = host_tab, .on_dev = on_dev};
+    ath_moe_experts ex = {.n_experts = E, .inter = I, .hidden = H, .dev_dtype = ATH_DTYPE_Q8_0,
+                          .dev_tab = (const void *const *)dev_tab, .host_dtype = ATH_DTYPE_Q8_0_R16,
+                          .host_tab = host_tab, .on_dev = on_dev};
     ath_pool pool;
     ATH_REQUIRE_OK(ath_pool_init(&pool, 4, &g.host));
     ath_moe_ws *ws;
@@ -559,6 +559,17 @@ ATH_TEST(gpu_moe_split)
         ATH_EXPECT(memcmp(rep.data, want.data, ath_tensor_nbytes(&want)) == 0);
     }
     ath_graph_destroy(&g.d, &gr_);
+
+    /* device copies regrouped too (Q8_0_R16, the tier's slots): the same bits */
+    for (int64_t e = 0; e < E; e++) {
+        gd[e] = up(&g, &gr[e]), ud[e] = up(&g, &ur[e]), dd[e] = up(&g, &dr[e]);
+    }
+    ex.dev_dtype = ATH_DTYPE_Q8_0_R16;
+    PLACE(e % 3 != 0);
+    ATH_EXPECT_OK(ath_memset(&g.d, yd.data, 0, ath_tensor_nbytes(&yd), ATH_STREAM_COMPUTE));
+    ATH_EXPECT_OK(ath_moe_experts_split(&g.d, &xd, &idd, &ex, ws, &hd, &yd));
+    ath_tensor r16 = down(&g, &yd);
+    ATH_EXPECT(memcmp(r16.data, want.data, ath_tensor_nbytes(&want)) == 0);
 #undef PLACE
     ath_moe_ws_free(ws);
     ath_pool_free(&pool);

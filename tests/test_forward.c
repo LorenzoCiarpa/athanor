@@ -232,14 +232,13 @@ ATH_TEST(forward_rejects)
     /* scratch memory is released by every call */
     ATH_EXPECT(ath_arena_used(&scratch) == 0);
 
-    /* MoE layers have no forward pass before step 12 */
+    /* MoE layers run since step 12 (before, ATH_ERR_UNSUPPORTED) */
     tiny_model moe;
     ATH_REQUIRE_OK(tiny_open(&moe, &MOE, 1));
     ath_state sm;
     ATH_REQUIRE_OK(ath_state_init(&sm, &moe.m, ATH_DTYPE_BF16, 4, &moe.a));
-    ATH_EXPECT_STATUS(ath_model_forward(&moe.m, &(ath_batch){.tokens = toks, .n_tokens = 2, .logits = NULL}, &sm, NULL, &scratch, NULL),
-                      ATH_ERR_UNSUPPORTED);
-    ATH_EXPECT(sm.n_past == 0);
+    ATH_EXPECT_OK(ath_model_forward(&moe.m, &(ath_batch){.tokens = toks, .n_tokens = 2, .logits = NULL}, &sm, NULL, &scratch, NULL));
+    ATH_EXPECT(sm.n_past == 2);
     tiny_close(&moe);
 
     ath_arena_free(&scratch);

@@ -334,9 +334,10 @@ ath_status ath_moe_expert_ref(const ath_tensor *x, const ath_tensor *gate, const
  * weights are on the device; the entries of the other experts are left as
  * they are (the CPU computes them: ath_moe_experts_cpu). tab: in device
  * memory, 3 · n pointers, each expert's gate [I, H], then each expert's up
- * [I, H], then each expert's down [H, I], all of dtype wdt; NULL for an
- * expert not on the device. x [T, H], ids [T, k], h [T, k, I] working
- * memory and y [T, k, H] of x's dtype. */
+ * [I, H], then each expert's down [H, I], all of dtype wdt (Q8_0 or
+ * Q8_0_R16: the canonical order, the reference's bits; f32 or bf16: within
+ * tolerance); NULL for an expert not on the device. x [T, H], ids [T, k],
+ * h [T, k, I] working memory and y [T, k, H] of x's dtype. */
 ath_status ath_moe_experts_gpu(const ath_device *d, const ath_tensor *x, const ath_tensor *ids,
                                const void *const *tab, ath_dtype wdt, int64_t n_experts, int64_t inter, ath_tensor *h,
                                ath_tensor *y);

@@ -197,14 +197,16 @@ ath_status ath_moe_experts_gpu(const ath_device *d, const ath_tensor *x, const a
     ATH_CHECK(ops_tensor(h, x->dtype, op, "h"));
     ATH_CHECK(ops_tensor(y, x->dtype, op, "y"));
     if (!tab || n_experts < 1 || inter < 1 ||
-        (wdt != ATH_DTYPE_Q8_0 && wdt != ATH_DTYPE_BF16 && wdt != ATH_DTYPE_F32))
-        return ops_fail(ATH_ERR_INVALID_ARG, op, "a table of experts, Q8_0, bf16 or f32");
+        (wdt != ATH_DTYPE_Q8_0 && wdt != ATH_DTYPE_Q8_0_R16 && wdt != ATH_DTYPE_BF16 && wdt != ATH_DTYPE_F32))
+        return ops_fail(ATH_ERR_INVALID_ARG, op, "a table of experts, Q8_0, Q8_0_R16, bf16 or f32");
     if (x->ndim != 2 || ids->ndim != 2 || ids->shape[0] != x->shape[0] || y->ndim != 3 ||
         y->shape[0] != x->shape[0] || y->shape[1] != ids->shape[1] || y->shape[2] != x->shape[1] || h->ndim != 3 ||
         h->shape[0] != x->shape[0] || h->shape[1] != ids->shape[1] || h->shape[2] != inter)
         return ops_fail(ATH_ERR_INVALID_ARG, op, "shapes must be x [T, H], ids [T, k], h [T, k, I], y [T, k, H]");
-    if (wdt == ATH_DTYPE_Q8_0 && (x->shape[1] % ATH_Q8_0_BLOCK || inter % ATH_Q8_0_BLOCK))
-        return ops_fail(ATH_ERR_INVALID_ARG, op, "Q8_0 experts need H and I multiples of %d", ATH_Q8_0_BLOCK);
+    const int64_t blk = ath_dtype_block(wdt);
+    if (blk > 1 && (x->shape[1] % blk || inter % blk))
+        return ops_fail(ATH_ERR_INVALID_ARG, op, "%s experts need H and I multiples of %lld", ath_dtype_name(wdt),
+                        (long long)blk);
     ATH_CHECK(OPS_PLACE(op, OPS_GPU, x, ids, h, y));
     return ath_moe_experts_launch(d, x, ids, tab, wdt, n_experts, inter, h, y);
 }

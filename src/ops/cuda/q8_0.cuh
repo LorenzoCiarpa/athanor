@@ -174,4 +174,40 @@ static __device__ __forceinline__ float k_q8_dot(const uint8_t *row, const void 
     return k_q8_tree(P);
 }
 
+/* The same dot product with the row in Q8_0_R16 (core/tensor.h: per group
+ * the 16 scales, then value i of the 16 blocks in 16 consecutive bytes; the
+ * layout the routed experts keep in host memory and, since moving an
+ * expert is then a plain copy, in their device slots). The group is staged
+ * as in k_q8_dot; lane j reads its scale and its 32 values, one byte 16
+ * bytes apart, which four lanes share per 32-bit word: no bank conflicts.
+ * K is a multiple of 512, rows on 16-byte boundaries (544 = 34 · 16). */
+static __device__ __forceinline__ float k_r16_dot(const uint8_t *row, const void *x, int xdt, int64_t xoff,
+                                                  int64_t K, unsigned char *region, int j, bool live)
+{
+    const uint4 *r = (const uint4 *)row;
+    const int64_t groups = K / ATH_Q8_0_R16_BLOCK;
+    float P = 0.0f;
+    q8_pieces next = k_q8_fetch(r, j, live && groups > 0);
+    for (int64_t g = 0; g < groups; g++) {
+        __syncwarp();
+        k_q8_stage(region, j, next);
+        __syncwarp();
+        if (g + 1 < groups)
+            next = k_q8_fetch(r + (g + 1) * (ATH_Q8_0_R16_BYTES / 16), j, live);
+        float xf[32];
+        if (live)
+            k_q8_x(x, xdt, xoff, g * 16 + j, xf);
+        else
+            for (int i = 0; i < 32; i++)
+                xf[i] = 0.0f;
+        float s = (float)(int8_t)region[32 + j] * xf[0];
+#pragma unroll
+        for (int i = 1; i < ATH_Q8_0_BLOCK; i++)
+            s = fmaf((float)(int8_t)region[32 + 16 * i + j], xf[i], s);
+        const float d = ath_f16_to_f32((uint16_t)(region[2 * j] | (uint16_t)region[2 * j + 1] << 8));
+        P = fmaf(d, s, P);
+    }
+    return k_q8_tree(P);
+}
+
 #endif /* ATH_OPS_Q8_0_CUH */

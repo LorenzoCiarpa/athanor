@@ -15,6 +15,12 @@
 
 ath_status ath_engine_open(ath_engine *e, const ath_model *m, int32_t device, ath_arena *a)
 {
+    return ath_engine_open_tier(e, m, device, NULL, a);
+}
+
+ath_status ath_engine_open_tier(ath_engine *e, const ath_model *m, int32_t device, const ath_place_opts *tier,
+                                ath_arena *a)
+{
     if (!e || !m || !a)
         return ATH_ERR_INVALID_ARG;
     memset(e, 0, sizeof *e);
@@ -31,6 +37,8 @@ ath_status ath_engine_open(ath_engine *e, const ath_model *m, int32_t device, at
         const ath_param *p = &m->params[i];
         if (p->flags & ATH_P_UNUSED)
             continue;
+        if (m->n_experts > 0 && (p->role == ATH_ROLE_EXPERT_IN || p->role == ATH_ROLE_EXPERT_OUT))
+            continue;                  /* the tier places them, below */
         if (!ath_tensor_is_contiguous(&p->t) || (p->t.tier != ATH_TIER_RAM && p->t.tier != ATH_TIER_PINNED)) {
             ath_log(ATH_LOG_ERROR, "engine: param %s is not a contiguous host tensor", p->name);
             st = ATH_ERR_UNSUPPORTED;
@@ -53,11 +61,21 @@ ath_status ath_engine_open(ath_engine *e, const ath_model *m, int32_t device, at
     }
     if (st == ATH_OK)
         st = ath_stream_sync(&e->dev, ATH_STREAM_H2D);
+    if (st == ATH_OK && m->n_experts > 0) {
+        e->tier = ath_arena_zalloc(a, sizeof *e->tier, _Alignof(ath_placement));
+        st = e->tier ? ath_place_open(e->tier, m, &e->dev, tier, a) : ATH_ERR_NOMEM;
+        if (st != ATH_OK)
+            e->tier = NULL;
+    }
     if (st != ATH_OK) {
         ath_engine_close(e);
         return st;
     }
     e->exec = (ath_exec){.dev = &e->dev, .weights = e->weights, .scratch = &e->scratch};
+    if (e->tier) {
+        e->exec.experts = e->tier->layers;
+        e->exec.moe_ws = e->tier->ws;
+    }
     ath_log(ATH_LOG_INFO, "engine: %u params, %.2f GiB on %s", e->n_copied, (double)e->weight_bytes / 1073741824.0,
             e->dev.name);
     return ATH_OK;
@@ -69,6 +87,7 @@ void ath_engine_close(ath_engine *e)
         return;
     if (e->dev.stream[0])
         ath_device_sync(&e->dev);
+    ath_place_close(e->tier);
     ath_dev_arena_free(&e->scratch);
     ath_dev_arena_free(&e->state_mem);
     ath_dev_arena_free(&e->weights_mem);
@@ -178,6 +197,8 @@ ath_status ath_decoder_step(ath_decoder *dc, int32_t token, double u, int32_t *n
     }
     ATH_CHECK(ath_stream_sync(&e->dev, ATH_STREAM_COMPUTE));
     dc->steps++;
+    if (e->tier)
+        ATH_CHECK(ath_place_update(e->tier));   /* experts move between steps, never during one */
     if (dc->gpu_sampling) {
         *next = dc->hio->next;
         return ATH_OK;

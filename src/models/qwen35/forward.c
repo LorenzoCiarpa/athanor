@@ -53,6 +53,7 @@ typedef struct {
     const ath_device        *dev;   /* NULL: the CPU                        */
     ath_dev_arena           *da;    /* GPU: working memory                  */
     const ath_tensor        *w;     /* GPU: the params' device copies       */
+    const ath_exec          *x;     /* where the pass runs (the experts of MoE layers) */
     ath_dtype                act;
     int64_t                  T;     /* tokens in this call            */
     int64_t                  P;     /* tokens before them (n_past)    */
@@ -128,19 +129,24 @@ static ath_status copy_cols(const fwd *f, const ath_tensor *src, int64_t col, at
  * (ath_add_rmsnorm_gpu, step 10): the bits of the add and then the norm. x
  * may be the last rows of the residual stream (the logits of the last
  * token), the same rows of the waiting projection. */
+static ath_status norm_into(fwd *f, ath_tensor *x, const ath_param *norm, ath_tensor *xn)
+{
+    ATH_CHECK(tmp(f, xn, f->act, 2, x->shape[0], x->shape[1], 0));
+    if (f->pending) {
+        ath_tensor y;
+        ATH_CHECK(ath_tensor_slice(&f->pend, 0, f->T - x->shape[0], x->shape[0], &y));
+        ATH_CHECK(ath_add_rmsnorm_gpu(f->dev, x, &y, W(f, norm), f->noff, f->eps, xn));
+        f->pending = false;
+        return ATH_OK;
+    }
+    return ath_rmsnorm(f->dev, x, W(f, norm), f->noff, f->eps, xn);
+}
+
 static ath_status norm_matmuls(fwd *f, ath_tensor *x, const ath_param *norm, int n, const ath_tensor *const *w,
                                ath_tensor *const *out)
 {
     ath_tensor xn;
-    ATH_CHECK(tmp(f, &xn, f->act, 2, x->shape[0], x->shape[1], 0));
-    if (f->pending) {
-        ath_tensor y;
-        ATH_CHECK(ath_tensor_slice(&f->pend, 0, f->T - x->shape[0], x->shape[0], &y));
-        ATH_CHECK(ath_add_rmsnorm_gpu(f->dev, x, &y, W(f, norm), f->noff, f->eps, &xn));
-        f->pending = false;
-    } else {
-        ATH_CHECK(ath_rmsnorm(f->dev, x, W(f, norm), f->noff, f->eps, &xn));
-    }
+    ATH_CHECK(norm_into(f, x, norm, &xn));
     return ath_matmul_n(f->dev, f->pool, &xn, n, w, out);
 }
 
@@ -330,6 +336,78 @@ static ath_status mlp(fwd *f, const ath_qwen35_layer *L, ath_tensor *x)
     return matmul_add(f, &h, W(f, L->down_proj), x);
 }
 
+/* Mixture of experts (contract qwen35-35b-a3b.md, MoE op contract): the
+ * router's logits in fp32, the k experts per token and their weights, the
+ * shared expert (SwiGLU) and its gate, the routed experts, and their
+ * weighted sum with the gated shared expert, rounded once, added to the
+ * residual stream (or left for the next norm to add, as an output
+ * projection is: matmul_add).
+ *
+ * On the CPU each chosen expert runs on its token from the params
+ * (ath_moe_expert_ref). On a GPU the experts are wherever the engine put
+ * them (x->experts: in device memory, or in host memory for the CPU to
+ * compute, with the same bits: invariant 7, step 12). */
+static ath_status moe(fwd *f, int32_t l, const ath_qwen35_layer *L, ath_tensor *x)
+{
+    const ath_qwen35_config *c = f->c;
+    const int64_t T = f->T, H = c->hidden, E = c->n_experts, k = c->n_experts_active;
+    const int64_t I = c->expert_inter, Is = c->shared_inter;
+    const ath_dtype act = f->act;
+
+    ath_tensor xn, logits, gs, us, sg, ids, w, hs, ys, y, out;
+    ATH_CHECK(norm_into(f, x, L->post_norm, &xn));
+    ATH_CHECK(tmp(f, &logits, ATH_DTYPE_F32, 2, T, E, 0));
+    ATH_CHECK(tmp(f, &gs, act, 2, T, Is, 0));
+    ATH_CHECK(tmp(f, &us, act, 2, T, Is, 0));
+    ATH_CHECK(tmp(f, &sg, act, 2, T, 1, 0));
+    const ath_tensor *pw[] = {W(f, L->router), W(f, L->sh_gate), W(f, L->sh_up), W(f, L->sh_gate_w)};
+    ath_tensor *po[] = {&logits, &gs, &us, &sg};
+    ATH_CHECK(ath_matmul_n(f->dev, f->pool, &xn, 4, pw, po));
+
+    /* the router's choice; the shared expert */
+    ATH_CHECK(tmp(f, &ids, ATH_DTYPE_I32, 2, T, k, 0));
+    ATH_CHECK(tmp(f, &w, act, 2, T, k, 0));
+    ATH_CHECK(f->dev ? ath_moe_route_gpu(f->dev, &logits, &ids, &w) : ath_moe_route_ref(&logits, &ids, &w));
+    ATH_CHECK(tmp(f, &hs, act, 2, T, Is, 0));
+    ATH_CHECK(ath_swiglu(f->dev, &gs, &us, &hs));
+    ATH_CHECK(tmp(f, &ys, act, 2, T, H, 0));
+    ATH_CHECK(ath_matmul(f->dev, f->pool, &hs, W(f, L->sh_down), &ys));
+
+    /* the routed experts */
+    ATH_CHECK(tmp(f, &y, act, 3, T, k, H));
+    if (f->dev) {
+        const ath_moe_experts *ex = f->x->experts ? &f->x->experts[l] : NULL;
+        if (!ex || !ex->dev_tab || !f->x->moe_ws) {
+            ath_log(ATH_LOG_ERROR, "qwen35: a MoE layer on a GPU needs the engine's experts (ath_exec.experts)");
+            return ATH_ERR_UNSUPPORTED;
+        }
+        ath_tensor h;
+        ATH_CHECK(tmp(f, &h, act, 3, T, k, I));
+        ATH_CHECK(ath_moe_experts_split(f->dev, &xn, &ids, ex, f->x->moe_ws, &h, &y));
+    } else {
+        const int32_t *id = ids.data;
+        for (int64_t t = 0; t < T; t++)
+            for (int64_t j = 0; j < k; j++) {
+                const int32_t e = id[t * k + j];
+                ath_tensor xr, cell;
+                ATH_CHECK(ath_tensor_slice(&xn, 0, t, 1, &xr));
+                ATH_CHECK(wrap(f, &cell, act, (char *)y.data + (size_t)((t * k + j) * H) * ath_dtype_size(act), 2, 1,
+                               H, 0));
+                ATH_CHECK(ath_moe_expert_ref(&xr, &L->exp_gate[e]->t, &L->exp_up[e]->t, &L->exp_down[e]->t, &cell));
+            }
+    }
+
+    /* the weighted sum with the gated shared expert, into the residual stream */
+    if (f->defer) {
+        ATH_CHECK(ath_moe_combine_gpu(f->dev, &y, &w, &ys, &sg, &f->pend));
+        f->pending = true;
+        return ATH_OK;
+    }
+    ATH_CHECK(tmp(f, &out, act, 2, T, H, 0));
+    ATH_CHECK(f->dev ? ath_moe_combine_gpu(f->dev, &y, &w, &ys, &sg, &out) : ath_moe_combine_ref(&y, &w, &ys, &sg, &out));
+    return ath_add(f->dev, x, &out, x);
+}
+
 /* One decoder layer, in place on the residual stream x [T, hidden]: each
  * half normalizes x into its first projections and adds its output
  * projection back to x (norm_matmuls, matmul_add). Both residual additions
@@ -341,7 +419,7 @@ static ath_status layer(fwd *f, int32_t l, ath_tensor *x)
         ATH_CHECK(attention(f, L, x));
     else
         ATH_CHECK(gated_deltanet(f, L, x));
-    return mlp(f, L, x);
+    return f->c->moe ? moe(f, l, L, x) : mlp(f, L, x);
 }
 
 /* ---- entry point ------------------------------------------------------------------ */
@@ -351,13 +429,9 @@ ath_status ath_qwen35_forward(const ath_model *m, const ath_batch *b, ath_state 
 {
     const ath_qwen35_model *q = m->family_data;
     const ath_qwen35_config *c = &q->c;
-    if (c->moe) {
-        ath_log(ATH_LOG_ERROR, "qwen35: the forward pass of MoE layers arrives in step 12");
-        return ATH_ERR_UNSUPPORTED;
-    }
     fwd f = {
         .m = m, .c = c, .s = s, .a = scratch, .pool = x_->pool, .dev = x_->dev, .da = x_->scratch,
-        .w = x_->dev ? x_->weights : NULL, .act = s->act, .T = b->n_tokens, .P = s->n_past,
+        .w = x_->dev ? x_->weights : NULL, .x = x_, .act = s->act, .T = b->n_tokens, .P = s->n_past,
         .eps = (float)c->rms_eps, .noff = q->norm_offset, .gguf = q->gguf,
     };
     const int64_t T = f.T, H = c->hidden;

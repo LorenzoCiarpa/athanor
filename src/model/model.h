@@ -33,6 +33,7 @@
 #include "core/ckpt.h"
 #include "core/tensor.h"
 #include "core/threads.h"
+#include "ops/ops.h"
 #include "text/bpe.h"
 
 /* What a param is for. Matmul roles name the direction relative to the
@@ -239,8 +240,16 @@ typedef struct {
     ath_pool         *pool;      /* CPU threads for the fast paths; NULL: the calling thread     */
     const ath_device *dev;       /* the device that runs the pass; NULL: the CPU                 */
     const ath_tensor *weights;   /* dev: [n_params], each param's copy in dev's memory (ignored
-                                  * params: an empty descriptor); NULL: the params themselves    */
+                                  * params: an empty descriptor; a routed expert's params may be
+                                  * empty too, see experts); NULL: the params themselves         */
     ath_dev_arena    *scratch;   /* dev: working memory, released after every call               */
+    /* MoE on a GPU (step 12): per layer [n_layers] the routed experts wherever they are
+     * (ops.h, ath_moe_experts: device and host copies; NULL entries for dense layers), and
+     * the working state of the CPU's share. The engine sets them (src/infer/tier.c); a
+     * family reads its experts there, never in weights. A routed expert's params, in
+     * param order, are its gate, up and down projections: the tables list them so. */
+    const ath_moe_experts *experts;
+    ath_moe_ws            *moe_ws;
 } ath_exec;
 
 /* Tokens appended to the sequence of a state by one forward call. */

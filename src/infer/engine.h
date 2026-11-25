@@ -22,6 +22,7 @@
 #define ATH_ENGINE_H
 
 #include "backend/backend.h"
+#include "infer/tier.h"
 #include "model/model.h"
 #include "ops/ops.h"
 
@@ -36,15 +37,21 @@ typedef struct {
     ath_tensor      *weights;        /* [n_params]: device copies; empty for ignored  */
     uint64_t         weight_bytes;   /* bytes copied to the device                    */
     uint32_t         n_copied;       /* params copied                                 */
+    ath_placement        *tier;           /* the routed experts of a MoE model (step 12)   */
     ath_exec         exec;           /* pass &exec to ath_model_forward               */
 } ath_engine;
 
 /* Open device `device`, copy the model's params to it and prepare the
  * exec. Params flagged ATH_P_UNUSED (the vision encoder, the MTP head) stay
- * on the host. Host bookkeeping goes into a, which must outlive the
- * engine. ATH_ERR_UNSUPPORTED without a GPU backend, ATH_ERR_NOMEM if the
- * weights do not fit. On failure everything is released. */
+ * on the host. The routed experts of a MoE model are placed by a tier
+ * (infer/tier.h, step 12) with options `tier` (NULL: the defaults): in
+ * device slots as many as fit, the rest in host memory for the CPU. Host
+ * bookkeeping goes into a, which must outlive the engine.
+ * ATH_ERR_UNSUPPORTED without a GPU backend, ATH_ERR_NOMEM if the weights
+ * do not fit. On failure everything is released. */
 ath_status ath_engine_open(ath_engine *e, const ath_model *m, int32_t device, ath_arena *a);
+ath_status ath_engine_open_tier(ath_engine *e, const ath_model *m, int32_t device, const ath_place_opts *tier,
+                                ath_arena *a);
 
 /* Wait for the device, then free everything (states included). */
 void ath_engine_close(ath_engine *e);

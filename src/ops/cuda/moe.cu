@@ -144,6 +144,9 @@ static __device__ __forceinline__ float k_row_dot(const void *w, int wdt, int64_
     if (wdt == ATH_DTYPE_Q8_0)
         return k_q8_dot((const uint8_t *)w + (live ? row : 0) * (K / ATH_Q8_0_BLOCK) * ATH_Q8_0_BYTES, x, xdt, xoff,
                         K, region, j, live);
+    if (wdt == ATH_DTYPE_Q8_0_R16)
+        return k_r16_dot((const uint8_t *)w + (live ? row : 0) * (K / ATH_Q8_0_R16_BLOCK) * ATH_Q8_0_R16_BYTES, x,
+                         xdt, xoff, K, region, j, live);
     const size_t es = wdt == ATH_DTYPE_BF16 ? 2 : 4;
     return k_float_dot((const char *)w + (size_t)(live ? row : 0) * (size_t)K * es, wdt, x, xdt, xoff, K, j, live);
 }
