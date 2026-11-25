@@ -1,6 +1,6 @@
 # src/quant
 
-Weight formats, the algorithms that produce them, the container that stores them, and the tools that measure their cost in quality. Phase 2. Kernels that read the formats live in `src/ops/cuda/matmul.cu` and `src/ops/cuda/quant.cu`.
+Weight formats, the algorithms that produce them, the container that stores them, and the tools that measure their cost in quality. Phase 2. Kernels that read the formats live in `src/ops/cuda/matmul.cu` and `src/ops/cuda/quant.cu`; the GPU parts of the algorithms (GPTQ's updates, for example) are ops as well, since this module holds no GPU code (AGENTS.md invariant 11).
 
 | File | Content |
 | --- | --- |

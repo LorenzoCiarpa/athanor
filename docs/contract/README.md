@@ -8,3 +8,5 @@ One file per model checkpoint (`<family>-<size>.md`, e.g. `qwen35-0.8b.md`) reco
 - the resolution of each **verify** item listed in `docs/MODELS.md`.
 
 No kernel is written for an op whose contract entry is missing.
+
+This is the op contract, a document about one checkpoint's math. The model contract is code, `src/model/model.h`, the interface every family in `src/models/` implements: `docs/ARCHITECTURE.md`, Three names.

@@ -39,7 +39,7 @@ Decided on 2026-11-25, before step 9, at the maintainer's request (`docs/PLAN.md
 - `cuda/` holds the CUDA C: compiled by nvcc for NVIDIA and, through `cuda/compat.h`, by hipcc for AMD (step 11), as one source. It is named after the language, not the vendor.
 - `hip/` would hold only the kernels whose AMD form cannot share the CUDA source; `metal/` a Metal port (MSL kernels, an Objective-C runtime), if one enters the plan.
 
-Three places hold GPU code: `src/backend/cuda/` (the runtime), `src/ops/cuda/` (the kernels) and `src/models/<family>/cuda/` (a family's fused kernels, `docs/ARCHITECTURE.md`, Rules). A change that is not specific to a GPU language never enters a `cuda/` folder, and a port to new hardware adds sibling folders without touching the portable code.
+Three places hold GPU code: `src/backend/cuda/` (the runtime), `src/ops/cuda/` (the kernels) and `src/models/<family>/cuda/` (a family's fused kernels, `docs/ARCHITECTURE.md`, Rules). Nowhere else: pipelines use the GPU through `backend.h` and `ops.h`, and a kernel one of them needs (an optimizer step, a quantization update) is an op (AGENTS.md invariant 11). A change that is not specific to a GPU language never enters a `cuda/` folder, and a port to new hardware adds sibling folders without touching the portable code.
 
 ## The interface
 

@@ -5,7 +5,7 @@ Training, the last and hardest phase: every op needs a backward, memory is tight
 | File | Content |
 | --- | --- |
 | `loop.c` | step loop, gradient accumulation, schedules, logging, evaluation hooks |
-| `optim.c` | AdamW, 8-bit AdamW (block-wise states), Muon; bf16 master with stochastic rounding |
+| `optim.c` | AdamW, 8-bit AdamW (block-wise states), Muon; bf16 master with stochastic rounding. The update steps that run on the GPU are ops in `src/ops/` (CPU reference, kernel, test), called from here: this module holds no GPU code (AGENTS.md invariant 11) |
 | `lora.c` | LoRA and QLoRA adapters, targets chosen by role |
 | `hotcold.c` | full fine-tuning beyond VRAM (below) |
 | `data.c` | tokenized binary shards via mmap, sequence packing, SFT loss masking, JSONL input |

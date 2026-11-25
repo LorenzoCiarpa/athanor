@@ -26,6 +26,7 @@ athanor is a single C engine that runs, quantizes, abliterates and trains one fa
 8. **No performance claims without a report** under `docs/results/` following `docs/BENCHMARKS.md`.
 9. **Minimal by default.** No abstraction until it has two real users. No speculative features outside the current step. Prefer one clear function over a framework.
 10. **No agent features.** athanor never executes tools, runs agent loops, stores conversation memory or compacts context. Requests in that direction are out of scope; note them under "Open questions" in `docs/STATUS.md` instead of implementing them. Rendering tool definitions into the prompt and parsing tool calls out of the output are in scope (`docs/ARCHITECTURE.md`, Scope: engine versus harness).
+11. **Pipelines contain no GPU code.** A pipeline (`src/infer`, `src/quant`, `src/ablit`, `src/train`, `src/net`) uses the GPU only through `backend.h` (devices, memory, copies, streams, graphs) and `ops.h` (computation): no `.cu` file, no kernel, no vendor call. A kernel a pipeline needs (an optimizer step, a quantization algorithm) is an op, with its CPU reference and test (invariant 4); a runtime service (graph capture) belongs to the backend. GPU code lives in `src/backend/cuda/`, `src/ops/cuda/` and `src/models/<family>/cuda/` only, so that a port to new hardware is the content of those folders.
 
 ## Workflow for every task
 
@@ -51,6 +52,7 @@ Never rewrite history in `STATUS.md`, `PLAN.md` or `PROGRAM.md`: mark items done
 - [ ] `<op>_ref` in `src/ops/<op>.c`: scalar, fp32 accumulation, obviously correct, never optimized
 - [ ] Tests vs hand-computed values in `tests/test_ops.c`, and vs golden data: a record in `tests/golden/dump.py`, a handler and a justified tolerance in `tests/test_golden.c` (`tests/README.md`)
 - [ ] GPU kernel in `src/ops/cuda/<op>.cu`, compiled for CUDA and HIP through `src/backend/cuda/compat.h`
+- [ ] An operator that only a pipeline uses (an optimizer step, a quantization update) follows the same checklist (invariant 11)
 - [ ] Test GPU vs CPU reference on random and real inputs
 - [ ] Optional `<op>_fast` CPU path only if the op runs on CPU at runtime (MoE experts), tested vs `_ref`
 

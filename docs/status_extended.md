@@ -1074,6 +1074,16 @@ Branch `step9-fast-decode`, before the first task of step 9, at the maintainer's
 
 The move: commit `7e8aaad`; the documentation: the commit that names it here.
 
+Then, the same day, two rules written down at the maintainer's request:
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `AGENTS.md` | Changed | Invariant 11, pipelines contain no GPU code; the op checklist covers operators only a pipeline uses |
+| `docs/ARCHITECTURE.md` | Changed | Three names: `docs/contract/` (op contract, a document), `src/model/` (model contract, the C interface), `src/models/` (the families), what each is and when it changes; rule 6 says "nowhere else" |
+| `docs/PLAN.md`, `src/backend/README.md` | Changed | The Source layout decision and section name the rule |
+| `src/model/README.md`, `docs/contract/README.md` | Changed | Pointers to Three names |
+| `src/train/README.md`, `src/quant/README.md` | Changed | Optimizer steps and the GPU parts of quantization algorithms are ops |
+
 ---
 
 ## Files by step

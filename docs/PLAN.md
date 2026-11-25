@@ -10,7 +10,7 @@ Within inference, the first five steps run on the CPU only. They produce a slow 
 | --- | --- | --- |
 | Name | athanor; binary `athanor`; prefix `ath_`; container extension `.ath` | decided |
 | Languages | C11 host code; CUDA C kernels compiled by nvcc and, through `compat.h`, by hipcc | decided |
-| Source layout | by layer, then by language: portable C at the root of a module, CUDA C in its `cuda/` folder (one source for nvcc and hipcc); `hip/` for kernels whose AMD form cannot share the source and `metal/` for a Metal port, only if needed (`src/backend/README.md`, Source layout) | decided 2026-11-25, before step 9, at the maintainer's request |
+| Source layout | by layer, then by language: portable C at the root of a module, CUDA C in its `cuda/` folder (one source for nvcc and hipcc); `hip/` for kernels whose AMD form cannot share the source and `metal/` for a Metal port, only if needed (`src/backend/README.md`, Source layout). Pipelines hold no GPU code: a kernel they need is an op (AGENTS.md invariant 11) | decided 2026-11-25, before step 9, at the maintainer's request |
 | Dependencies | libc, libm, pthreads, POSIX, CUDA toolkit, ROCm; Python only for golden data | decided |
 | License | MIT | decided |
 | Model family | Qwen hybrid line (Qwen3.5 / 3.6 / 3.8) | decided |

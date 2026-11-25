@@ -1,6 +1,6 @@
 # src/model
 
-The contract between pipelines and model families, and the static registry. Introduced in step 2; the forward pass and the per-sequence state joined in step 4, text (tokenizer, chat template, output parser) in step 5, the GPU (`ath_exec`, states on a device) in step 8.
+The contract between pipelines and model families, and the static registry. Not to be confused with `src/models/` (the families that implement it) or `docs/contract/` (the op contract of each checkpoint, a document): `docs/ARCHITECTURE.md`, Three names. Introduced in step 2; the forward pass and the per-sequence state joined in step 4, text (tokenizer, chat template, output parser) in step 5, the GPU (`ath_exec`, states on a device) in step 8.
 
 | File | Content |
 | --- | --- |

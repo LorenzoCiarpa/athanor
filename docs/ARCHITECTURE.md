@@ -33,6 +33,18 @@ Tool calling is model-specific: how tool definitions enter the prompt and how a 
 
 Dependency direction: `tools → pipelines → contract → families → ops/text → backend → core`.
 
+### Three names: `docs/contract/`, `src/model/`, `src/models/`
+
+The word "contract" names two different things, and two folders differ by one letter:
+
+| Path | What it is | Kind | Changes when |
+| --- | --- | --- | --- |
+| `docs/contract/<family>-<size>.md` | the **op contract** of one checkpoint: the math of every op (dtype boundaries, norms, RoPE, gates, routing, state layout) as the pinned reference implementation computes it, each **verify** item checked there, with the reference's version and file hashes. No kernel is written for an op whose entry is missing (AGENTS.md invariant 5) | document | a model is added, or a **verify** item is settled |
+| `src/model/` | the **model contract**: `model.h`, the C interface between pipelines and families (roles, flags, params, the layer schedule, state specs, `forward`, the text members, `ath_exec`), with the registry and the checks around each call. It names no model | code, generic | a family brings a concept the contract cannot express (a new state kind, role or flag): by addition only, documented in this file, every existing family still compiling |
+| `src/models/<family>/` | the **families**: one folder per family that implements the contract (`config.c`, `weights.c`, `forward.c`, `text.c`, later `backward.c` and `cuda/fused.cu`). The only code that knows a model by name (invariant 2) | code, specific | a family is added or extended |
+
+`docs/contract/` says what a model computes; `src/models/<family>/` computes it, following that document op by op; `src/model/` is the shape through which every pipeline reaches any family without knowing which one it is. Adding a family is a new folder under `src/models/` and a new file under `docs/contract/`; `src/model/` changes only when the new family needs a concept the contract lacks (Adding models, below).
+
 ## The contract
 
 `src/model/model.h` is the most important file in the project. Pipelines see a model only through it. This is the header as of step 5 (comments shortened); members marked *later* join it when their first user lands.
@@ -281,4 +293,4 @@ athanor/
 3. Fused kernels live in the family folder, need a benchmark that shows the gain, and keep the op composition as fallback and reference.
 4. No model names outside `src/models/`.
 5. A pipeline that needs new information extends the contract, never works around it.
-6. Code is grouped by layer, then by language: portable C at the root of a module, GPU code in a folder named after its language, `cuda/` (CUDA C, which hipcc also compiles), with `hip/` or `metal/` beside it only if ever needed. Today GPU code lives in `src/backend/cuda/`, `src/ops/cuda/` and, for fused kernels, `src/models/<family>/cuda/` (`src/backend/README.md`, Source layout; decided 2026-11-25).
+6. Code is grouped by layer, then by language: portable C at the root of a module, GPU code in a folder named after its language, `cuda/` (CUDA C, which hipcc also compiles), with `hip/` or `metal/` beside it only if ever needed. GPU code lives in `src/backend/cuda/`, `src/ops/cuda/` and, for fused kernels, `src/models/<family>/cuda/`, and nowhere else: pipelines use the GPU through `backend.h` and `ops.h` and hold no GPU code; a kernel a pipeline needs is an op (AGENTS.md invariant 11; `src/backend/README.md`, Source layout; decided 2026-11-25).
