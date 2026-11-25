@@ -234,7 +234,7 @@ ATH_TEST(qwen35_bind_dense)
         ATH_EXPECT_EQ_INT(p->role, ATH_ROLE_OTHER);
         ATH_EXPECT_EQ_INT(p->layer, -1);
         ATH_EXPECT(strncmp(p->name, "model.visual.", 13) == 0 || strncmp(p->name, "mtp.", 4) == 0);
-        ATH_EXPECT(p->t.data == ath_safetensors_find(&m.ckpt, p->name)->t.data);
+        ATH_EXPECT(p->t.data == ath_ckpt_find(&m.ckpt, p->name)->t.data);
     }
 
     /* forward order: embedding first, final norm last (tied: no head) */
@@ -267,7 +267,7 @@ ATH_TEST(qwen35_bind_dense)
     ATH_EXPECT_EQ_INT(o->flags, ATH_P_WRITES_RESIDUAL);
     const ath_param *e = find_param(&m, "model.language_model.embed_tokens.weight", -1);
     ATH_REQUIRE(e);
-    ATH_EXPECT(e->t.data == ath_safetensors_find(&m.ckpt, e->name)->t.data);   /* zero-copy */
+    ATH_EXPECT(e->t.data == ath_ckpt_find(&m.ckpt, e->name)->t.data);   /* zero-copy */
 
     ath_model_close(&m);
     tmpdir_remove(&d);
@@ -304,7 +304,7 @@ ATH_TEST(qwen35_bind_moe)
 
     /* fused experts: one contiguous [rows, cols] view per expert, in place */
     const char *gu = "model.language_model.layers.2.mlp.experts.gate_up_proj";
-    const ath_safetensors_entry *full = ath_safetensors_find(&m.ckpt, gu);
+    const ath_ckpt_tensor *full = ath_ckpt_find(&m.ckpt, gu);
     ATH_REQUIRE(full);
     for (int32_t x = 0; x < E; x++) {
         const ath_param *p = find_param(&m, gu, x);

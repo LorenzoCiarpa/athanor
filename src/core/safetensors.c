@@ -3,49 +3,6 @@
 
 #include <string.h>
 
-/* ---- sorting -----------------------------------------------------------------
- * A small heapsort instead of qsort(): glibc's qsort may allocate a merge
- * buffer with malloc, and loading a checkpoint must not touch the heap outside
- * arenas. tmp is scratch space of one element. */
-
-typedef int (*cmp_fn)(const void *a, const void *b, void *ctx);
-
-static void swap_elem(char *a, char *b, size_t size, void *tmp)
-{
-    memcpy(tmp, a, size);
-    memcpy(a, b, size);
-    memcpy(b, tmp, size);
-}
-
-static void sift_down(char *base, size_t root, size_t end, size_t size, cmp_fn cmp, void *ctx,
-                      void *tmp)
-{
-    for (;;) {
-        size_t child = 2 * root + 1;
-        if (child >= end)
-            return;
-        if (child + 1 < end && cmp(base + child * size, base + (child + 1) * size, ctx) < 0)
-            child++;
-        if (cmp(base + root * size, base + child * size, ctx) >= 0)
-            return;
-        swap_elem(base + root * size, base + child * size, size, tmp);
-        root = child;
-    }
-}
-
-static void heap_sort(void *base, size_t n, size_t size, cmp_fn cmp, void *ctx, void *tmp)
-{
-    char *b = base;
-    if (n < 2)
-        return;
-    for (size_t i = n / 2; i-- > 0;)
-        sift_down(b, i, n, size, cmp, ctx, tmp);
-    for (size_t end = n - 1; end > 0; end--) {
-        swap_elem(b, b + end * size, size, tmp);
-        sift_down(b, 0, end, size, cmp, ctx, tmp);
-    }
-}
-
 static bool is_digit(unsigned char c) { return c >= '0' && c <= '9'; }
 
 int ath_safetensors_name_cmp(const char *a, const char *b)
@@ -310,7 +267,7 @@ static ath_status load_entries(ath_safetensors *st, ath_arena *a)
         goto done;
     }
 
-    heap_sort(st->tensors, n, sizeof *st->tensors, cmp_entry_name, NULL, tmp);
+    ath_sort(st->tensors, n, sizeof *st->tensors, cmp_entry_name, NULL, tmp);
     for (uint32_t i = 1; i < n; i++) {
         if (strcmp(st->tensors[i - 1].name, st->tensors[i].name) == 0) {
             ath_log(ATH_LOG_ERROR, "tensor %s appears more than once", st->tensors[i].name);
@@ -324,7 +281,7 @@ static ath_status load_entries(ath_safetensors *st, ath_arena *a)
      * of the data section. This also rules out overlapping tensors. */
     for (uint32_t i = 0; i < n; i++)
         order[i] = i;
-    heap_sort(order, n, sizeof *order, cmp_entry_offset, st->tensors, tmp);
+    ath_sort(order, n, sizeof *order, cmp_entry_offset, st->tensors, tmp);
     uint32_t i = 0;
     for (uint32_t s = 0; s < st->n_shards; s++) {
         uint64_t expect = 0;
@@ -409,7 +366,7 @@ static ath_status open_index(ath_safetensors *st, ath_arena *a, const char *dir,
             names[n_shards++] = file;
     }
     const char *tmp;
-    heap_sort(names, n_shards, sizeof *names, cmp_str_ptr, NULL, &tmp);
+    ath_sort(names, n_shards, sizeof *names, cmp_str_ptr, NULL, &tmp);
 
     st->shards = ath_arena_zalloc(a, (n_shards + 1) * sizeof *st->shards,
                                   _Alignof(ath_safetensors_shard));

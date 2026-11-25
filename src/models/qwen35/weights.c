@@ -62,9 +62,9 @@ static ath_status tensor_name(char *out, size_t cap, const binder *b, int32_t la
 }
 
 /* The tensor called name, with a float dtype and exactly the expected shape. */
-static ath_status find(const binder *b, const char *name, shape want, const ath_safetensors_entry **out)
+static ath_status find(const binder *b, const char *name, shape want, const ath_ckpt_tensor **out)
 {
-    const ath_safetensors_entry *e = ath_safetensors_find(&b->m->ckpt, name);
+    const ath_ckpt_tensor *e = ath_ckpt_find(&b->m->ckpt, name);
     if (!e) {
         ath_log(ATH_LOG_ERROR, "qwen35: missing tensor %s", name);
         return ATH_ERR_NOT_FOUND;
@@ -108,7 +108,7 @@ static ath_status bind(binder *b, int32_t layer, const char *suffix, shape want,
 {
     char name[256];
     ATH_CHECK(tensor_name(name, sizeof name, b, layer, suffix));
-    const ath_safetensors_entry *e;
+    const ath_ckpt_tensor *e;
     ATH_CHECK(find(b, name, want, &e));
     const ath_param *p = add(b, &e->t, e->name, role, layer, -1, flags);
     if (out)
@@ -123,7 +123,7 @@ static ath_status bind_experts(binder *b, int32_t layer, const char *suffix, int
 {
     char name[256];
     ATH_CHECK(tensor_name(name, sizeof name, b, layer, suffix));
-    const ath_safetensors_entry *e;
+    const ath_ckpt_tensor *e;
     ATH_CHECK(find(b, name, S3(b->c->n_experts, rows, cols), &e));
     const int64_t sh[2] = {rows, cols};
     for (int32_t x = 0; x < b->c->n_experts; x++) {
@@ -202,7 +202,7 @@ static const ath_ignored ignored_groups[] = {
     {.prefix = "mtp.", .reason = "multi-token prediction head: speculative decoding, step 13"},
 };
 
-static uint32_t count_prefix(const ath_safetensors *st, const char *prefix)
+static uint32_t count_prefix(const ath_ckpt *st, const char *prefix)
 {
     uint32_t n = 0;
     for (uint32_t i = 0; i < st->n_tensors; i++)
@@ -216,9 +216,9 @@ static uint32_t count_prefix(const ath_safetensors *st, const char *prefix)
  * are. */
 static void bind_unused(binder *b, const char *prefix)
 {
-    const ath_safetensors *st = &b->m->ckpt;
+    const ath_ckpt *st = &b->m->ckpt;
     for (uint32_t i = 0; i < st->n_tensors; i++) {
-        const ath_safetensors_entry *e = &st->tensors[i];
+        const ath_ckpt_tensor *e = &st->tensors[i];
         if (strncmp(e->name, prefix, strlen(prefix)) == 0)
             add(b, &e->t, e->name, ATH_ROLE_OTHER, -1, -1, ATH_P_UNUSED);
     }
@@ -264,7 +264,7 @@ ath_status ath_qwen35_bind(ath_model *m, ath_arena *a, ath_qwen35_model *q)
     ATH_CHECK(bind(&b, -1, "norm.weight", S1(h), ATH_ROLE_NORM, 0, &q->norm));
 
     /* The output head is a top-level tensor in both checkpoint layouts. */
-    const ath_safetensors_entry *head = ath_safetensors_find(&m->ckpt, "lm_head.weight");
+    const ath_ckpt_tensor *head = ath_ckpt_find(&m->ckpt, "lm_head.weight");
     if (c->tie_embeddings) {
         if (head) {
             ath_log(ATH_LOG_ERROR, "qwen35: tie_word_embeddings is true but the checkpoint has lm_head.weight");
@@ -272,7 +272,7 @@ ath_status ath_qwen35_bind(ath_model *m, ath_arena *a, ath_qwen35_model *q)
         }
         q->head = q->embed;
     } else {
-        const ath_safetensors_entry *e;
+        const ath_ckpt_tensor *e;
         ATH_CHECK(find(&b, "lm_head.weight", S2(v, h), &e));
         q->head = add(&b, &e->t, e->name, ATH_ROLE_LM_HEAD, -1, -1, SENS);
     }

@@ -90,13 +90,13 @@ enum { MARK_USED = 1, MARK_UNUSED = 2, MARK_GROUP = 4 };
  * contiguous view inside it. */
 static ath_status mark_params(const ath_model *m, uint8_t *mark)
 {
-    const ath_safetensors *st = &m->ckpt;
+    const ath_ckpt *st = &m->ckpt;
     for (uint32_t i = 0; i < m->n_params; i++) {
         const ath_param *p = &m->params[i];
         ATH_ASSERT((unsigned)p->role < ATH_ROLE_COUNT);
         ATH_ASSERT(p->layer >= -1 && p->layer < m->n_layers);
         ATH_ASSERT(p->expert >= -1 && (p->expert < m->n_experts || p->expert == -1));
-        const ath_safetensors_entry *e = p->name ? ath_safetensors_find(st, p->name) : NULL;
+        const ath_ckpt_tensor *e = p->name ? ath_ckpt_find(st, p->name) : NULL;
         if (!e) {
             ath_log(ATH_LOG_ERROR, "%s: param %u names no checkpoint tensor ('%s')",
                     m->family->name, i, p->name ? p->name : "(null)");
@@ -119,14 +119,14 @@ static ath_status mark_params(const ath_model *m, uint8_t *mark)
  * group only and bound as unused, never as a param the text path uses. */
 static ath_status mark_groups(ath_model *m, uint8_t *mark)
 {
-    const ath_safetensors *st = &m->ckpt;
+    const ath_ckpt *st = &m->ckpt;
     for (uint32_t g = 0; g < m->n_ignored; g++) {
         ath_ignored *ig = &m->ignored[g];
         size_t       plen = strlen(ig->prefix);
         ig->n_tensors = 0;
         ig->bytes = 0;
         for (uint32_t i = 0; i < st->n_tensors; i++) {
-            const ath_safetensors_entry *e = &st->tensors[i];
+            const ath_ckpt_tensor *e = &st->tensors[i];
             if (strncmp(e->name, ig->prefix, plen) != 0)
                 continue;
             const char *bad = (mark[i] & MARK_GROUP)    ? "is in another ignored group too"
@@ -140,7 +140,7 @@ static ath_status mark_groups(ath_model *m, uint8_t *mark)
             }
             mark[i] |= MARK_GROUP;
             ig->n_tensors++;
-            ig->bytes += e->end - e->begin;
+            ig->bytes += e->bytes;
         }
     }
     return ATH_OK;
@@ -151,7 +151,7 @@ static ath_status mark_groups(ath_model *m, uint8_t *mark)
  * bound as unused must be in an ignored group, so that the family says why. */
 static ath_status check_coverage(ath_model *m, ath_arena *a)
 {
-    const ath_safetensors *st = &m->ckpt;
+    const ath_ckpt *st = &m->ckpt;
     ath_arena_pos pos = ath_arena_mark(a);
     uint8_t *mark = ath_arena_zalloc(a, st->n_tensors ? st->n_tensors : 1, 1);
     if (!mark)
@@ -197,12 +197,12 @@ ath_status ath_model_open(ath_model *m, ath_arena *a, const char *dir)
         log_no_family(dir, m->config);
         return ATH_ERR_UNSUPPORTED;
     }
-    ATH_CHECK(ath_safetensors_open(&m->ckpt, a, dir));
+    ATH_CHECK(ath_ckpt_open(&m->ckpt, a, dir));
     ath_status s = m->family->load(m, a);
     if (s == ATH_OK)
         s = check_coverage(m, a);
     if (s != ATH_OK) {
-        ath_safetensors_close(&m->ckpt);
+        ath_ckpt_close(&m->ckpt);
         memset(m, 0, sizeof *m);
     }
     return s;
@@ -210,5 +210,5 @@ ath_status ath_model_open(ath_model *m, ath_arena *a, const char *dir)
 
 void ath_model_close(ath_model *m)
 {
-    ath_safetensors_close(&m->ckpt);
+    ath_ckpt_close(&m->ckpt);
 }

@@ -8,6 +8,7 @@
 #include "util.h"
 
 #include "core/arena.h"
+#include "core/ckpt.h"
 #include "core/file.h"
 #include "core/json.h"
 #include "core/safetensors.h"
@@ -574,8 +575,41 @@ ATH_TEST(tensor_init_and_views)
     ATH_EXPECT_STATUS(ath_tensor_init(&t, ATH_DTYPE_I64, 1, big, NULL, ATH_TIER_RAM), ATH_ERR_RANGE);
     int64_t nine[9] = {1, 1, 1, 1, 1, 1, 1, 1, 1};
     ATH_EXPECT_STATUS(ath_tensor_init(&t, ATH_DTYPE_F32, 9, nine, NULL, ATH_TIER_RAM), ATH_ERR_RANGE);
-    ATH_EXPECT_STATUS(ath_tensor_init(&t, ATH_DTYPE_QUANT_FIRST, 1, nine, NULL, ATH_TIER_RAM),
+    ATH_EXPECT_STATUS(ath_tensor_init(&t, (ath_dtype)(ATH_DTYPE_QUANT_FIRST + 1), 1, nine, NULL, ATH_TIER_RAM),
                       ATH_ERR_UNSUPPORTED);
+}
+
+ATH_TEST(q8_0_blocks)
+{
+    ATH_EXPECT(ath_dtype_is_quant(ATH_DTYPE_Q8_0) && !ath_dtype_is_quant(ATH_DTYPE_BF16));
+    ATH_EXPECT_EQ_U64(ath_dtype_size(ATH_DTYPE_Q8_0), 0);
+    ATH_EXPECT_EQ_INT(ath_dtype_block(ATH_DTYPE_Q8_0), 32);
+    ATH_EXPECT_EQ_INT(ath_dtype_block(ATH_DTYPE_BF16), 1);
+    ATH_EXPECT_EQ_INT(ath_dtype_block((ath_dtype)(ATH_DTYPE_QUANT_FIRST + 1)), 0);
+    ATH_EXPECT_EQ_U64(ath_dtype_bytes(ATH_DTYPE_Q8_0, 64), 68);
+    ATH_EXPECT_EQ_U64(ath_dtype_bytes(ATH_DTYPE_F32, 3), 12);
+    ATH_EXPECT_STR_EQ(ath_dtype_name(ATH_DTYPE_Q8_0), "q8_0");
+
+    /* [4 experts, 3 rows, 64 columns]: rows of two blocks, 68 bytes */
+    static unsigned char buf[4 * 3 * 68];
+    ath_tensor t, v;
+    int64_t shape[] = {4, 3, 64};
+    ATH_REQUIRE_OK(ath_tensor_init(&t, ATH_DTYPE_Q8_0, 3, shape, buf, ATH_TIER_RAM));
+    ATH_EXPECT_EQ_U64(ath_tensor_nbytes(&t), sizeof buf);
+    ATH_EXPECT_EQ_INT(t.stride[0], 192);
+    ATH_REQUIRE_OK(ath_tensor_slice(&t, 0, 2, 1, &v));                /* one expert */
+    ATH_EXPECT(v.data == (void *)(buf + 2 * 3 * 68) && ath_tensor_nbytes(&v) == 3 * 68);
+    ATH_REQUIRE_OK(ath_tensor_slice(&t, 1, 1, 2, &v));                /* rows 1..2 */
+    ATH_EXPECT(v.data == (void *)(buf + 68));
+    ATH_REQUIRE_OK(ath_tensor_slice(&t, 2, 32, 32, &v));              /* the second block */
+    ATH_EXPECT(v.data == (void *)(buf + 34));
+    ATH_EXPECT_STATUS(ath_tensor_slice(&t, 2, 16, 32, &v), ATH_ERR_INVALID_ARG);
+    ATH_EXPECT_STATUS(ath_tensor_slice(&t, 2, 0, 16, &v), ATH_ERR_INVALID_ARG);
+    int64_t two[] = {12, 64};
+    ATH_REQUIRE_OK(ath_tensor_reshape(&t, 2, two, &v));
+    int64_t odd[] = {3, 48};
+    ATH_EXPECT_STATUS(ath_tensor_init(&t, ATH_DTYPE_Q8_0, 2, odd, buf, ATH_TIER_RAM), ATH_ERR_INVALID_ARG);
+    ATH_EXPECT_STATUS(ath_tensor_init(&t, ATH_DTYPE_Q8_0, 0, NULL, buf, ATH_TIER_RAM), ATH_ERR_INVALID_ARG);
 }
 
 /* ---- safetensors ---------------------------------------------------------- */
@@ -884,6 +918,303 @@ ATH_TEST(safetensors_real_model)
 enum { MAX_TASKS = 12 };
 
 /* Each task counts its own runs: a task run twice, or by two threads, shows. */
+/* ---- GGUF ----------------------------------------------------------------- */
+
+/* A GGUF file built in memory, little-endian whatever the host. */
+typedef struct {
+    unsigned char b[8192];
+    size_t        n;
+} gbuf;
+
+static void g_le(gbuf *g, uint64_t v, unsigned bytes)
+{
+    for (unsigned i = 0; i < bytes; i++)
+        g->b[g->n++] = (unsigned char)(v >> (8 * i));
+}
+static void g_str(gbuf *g, const char *s)
+{
+    size_t n = strlen(s);
+    g_le(g, n, 8);
+    memcpy(g->b + g->n, s, n);
+    g->n += n;
+}
+static void g_header(gbuf *g, uint32_t version, uint64_t n_tensors, uint64_t n_kv)
+{
+    g->n = 0;
+    g_le(g, 0x46554747u, 4);
+    g_le(g, version, 4);
+    g_le(g, n_tensors, 8);
+    g_le(g, n_kv, 8);
+}
+static void g_kv_u32(gbuf *g, const char *key, uint32_t v)
+{
+    g_str(g, key);
+    g_le(g, 4, 4);
+    g_le(g, v, 4);
+}
+static void g_tensor(gbuf *g, const char *name, uint32_t nd, const uint64_t *ne, uint32_t type, uint64_t off)
+{
+    g_str(g, name);
+    g_le(g, nd, 4);
+    for (uint32_t i = 0; i < nd; i++)
+        g_le(g, ne[i], 8);
+    g_le(g, type, 4);
+    g_le(g, off, 8);
+}
+static void g_pad(gbuf *g, size_t align)
+{
+    while (g->n % align)
+        g->b[g->n++] = 0;
+}
+
+/* The valid file of gguf_reads: metadata of several types, then three
+ * tensors (f32 [2, 3], bf16 [4], q8_0 [2, 32]) at 32-byte boundaries.
+ * Returns the offset of the data section. */
+static size_t g_valid(gbuf *g)
+{
+    g_header(g, 3, 3, 5);
+    g_str(g, "general.architecture");
+    g_le(g, 8, 4);
+    g_str(g, "qwen35moe");
+    g_kv_u32(g, "qwen35moe.expert_count", 256);
+    g_str(g, "qwen35moe.rope.freq_base");
+    g_le(g, 6, 4);
+    float f = 1e7f;
+    uint32_t fu;
+    memcpy(&fu, &f, 4);
+    g_le(g, fu, 4);
+    g_str(g, "tokenizer.ggml.tokens");      /* an array of strings */
+    g_le(g, 9, 4);
+    g_le(g, 8, 4);
+    g_le(g, 2, 8);
+    g_str(g, "a");
+    g_str(g, "bc");
+    g_str(g, "qwen35moe.rope.dimension_sections");   /* an array of i32 */
+    g_le(g, 9, 4);
+    g_le(g, 5, 4);
+    g_le(g, 4, 8);
+    for (int i = 0; i < 4; i++)
+        g_le(g, (uint32_t)(i == 3 ? 0 : 11 - (i == 2)), 4);
+    const uint64_t ne_f[] = {3, 2}, ne_b[] = {4}, ne_q[] = {32, 2};
+    g_tensor(g, "blk.10.w", 2, ne_f, 0, 0);          /* 24 bytes at 0   */
+    g_tensor(g, "blk.2.w", 1, ne_b, 30, 32);         /*  8 bytes at 32  */
+    g_tensor(g, "q", 2, ne_q, 8, 64);                /* 68 bytes at 64  */
+    g_pad(g, 32);
+    size_t data = g->n;
+    for (int i = 0; i < 6; i++) {
+        float v = (float)i;
+        uint32_t u;
+        memcpy(&u, &v, 4);
+        g_le(g, u, 4);
+    }
+    g_pad(g, 32);
+    const uint16_t bf[4] = {0x3f80, 0x4000, 0xbf80, 0x0000};
+    for (int i = 0; i < 4; i++)
+        g_le(g, bf[i], 2);
+    g_pad(g, 32);
+    for (int r = 0; r < 2; r++) {          /* scale 0.5 (f16 0x3800), values r*32 + i - 16 */
+        g_le(g, 0x3800, 2);
+        for (int i = 0; i < 32; i++)
+            g->b[g->n++] = (unsigned char)(int8_t)(r * 32 + i - 16);
+    }
+    return data;
+}
+
+ATH_TEST(gguf_reads)
+{
+    tmpdir d;
+    ATH_REQUIRE(tmpdir_make(&d));
+    static gbuf g;
+    size_t data = g_valid(&g);
+    ATH_REQUIRE(tmpdir_write(&d, "m.gguf", g.b, g.n));
+    char p[1024];
+    ATH_REQUIRE_OK(ath_path_join(p, sizeof p, d.path, "m.gguf"));
+
+    ath_arena a;
+    ath_arena_init(&a, 0);
+    ath_gguf f;
+    ATH_REQUIRE_OK(ath_gguf_open(&f, &a, p));
+    ATH_EXPECT_EQ_INT(f.version, 3);
+    ATH_EXPECT_EQ_U64(f.n_kv, 5);
+    ATH_EXPECT_EQ_U64(f.alignment, 32);
+    ATH_EXPECT_EQ_U64(f.data_offset, data);
+    ATH_EXPECT_EQ_U64(f.tensor_bytes, 24 + 8 + 68);
+
+    const ath_gguf_kv *kv = ath_gguf_get(&f, "general.architecture");
+    ATH_REQUIRE(kv && kv->type == ATH_GGUF_STRING);
+    ATH_EXPECT_STR_EQ(kv->v.str.ptr, "qwen35moe");
+    kv = ath_gguf_get(&f, "qwen35moe.expert_count");
+    ATH_EXPECT(kv && kv->type == ATH_GGUF_U32 && kv->v.u == 256);
+    kv = ath_gguf_get(&f, "qwen35moe.rope.freq_base");
+    ATH_EXPECT(kv && kv->type == ATH_GGUF_F32 && kv->v.f == 1e7);
+    kv = ath_gguf_get(&f, "tokenizer.ggml.tokens");
+    ATH_EXPECT(kv && kv->type == ATH_GGUF_ARRAY && kv->v.arr.type == ATH_GGUF_STRING && kv->v.arr.count == 2);
+    kv = ath_gguf_get(&f, "qwen35moe.rope.dimension_sections");
+    ATH_EXPECT(kv && kv->v.arr.type == ATH_GGUF_I32 && kv->v.arr.count == 4);
+    ATH_EXPECT(ath_gguf_get(&f, "missing") == NULL);
+
+    /* natural order, shapes reversed from ne */
+    ATH_EXPECT_STR_EQ(f.tensors[0].name, "blk.2.w");
+    ATH_EXPECT_STR_EQ(f.tensors[1].name, "blk.10.w");
+    const ath_gguf_tensor *t = ath_gguf_find(&f, "blk.10.w");
+    ATH_REQUIRE(t != NULL);
+    ATH_EXPECT(t->t.dtype == ATH_DTYPE_F32 && t->t.ndim == 2 && t->t.shape[0] == 2 && t->t.shape[1] == 3);
+    ATH_EXPECT((const char *)t->t.data == (const char *)f.file.data + data);
+    ATH_EXPECT(((const float *)t->t.data)[t->t.stride[0] + 2] == 5.0f);
+    t = ath_gguf_find(&f, "blk.2.w");
+    ATH_REQUIRE(t != NULL);
+    ATH_EXPECT(t->t.dtype == ATH_DTYPE_BF16 && ((const uint16_t *)t->t.data)[2] == 0xbf80);
+    t = ath_gguf_find(&f, "q");
+    ATH_REQUIRE(t != NULL);
+    ATH_EXPECT(t->t.dtype == ATH_DTYPE_Q8_0 && t->t.shape[0] == 2 && t->t.shape[1] == 32 && t->bytes == 68);
+    const unsigned char *q = t->t.data;
+    ATH_EXPECT(q[0] == 0x00 && q[1] == 0x38 && (int8_t)q[2] == -16 && (int8_t)q[34 + 2 + 31] == 47);
+    ATH_EXPECT(ath_gguf_find(&f, "blk.3.w") == NULL);
+    ath_gguf_close(&f);
+
+    /* the same file as a checkpoint directory, with a vision projector beside it */
+    ATH_REQUIRE(tmpdir_write(&d, "mmproj-F16.gguf", "x", 1));
+    ath_ckpt c;
+    ATH_REQUIRE_OK(ath_ckpt_open(&c, &a, d.path));
+    ATH_EXPECT(c.format == ATH_CKPT_GGUF && c.n_tensors == 3 && c.tensor_bytes == 100);
+    const ath_ckpt_tensor *ct = ath_ckpt_find(&c, "q");
+    ATH_EXPECT(ct && ct->t.dtype == ATH_DTYPE_Q8_0 && ct->bytes == 68 && ct->offset == data + 64);
+    ath_ckpt_close(&c);
+    /* two text-model files are ambiguous */
+    ATH_REQUIRE(tmpdir_write(&d, "other.gguf", g.b, g.n));
+    ATH_EXPECT_STATUS(ath_ckpt_open(&c, &a, d.path), ATH_ERR_FORMAT);
+    /* safetensors win over GGUF */
+    ATH_REQUIRE(write_st(&d, "model.safetensors", "{\"w\":{\"dtype\":\"U8\",\"shape\":[1],\"data_offsets\":[0,1]}}",
+                         "z", 1));
+    ATH_REQUIRE_OK(ath_ckpt_open(&c, &a, d.path));
+    ATH_EXPECT(c.format == ATH_CKPT_SAFETENSORS && c.n_tensors == 1 && ath_ckpt_find(&c, "w") != NULL);
+    ath_ckpt_close(&c);
+    ath_arena_free(&a);
+    tmpdir_remove(&d);
+}
+
+ATH_TEST(gguf_rejects_bad_files)
+{
+    tmpdir d;
+    ATH_REQUIRE(tmpdir_make(&d));
+    char p[1024];
+    ATH_REQUIRE_OK(ath_path_join(p, sizeof p, d.path, "bad.gguf"));
+    ath_arena a;
+    ath_arena_init(&a, 0);
+    ath_gguf f;
+    static gbuf g;
+    const uint64_t ne4[] = {4}, ne8[] = {8}, ne48[] = {48};
+    enum { BAD_MAGIC, V1, TRUNC, KV_TYPE, BOOL2, DUP_KEY, ALIGN0, T_TYPE, Q_ROW, MISALIGNED, OVERLAP, GAP, PAST_END,
+           DUP_NAME, TAIL, EMPTY_NAME, N_CASES };
+    static const ath_status want[N_CASES] = {
+        [BAD_MAGIC] = ATH_ERR_FORMAT, [V1] = ATH_ERR_UNSUPPORTED, [TRUNC] = ATH_ERR_FORMAT,
+        [KV_TYPE] = ATH_ERR_UNSUPPORTED, [BOOL2] = ATH_ERR_FORMAT, [DUP_KEY] = ATH_ERR_FORMAT,
+        [ALIGN0] = ATH_ERR_FORMAT, [T_TYPE] = ATH_ERR_UNSUPPORTED, [Q_ROW] = ATH_ERR_FORMAT,
+        [MISALIGNED] = ATH_ERR_FORMAT, [OVERLAP] = ATH_ERR_FORMAT, [GAP] = ATH_ERR_FORMAT,
+        [PAST_END] = ATH_ERR_FORMAT, [DUP_NAME] = ATH_ERR_FORMAT, [TAIL] = ATH_ERR_FORMAT,
+        [EMPTY_NAME] = ATH_ERR_FORMAT,
+    };
+    for (int k = 0; k < N_CASES; k++) {
+        /* a base of one key and two u8 tensors of 4 bytes at 0 and 32, then the change */
+        uint64_t off2 = 32;
+        const uint64_t *ne2 = ne4;
+        uint32_t type2 = 0;
+        const char *name2 = "b";
+        int n_tensors = 2;
+        g_header(&g, k == V1 ? 1 : 3, (uint64_t)n_tensors, k == DUP_KEY ? 2 : 1);
+        if (k == BAD_MAGIC)
+            g.b[0] = 'X';
+        if (k == KV_TYPE) {
+            g_str(&g, "k");
+            g_le(&g, 13, 4);
+            g_le(&g, 0, 4);
+        } else if (k == BOOL2) {
+            g_str(&g, "k");
+            g_le(&g, 7, 4);
+            g_le(&g, 2, 1);
+        } else if (k == ALIGN0) {
+            g_kv_u32(&g, "general.alignment", 24);
+        } else {
+            g_kv_u32(&g, "k", 1);
+        }
+        if (k == DUP_KEY)
+            g_kv_u32(&g, "k", 2);
+        switch (k) {
+        case T_TYPE: type2 = 2; break;                     /* Q4_0 */
+        case Q_ROW: type2 = 8; ne2 = ne48; break;          /* 48 is not whole blocks */
+        case MISALIGNED: off2 = 16; break;
+        case OVERLAP: off2 = 0; break;
+        case GAP: off2 = 64; break;
+        case PAST_END: ne2 = ne8; off2 = 32; break;        /* 8 bytes where 4 are */
+        case DUP_NAME: name2 = "a"; break;
+        case EMPTY_NAME: name2 = ""; break;
+        }
+        g_tensor(&g, "a", 1, ne4, 0, 0);
+        g_tensor(&g, name2, 1, ne2, type2, off2);
+        if (k == TRUNC) {
+            ATH_REQUIRE(tmpdir_write(&d, "bad.gguf", g.b, g.n - 3));
+        } else {
+            g_pad(&g, 32);
+            for (int i = 0; i < 32 + 16; i++)                 /* tensor a, padding, tensor b (16 bytes of f32) */
+                g.b[g.n++] = 0;
+            if (k == TAIL)
+                for (int i = 0; i < 64; i++)
+                    g.b[g.n++] = 0;
+            ATH_REQUIRE(tmpdir_write(&d, "bad.gguf", g.b, g.n));
+        }
+        ath_status got = ath_gguf_open(&f, &a, p);
+        if (got != want[k]) {
+            char msg[256];
+            snprintf(msg, sizeof msg, "case %d: got '%s', want '%s'", k, ath_status_str(got), ath_status_str(want[k]));
+            ath_test_fail_(t_, __FILE__, __LINE__, msg);
+        }
+        if (got == ATH_OK)
+            ath_gguf_close(&f);
+    }
+    /* the base itself is valid */
+    g_header(&g, 3, 2, 1);
+    g_kv_u32(&g, "k", 1);
+    g_tensor(&g, "a", 1, ne4, 0, 0);
+    g_tensor(&g, "b", 1, ne4, 0, 32);
+    g_pad(&g, 32);
+    for (int i = 0; i < 48; i++)
+        g.b[g.n++] = 0;
+    ATH_REQUIRE(tmpdir_write(&d, "bad.gguf", g.b, g.n));
+    ATH_EXPECT_OK(ath_gguf_open(&f, &a, p));
+    ath_gguf_close(&f);
+    ATH_EXPECT_STATUS(ath_ckpt_open((ath_ckpt[1]){0}, &a, "/nonexistent-athanor-dir"), ATH_ERR_NOT_FOUND);
+    ath_arena_free(&a);
+    tmpdir_remove(&d);
+}
+
+/* The GGUF of step 12, if it is there (ATH_MOE_DIR, default models/Qwen3.6-35B-A3B). */
+ATH_TEST(gguf_real_model)
+{
+    const char *dir = getenv("ATH_MOE_DIR") ? getenv("ATH_MOE_DIR") : "models/Qwen3.6-35B-A3B";
+    char p[1024];
+    if (ath_path_join(p, sizeof p, dir, "Qwen3.6-35B-A3B-Q8_0.gguf") != ATH_OK || !ath_file_exists(p)) {
+        ATH_SKIP("no Qwen3.6-35B-A3B GGUF");
+    }
+    ath_arena a;
+    ath_arena_init(&a, 0);
+    ath_ckpt c;
+    ATH_REQUIRE_OK(ath_ckpt_open(&c, &a, dir));
+    ATH_EXPECT(c.format == ATH_CKPT_GGUF);
+    ATH_EXPECT_EQ_U64(c.n_tensors, 753);
+    const ath_gguf_kv *kv = ath_gguf_get(&c.gguf, "qwen35moe.expert_count");
+    ATH_EXPECT(kv && kv->type == ATH_GGUF_U32 && kv->v.u == 256);
+    const ath_ckpt_tensor *t = ath_ckpt_find(&c, "blk.0.ffn_gate_exps.weight");
+    ATH_REQUIRE(t != NULL);
+    ATH_EXPECT(t->t.dtype == ATH_DTYPE_Q8_0 && t->t.ndim == 3 && t->t.shape[0] == 256 && t->t.shape[1] == 512 &&
+               t->t.shape[2] == 2048);
+    t = ath_ckpt_find(&c, "token_embd.weight");
+    ATH_EXPECT(t && t->t.shape[0] == 248320 && t->t.shape[1] == 2048);
+    for (uint32_t i = 1; i < c.n_tensors; i++)
+        ATH_EXPECT(ath_safetensors_name_cmp(c.tensors[i - 1].name, c.tensors[i].name) < 0);
+    ath_ckpt_close(&c);
+    ath_arena_free(&a);
+}
+
 static void count_task(void *ctx, int32_t task, int32_t n_tasks)
 {
     int32_t *runs = ctx;
@@ -1053,11 +1384,15 @@ static const ath_test_case tests[] = {
     ATH_TEST_ENTRY(json_real_model_files),
     ATH_TEST_ENTRY(dtype_table),
     ATH_TEST_ENTRY(tensor_init_and_views),
+    ATH_TEST_ENTRY(q8_0_blocks),
     ATH_TEST_ENTRY(safetensors_name_order),
     ATH_TEST_ENTRY(safetensors_single_file),
     ATH_TEST_ENTRY(safetensors_rejects_bad_headers),
     ATH_TEST_ENTRY(safetensors_sharded),
     ATH_TEST_ENTRY(safetensors_real_model),
+    ATH_TEST_ENTRY(gguf_reads),
+    ATH_TEST_ENTRY(gguf_rejects_bad_files),
+    ATH_TEST_ENTRY(gguf_real_model),
     ATH_TEST_ENTRY(pool_runs_every_task_once),
     ATH_TEST_ENTRY(pool_shared_by_threads),
     ATH_TEST_ENTRY(sha256_vectors),

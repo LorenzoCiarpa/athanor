@@ -30,7 +30,7 @@
 #include "core/arena.h"
 #include "core/buf.h"
 #include "core/json.h"
-#include "core/safetensors.h"
+#include "core/ckpt.h"
 #include "core/tensor.h"
 #include "core/threads.h"
 #include "text/bpe.h"
@@ -47,7 +47,8 @@ typedef enum {
     ATH_ROLE_MLP_IN,      /* dense MLP or shared expert input matmuls (gate, up)        */
     ATH_ROLE_MLP_OUT,     /* dense MLP or shared expert output matmul (down)            */
     ATH_ROLE_ROUTER,      /* MoE router [n_experts, hidden]                             */
-    ATH_ROLE_EXPERT_IN,   /* routed expert input matmul, one param per expert           */
+    ATH_ROLE_EXPERT_IN,   /* routed expert input matmul(s), per expert one param per
+                           * checkpoint tensor (gate and up fused or apart)            */
     ATH_ROLE_EXPERT_OUT,  /* routed expert output matmul, one param per expert          */
     ATH_ROLE_CONV,        /* short causal convolution kernel                            */
     ATH_ROLE_GATE,        /* small matmul that produces per-head or per-token gates     */
@@ -192,7 +193,8 @@ typedef struct ath_family ath_family;
 typedef struct {
     const ath_family *family;
     const ath_json   *config;            /* parsed config.json                         */
-    ath_safetensors   ckpt;              /* mapped checkpoint; params view its memory  */
+    ath_ckpt          ckpt;              /* mapped checkpoint (safetensors or GGUF);
+                                          * params view its memory                   */
 
     ath_param        *params;            /* global params and each layer's params, in
                                           * forward order; then the ATH_P_UNUSED ones */
@@ -322,7 +324,8 @@ struct ath_family {
 };
 
 /* Open the checkpoint in dir: parse config.json, pick the first compiled-in
- * family whose match accepts it, map the safetensors files, load, and check
+ * family whose match accepts it, map the weights (safetensors or one GGUF
+ * file: core/ckpt.h), load, and check
  * coverage: every checkpoint tensor is viewed by at least one param; the
  * tensors of each ignored group are viewed by ATH_P_UNUSED params only, and
  * every ATH_P_UNUSED param views a tensor of exactly one group; every param

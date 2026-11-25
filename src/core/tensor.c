@@ -22,8 +22,34 @@ size_t ath_dtype_size(ath_dtype dt)
     return (unsigned)dt < ATH_DTYPE_COUNT ? dtype_info[dt].size : 0;
 }
 
+bool ath_dtype_is_quant(ath_dtype dt)
+{
+    return dt == ATH_DTYPE_Q8_0;
+}
+
+int64_t ath_dtype_block(ath_dtype dt)
+{
+    if (dt == ATH_DTYPE_Q8_0)
+        return ATH_Q8_0_BLOCK;
+    return ath_dtype_size(dt) ? 1 : 0;
+}
+
+/* Bytes of one block. */
+static size_t block_bytes(ath_dtype dt)
+{
+    return dt == ATH_DTYPE_Q8_0 ? ATH_Q8_0_BYTES : ath_dtype_size(dt);
+}
+
+size_t ath_dtype_bytes(ath_dtype dt, int64_t n)
+{
+    int64_t b = ath_dtype_block(dt);
+    return b ? (size_t)(n / b) * block_bytes(dt) : 0;
+}
+
 const char *ath_dtype_name(ath_dtype dt)
 {
+    if (dt == ATH_DTYPE_Q8_0)
+        return "q8_0";
     return (unsigned)dt < ATH_DTYPE_COUNT ? dtype_info[dt].name : "?";
 }
 
@@ -41,17 +67,19 @@ const char *ath_tier_name(ath_tier tier)
 ath_status ath_tensor_init(ath_tensor *t, ath_dtype dtype, int32_t ndim, const int64_t *shape,
                            void *data, ath_tier tier)
 {
-    size_t esize = ath_dtype_size(dtype);
-    if (esize == 0)
+    const int64_t block = ath_dtype_block(dtype);
+    if (block == 0)
         return ATH_ERR_UNSUPPORTED;
     if (ndim < 0 || ndim > ATH_MAX_DIMS)
         return ATH_ERR_RANGE;
+    if (block > 1 && (ndim == 0 || shape[ndim - 1] % block != 0))
+        return ATH_ERR_INVALID_ARG;
 
-    /* The product of the non-zero dimensions times the element size must fit
-     * in int64_t and size_t. That bounds every stride and the byte size, also
-     * when a zero dimension makes the tensor empty. */
+    /* The product of the non-zero dimensions times the bytes of a block must
+     * fit in int64_t and size_t. That bounds every stride and the byte size,
+     * also when a zero dimension makes the tensor empty. */
     uint64_t limit = (uint64_t)INT64_MAX < (uint64_t)SIZE_MAX ? (uint64_t)INT64_MAX : (uint64_t)SIZE_MAX;
-    uint64_t bytes = esize;
+    uint64_t bytes = block_bytes(dtype);
     for (int32_t i = 0; i < ndim; i++) {
         if (shape[i] < 0)
             return ATH_ERR_RANGE;
@@ -86,7 +114,7 @@ int64_t ath_tensor_numel(const ath_tensor *t)
 
 size_t ath_tensor_nbytes(const ath_tensor *t)
 {
-    return (size_t)ath_tensor_numel(t) * ath_dtype_size(t->dtype);
+    return ath_dtype_bytes(t->dtype, ath_tensor_numel(t));
 }
 
 bool ath_tensor_is_contiguous(const ath_tensor *t)
@@ -110,10 +138,13 @@ ath_status ath_tensor_slice(const ath_tensor *t, int32_t dim, int64_t start, int
         return ATH_ERR_INVALID_ARG;
     if (start < 0 || len < 0 || start > t->shape[dim] || len > t->shape[dim] - start)
         return ATH_ERR_RANGE;
+    const int64_t block = ath_dtype_block(t->dtype);
+    if (block > 1 && ((start * t->stride[dim]) % block || (len * t->stride[dim]) % block))
+        return ATH_ERR_INVALID_ARG;
     ath_tensor v = *t;
     v.shape[dim] = len;
     if (t->data)
-        v.data = (char *)t->data + start * t->stride[dim] * (int64_t)ath_dtype_size(t->dtype);
+        v.data = (char *)t->data + ath_dtype_bytes(t->dtype, start * t->stride[dim]);
     *out = v;
     return ATH_OK;
 }

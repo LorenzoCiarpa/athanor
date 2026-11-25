@@ -181,7 +181,7 @@ typedef struct {
     ath_status   (*backward)   (ath_model *m, ath_batch *b, ath_grads *g);     /* NULL until phase 4 */
 ```
 
-`load` takes the open checkpoint (`ath_safetensors`) rather than the `ath_weights` abstraction of the first design: there is one weight source until the `.ath` container lands in phase 2, which will introduce the abstraction with its second user.
+`load` takes the open checkpoint (`ath_safetensors`) rather than the `ath_weights` abstraction of the first design: there is one weight source until the `.ath` container lands in phase 2, which will introduce the abstraction with its second user. Step 12 brought the second source, a GGUF file (`docs/PLAN.md`, Step 12 weights), and with it the abstraction: `m->ckpt` is an `ath_ckpt` (`src/core/ckpt.h`), one name-sorted table of tensors from safetensors or from GGUF. Tensor names stay the format's own, so a family that reads both binds both naming schemes; the `.ath` container will be a third source of the same table.
 
 Since CHANGE-001 (2026-11-24) every checkpoint tensor is a param. Tensors the text path does not use, the vision encoder of a vision-language checkpoint and, until step 13, the MTP head, are bound as whole-tensor params flagged `ATH_P_UNUSED` (role other, layer −1, after all the other params), and each belongs to an ignored group that the family declares with a prefix and a reason. Pipelines on the text path skip them; an export (quantized container, abliterated checkpoint) copies them unchanged, so the result keeps its vision encoder.
 
@@ -253,7 +253,7 @@ athanor/
 ├── Makefile                     targets: cpu (default), cuda (+ test), hip, test, golden, clean; FAMILIES=qwen35
 ├── include/athanor.h            public C API
 ├── src/
-│   ├── core/      base.c arena.c buf.c tensor.c file.c json.c safetensors.c threads.c rng.c sha256.c (each with its .h)
+│   ├── core/      base.c arena.c buf.c tensor.c file.c json.c safetensors.c gguf.c ckpt.c threads.c rng.c sha256.c (each with its .h)
 │   ├── backend/   backend.h gpu_none.c devarena.c (step 6), cpu.c (later)
 │   │   └── cuda/  gpu.cu compat.h (step 6), gpu.h (step 7)
 │   ├── ops/       ops.h, check.h (private); per op a .c reference here and a .cu kernel in cuda/:

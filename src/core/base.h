@@ -91,6 +91,16 @@ void ath_log(ath_log_level level, const char *fmt, ...) __attribute__((format(pr
 
 #define ATH_ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
 
+/* ---- sorting -------------------------------------------------------------- */
+
+/* Sort n elements of size bytes in place by cmp (negative, zero, positive),
+ * which receives ctx. A heapsort instead of qsort(): glibc's qsort may
+ * allocate a merge buffer with malloc, and loading a checkpoint must not
+ * touch the heap outside arenas. tmp is scratch space for one element. Not
+ * stable. */
+typedef int (*ath_cmp_fn)(const void *a, const void *b, void *ctx);
+void ath_sort(void *base, size_t n, size_t size, ath_cmp_fn cmp, void *ctx, void *tmp);
+
 #ifdef __cplusplus
 }
 #endif

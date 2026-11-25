@@ -23,6 +23,7 @@ How to read it:
   - [Before step 9: source layout](#before-step-9-source-layout)
   - [Step 9: fast decode and bench](#step-9-fast-decode-and-bench)
   - [Step 10: fast prefill](#step-10-fast-prefill)
+  - [Step 12: MoE and tiering](#step-12-moe-and-tiering)
 - [Files by step](#files-by-step)
 
 ---
@@ -1202,6 +1203,28 @@ No file of the repository: vLLM 0.34.0 (torch 2.14.0 for CUDA 13.0) in a virtual
 #### 10.6 Report and documentation
 
 The report, `docs/results/2026-11-25-step10-prefill/`; READMEs of `src/ops` (Prompt kernels), `src/models/qwen35`, `tests`; `docs/program/gdn-gpu-kernel.md` (the chunked form), `docs/program/PROGRAM.md` (rows 10 and 10b), `docs/PLAN.md` (Dense GEMM decided), `README.md`, this file and `STATUS.md`.
+
+### Step 12: MoE and tiering
+
+Branch `step12-moe-tiering`, from `main` (steps 1–10; step 11 is postponed). The gate of `docs/PLAN.md`: Qwen3.6-35B-A3B decode at least Strata's on the same machine and quantization. Decisions at the start (`STATUS.md`, step 12): Q8_0 weights read from Unsloth's GGUF, the file Strata uses; invariant 7 as option (b), the CPU and GPU expert paths give the same bits.
+
+#### 12.1 The Strata baseline
+
+(in progress)
+
+#### 12.2 The GGUF reader and the checkpoint abstraction
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `src/core/gguf.h`, `gguf.c` | New | The GGUF reader: header (versions 2 and 3), metadata (every value type; keys and strings copied with a NUL, arrays left in the mapping with their type and count), the tensor table (shapes reversed from `ne`, types F32, F16, BF16, Q8_0), zero-copy views; validation: bounded reads, unique keys and names, a power-of-two `general.alignment`, aligned offsets, no overlap, padding-only gaps, nothing past the data |
+| `src/core/ckpt.h`, `ckpt.c` | New | `ath_ckpt`: safetensors (index and shards, or one file) or the one `.gguf` of a directory (`mmproj-*.gguf` passed over, safetensors first) as one name-sorted table of `ath_ckpt_tensor` (name, view, bytes, shard, file offset) |
+| `src/core/tensor.h`, `tensor.c` | Changed | `ATH_DTYPE_Q8_0` (64, the first block format: 32 elements, an f16 scale and 32 int8, 34 bytes); `ath_dtype_block`, `ath_dtype_bytes`, `ath_dtype_is_quant`; `ath_tensor_init` requires rows of whole blocks, `ath_tensor_slice` block boundaries, `ath_tensor_nbytes` counts blocks |
+| `src/core/base.h`, `base.c`, `safetensors.c` | Changed | `ath_sort`, the heapsort moved out of `safetensors.c` now that the GGUF reader uses it too |
+| `src/model/model.h`, `registry.c` | Changed | `m->ckpt` is an `ath_ckpt`; `ath_model_open` opens it, the coverage check walks its table |
+| `src/models/qwen35/weights.c` | Changed | Binds from the `ath_ckpt` table (the GGUF names arrive with 12.4) |
+| `tools/inspect.c` | Changed | Lists a GGUF checkpoint too: the file line (version, keys, architecture, data section), its tensors with their dtypes (`q8_0`), totals per dtype including block formats, the padding check |
+| `tests/test_core.c` | Changed | `q8_0_blocks` (sizes, views and slices on block boundaries); `gguf_reads` (a file built in memory: metadata of five types, three tensors, the checkpoint directory with a vision projector beside it, two files refused, safetensors first); `gguf_rejects_bad_files` (16 malformed variants); `gguf_real_model` (the Qwen3.6-35B-A3B GGUF when present: 753 tensors in natural order) |
+| `src/core/README.md`, `docs/ARCHITECTURE.md` | Changed | The two new files, Q8_0, loading through `ath_ckpt`; the weight-source abstraction arrived with its second user |
 
 ---
 

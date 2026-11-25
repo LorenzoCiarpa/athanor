@@ -1,4 +1,4 @@
-/* base.c: status strings and logging. See base.h. */
+/* base.c: status strings, logging and sorting. See base.h. */
 #include "core/base.h"
 
 #include <stdarg.h>
@@ -63,4 +63,41 @@ void ath_log(ath_log_level level, const char *fmt, ...)
     vfprintf(stderr, fmt, ap);
     fputc('\n', stderr);
     va_end(ap);
+}
+
+/* ---- sorting ----------------------------------------------------------------- */
+
+static void swap_elem(char *a, char *b, size_t size, void *tmp)
+{
+    memcpy(tmp, a, size);
+    memcpy(a, b, size);
+    memcpy(b, tmp, size);
+}
+
+static void sift_down(char *base, size_t root, size_t end, size_t size, ath_cmp_fn cmp, void *ctx, void *tmp)
+{
+    for (;;) {
+        size_t child = 2 * root + 1;
+        if (child >= end)
+            return;
+        if (child + 1 < end && cmp(base + child * size, base + (child + 1) * size, ctx) < 0)
+            child++;
+        if (cmp(base + root * size, base + child * size, ctx) >= 0)
+            return;
+        swap_elem(base + root * size, base + child * size, size, tmp);
+        root = child;
+    }
+}
+
+void ath_sort(void *base, size_t n, size_t size, ath_cmp_fn cmp, void *ctx, void *tmp)
+{
+    char *b = base;
+    if (n < 2)
+        return;
+    for (size_t i = n / 2; i-- > 0;)
+        sift_down(b, i, n, size, cmp, ctx, tmp);
+    for (size_t end = n - 1; end > 0; end--) {
+        swap_elem(b, b + end * size, size, tmp);
+        sift_down(b, 0, end, size, cmp, ctx, tmp);
+    }
 }

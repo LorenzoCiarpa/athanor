@@ -4,13 +4,15 @@ The bottom layer: memory, tensors, files, parsing, threads. No GPU code and no k
 
 | File | Content | Step |
 | --- | --- | --- |
-| `base.h`, `base.c` | fixed-width types, `ath_status` and `ath_status_str` (`ATH_ERR_DEVICE` since step 6), `ATH_CHECK`, logging (`ath_log`, `ATH_LOG` environment variable), `ATH_ASSERT` | 1, 6 |
+| `base.h`, `base.c` | fixed-width types, `ath_status` and `ath_status_str` (`ATH_ERR_DEVICE` since step 6), `ATH_CHECK`, logging (`ath_log`, `ATH_LOG` environment variable), `ATH_ASSERT`; `ath_sort`, the heapsort that loading uses instead of `qsort` (moved here from `safetensors.c` in step 12, when the GGUF reader became its second user) | 1, 6, 12 |
 | `arena.h`, `arena.c` | lifetime-scoped linear arenas (weights, per-request, per-step scratch): chained blocks, alignment, mark/reset | 1 |
-| `tensor.h`, `tensor.c` | `ath_dtype`, `ath_tier`, `ath_tensor` descriptor, slice and reshape views; bf16 conversion (round to nearest even, as torch) and element access for f32 and bf16 (step 3) | 1, 3 |
+| `tensor.h`, `tensor.c` | `ath_dtype`, `ath_tier`, `ath_tensor` descriptor, slice and reshape views; bf16 conversion (round to nearest even, as torch) and element access for f32 and bf16 (step 3); the first block format, `ATH_DTYPE_Q8_0` (step 12): `ath_dtype_block`, `ath_dtype_bytes`, `ath_dtype_is_quant`, rows of whole blocks, slices on block boundaries | 1, 3, 12 |
 | `file.h`, `file.c` | read-only `mmap`, `pread`, path join; async reads later (io_uring via raw syscalls) | 1 |
 | `json.h`, `json.c` | read-only JSON parser into an arena; lookup by key, index and dotted path; a writer with the formatting of Python's `json.dumps(ensure_ascii=False)` (step 5), because chat templates serialize tool definitions and arguments with it: `", "` and `": "`, Python's escapes and its shortest float repr (`1e-05`, `1e+16`) | 1, 5 |
 | `buf.h`, `buf.c` | `ath_buf`: a growable byte buffer in an arena, always NUL-terminated (rendered prompts, decoded text, JSON) | 5 |
 | `safetensors.h`, `safetensors.c` | single and multi-shard readers, zero-copy views; writer added in phase 4 for checkpoint export | 1 |
+| `gguf.h`, `gguf.c` | GGUF reader (versions 2 and 3): metadata (keys and strings copied, arrays left in the mapping), tensor table with shapes in row-major order, zero-copy views; tensor types F32, F16, BF16 and Q8_0; layout checked (aligned offsets, no overlap, padding only between tensors) | 12 |
+| `ckpt.h`, `ckpt.c` | `ath_ckpt`: the tensors of a model directory, from safetensors or from one `.gguf` file (`mmproj-*.gguf` passed over), as one name-sorted table; what `ath_model_open` and `athanor inspect` read | 12 |
 | `threads.c/.h` | fixed pthread pool for CPU work: `ath_pool_init`, `ath_pool_run` (fork and join, tasks assigned statically, runs from several threads take turns), `ath_pool_free`; first user `ath_matmul_fast`; later experts, dequantization, I/O completion | 4 |
 | `sha256.h`, `sha256.c` | SHA-256 (FIPS 180-4), streaming and of a whole file through its mapping; the weight files of benchmark reports (step 9), later the keys of on-disk prefix snapshots (step 14) | 9 |
 | `rng.h`, `rng.c` | `ath_rng`: xoshiro256** seeded by splitmix64, the same sequence for the same seed on every machine; the state belongs to the caller. First user: sampling in `athanor chat` | 5 |
@@ -26,6 +28,18 @@ The bottom layer: memory, tensors, files, parsing, threads. No GPU code and no k
 
 ## Loading a checkpoint
 
+Through `ath_ckpt`, whatever the format:
+
+```c
+ath_ckpt c;
+ATH_CHECK(ath_ckpt_open(&c, &a, "models/Qwen3.6-35B-A3B"));   /* safetensors, or the one .gguf file */
+const ath_ckpt_tensor *t = ath_ckpt_find(&c, "blk.0.ffn_gate_exps.weight");
+/* t->t: q8_0 [256, 512, 2048], data in the mapping; t->bytes, t->offset in the file */
+ath_ckpt_close(&c);
+```
+
+Or a safetensors checkpoint directly:
+
 ```c
 ath_arena a;
 ath_arena_init(&a, 0);
@@ -37,7 +51,9 @@ ath_safetensors_close(&st);
 ath_arena_free(&a);
 ```
 
-Opening validates the format the way the reference implementation does: known dtypes, shapes consistent with byte ranges, ranges inside the data section, tensors covering each data section exactly (no gaps, no overlaps), no duplicate names, and for sharded checkpoints a one-to-one match between the index and the shard headers. Tensors are sorted by name with digit runs compared as numbers (`layers.2` before `layers.10`); lookups are binary searches.
+GGUF files are validated as strictly: every count, string and array inside the file, unique NUL-free names and keys, offsets on the alignment, tensors inside the data section without overlaps, and gaps between tensors (and after the last) shorter than the alignment, i.e. padding. GGUF lists dimensions fastest first (`ne[0]`); the reader reverses them, so `token_embd.weight` of ne `[2048, 248320]` is `[248320, 2048]`, as in safetensors.
+
+Opening a safetensors checkpoint validates the format the way the reference implementation does: known dtypes, shapes consistent with byte ranges, ranges inside the data section, tensors covering each data section exactly (no gaps, no overlaps), no duplicate names, and for sharded checkpoints a one-to-one match between the index and the shard headers. Tensors are sorted by name with digit runs compared as numbers (`layers.2` before `layers.10`); lookups are binary searches.
 
 ## Memory tiers
 
@@ -46,5 +62,5 @@ Every tensor lives in one tier: `ATH_TIER_VRAM`, `ATH_TIER_PINNED`, `ATH_TIER_RA
 ## Rules
 
 - No `malloc` in hot paths; arenas only. `arena.c` is the only host file that calls `malloc`; `make check-alloc` verifies that `athanor inspect` allocates nothing else.
-- No `qsort`: glibc's may allocate a merge buffer. `safetensors.c` carries a small heapsort.
+- No `qsort`: glibc's may allocate a merge buffer. `ath_sort` (`base.c`) is a small heapsort.
 - Weights stay where `mmap` put them unless the engine decides to place them elsewhere; no hidden copies.

@@ -1,9 +1,11 @@
 /* inspect.c: `athanor inspect <model_dir> [--roles] [--json] [--filter <substring>]`.
  *
- * Without --roles: a summary of config.json, the shard files, one row per
- * tensor (name, dtype, shape, bytes) and totals per dtype, then the check
- * that the tensors account for every byte of the shards' data sections. This
- * works on any safetensors checkpoint and uses generic Hugging Face keys:
+ * Without --roles: a summary of config.json, the checkpoint files (the
+ * safetensors shards or the GGUF file), one row per tensor (name, dtype,
+ * shape, bytes) and totals per dtype, then the check that the tensors account
+ * for every byte of the data sections (for GGUF, up to alignment padding).
+ * This works on any safetensors or GGUF checkpoint (core/ckpt.h) and uses
+ * generic Hugging Face keys:
  * multimodal checkpoints keep the language model's keys under "text_config",
  * so each key is looked up at the top level first and then there.
  *
@@ -19,7 +21,7 @@
 
 #include "core/file.h"
 #include "core/json.h"
-#include "core/safetensors.h"
+#include "core/ckpt.h"
 #include "model/model.h"
 
 #include <string.h>
@@ -51,6 +53,9 @@ typedef struct {
     uint64_t params;
     uint64_t bytes;
 } dtype_total;
+
+/* Totals per dtype: plain types and block formats (values up to ATH_DTYPE_QUANT_LAST). */
+#define N_DTYPES (ATH_DTYPE_QUANT_LAST + 1)
 
 /* ---- config ------------------------------------------------------------------ */
 
@@ -195,9 +200,10 @@ static bool selected(const options *opt, const char *name)
 
 static const char *const cfg_keys[] = {"num_hidden_layers", "hidden_size", "vocab_size"};
 
-static void print_text(const options *opt, const ath_json *cfg, const ath_safetensors *st,
+static void print_text(const options *opt, const ath_json *cfg, const ath_ckpt *c,
                        const dtype_total *tot, const dtype_total *all)
 {
+    const ath_safetensors *st = &c->st;
     FILE *o = stdout;
     char b1[64], b2[64];
 
@@ -223,7 +229,16 @@ static void print_text(const options *opt, const ath_json *cfg, const ath_safete
     } else {
         printf("config   (no config.json)\n");
     }
-    for (uint32_t s = 0; s < st->n_shards; s++) {
+    if (c->format == ATH_CKPT_GGUF) {
+        const ath_gguf *g = &c->gguf;
+        fmt_bytes(b1, sizeof b1, g->file.size - g->data_offset);
+        const ath_gguf_kv *arch = ath_gguf_get(g, "general.architecture");
+        printf("gguf     %s: version %u, %llu metadata keys, architecture %s, data %s at %llu (alignment %llu)\n",
+               base_name(g->path), g->version, (unsigned long long)g->n_kv,
+               arch && arch->type == ATH_GGUF_STRING ? arch->v.str.ptr : "?", b1,
+               (unsigned long long)g->data_offset, (unsigned long long)g->alignment);
+    }
+    for (uint32_t s = 0; c->format == ATH_CKPT_SAFETENSORS && s < st->n_shards; s++) {
         fmt_bytes(b1, sizeof b1, st->shards[s].data_bytes);
         printf("%s %s: header %llu B, data %s\n", s ? "        " : "shards  ",
                base_name(st->shards[s].path), (unsigned long long)st->shards[s].header_bytes, b1);
@@ -231,8 +246,8 @@ static void print_text(const options *opt, const ath_json *cfg, const ath_safete
 
     int wname = 4, wshape = 5;
     char shape[256];
-    for (uint32_t i = 0; i < st->n_tensors; i++) {
-        const ath_safetensors_entry *e = &st->tensors[i];
+    for (uint32_t i = 0; i < c->n_tensors; i++) {
+        const ath_ckpt_tensor *e = &c->tensors[i];
         if (!selected(opt, e->name))
             continue;
         int l = (int)strlen(e->name);
@@ -243,20 +258,20 @@ static void print_text(const options *opt, const ath_json *cfg, const ath_safete
     }
     printf("\n%-*s  %-7s  %-*s  %12s\n", wname, "name", "dtype", wshape, "shape", "bytes");
     uint32_t shown = 0;
-    for (uint32_t i = 0; i < st->n_tensors; i++) {
-        const ath_safetensors_entry *e = &st->tensors[i];
+    for (uint32_t i = 0; i < c->n_tensors; i++) {
+        const ath_ckpt_tensor *e = &c->tensors[i];
         if (!selected(opt, e->name))
             continue;
         fmt_shape(shape, sizeof shape, &e->t);
         printf("%-*s  %-7s  %-*s  %12llu\n", wname, e->name, ath_dtype_name(e->t.dtype), wshape,
-               shape, (unsigned long long)(e->end - e->begin));
+               shape, (unsigned long long)e->bytes);
         shown++;
     }
 
     if (opt->filter)
-        printf("\nfilter '%s': %u of %u tensors\n", opt->filter, shown, st->n_tensors);
+        printf("\nfilter '%s': %u of %u tensors\n", opt->filter, shown, c->n_tensors);
     printf("\n%-7s  %8s  %14s  %14s\n", "dtype", "tensors", "params", "bytes");
-    for (int d = 0; d < ATH_DTYPE_COUNT; d++) {
+    for (int d = 0; d < N_DTYPES; d++) {
         if (!tot[d].tensors)
             continue;
         fmt_bytes(b1, sizeof b1, tot[d].bytes);
@@ -267,6 +282,13 @@ static void print_text(const options *opt, const ath_json *cfg, const ath_safete
     printf("%-7s  %8u  %14llu  %14llu  %s\n", opt->filter ? "matched" : "total", all->tensors,
            (unsigned long long)all->params, (unsigned long long)all->bytes, b1);
 
+    if (c->format == ATH_CKPT_GGUF) {
+        const ath_gguf *g = &c->gguf;
+        fmt_bytes(b1, sizeof b1, g->tensor_bytes);
+        printf("\ncheck    tensor bytes %llu (%s), data section %llu: the rest is alignment padding\n",
+               (unsigned long long)g->tensor_bytes, b1, (unsigned long long)(g->file.size - g->data_offset));
+        return;
+    }
     fmt_bytes(b1, sizeof b1, st->tensor_bytes);
     fmt_bytes(b2, sizeof b2, st->data_bytes);
     printf("\ncheck    tensor bytes %llu (%s) %s data sections %llu (%s)\n",
@@ -279,9 +301,11 @@ static void print_text(const options *opt, const ath_json *cfg, const ath_safete
                (uint64_t)st->index_total_size == st->tensor_bytes ? "==" : "!=");
 }
 
-static void print_json(const options *opt, const ath_json *cfg, const ath_safetensors *st,
+static void print_json(const options *opt, const ath_json *cfg, const ath_ckpt *c,
                        const dtype_total *tot, const dtype_total *all)
 {
+    const ath_safetensors *st = &c->st;
+    const bool gguf = c->format == ATH_CKPT_GGUF;
     FILE *o = stdout;
     fputs("{\n  \"model_dir\": ", o);
     json_cstr(o, opt->dir);
@@ -302,8 +326,15 @@ static void print_json(const options *opt, const ath_json *cfg, const ath_safete
         fputs("null", o);
     }
 
+    fprintf(o, ",\n  \"format\": \"%s\"", ath_ckpt_format_name(c->format));
     fputs(",\n  \"shards\": [", o);
-    for (uint32_t s = 0; s < st->n_shards; s++) {
+    if (gguf) {
+        fputs("\n    {\"file\": ", o);
+        json_cstr(o, base_name(c->gguf.path));
+        fprintf(o, ", \"header_bytes\": %llu, \"data_bytes\": %llu}", (unsigned long long)c->gguf.data_offset,
+                (unsigned long long)(c->gguf.file.size - c->gguf.data_offset));
+    }
+    for (uint32_t s = 0; !gguf && s < st->n_shards; s++) {
         fputs(s ? ",\n    {\"file\": " : "\n    {\"file\": ", o);
         json_cstr(o, base_name(st->shards[s].path));
         fprintf(o, ", \"header_bytes\": %llu, \"data_bytes\": %llu}",
@@ -318,8 +349,8 @@ static void print_json(const options *opt, const ath_json *cfg, const ath_safete
 
     fputs(",\n  \"tensors\": [", o);
     bool first = true;
-    for (uint32_t i = 0; i < st->n_tensors; i++) {
-        const ath_safetensors_entry *e = &st->tensors[i];
+    for (uint32_t i = 0; i < c->n_tensors; i++) {
+        const ath_ckpt_tensor *e = &c->tensors[i];
         if (!selected(opt, e->name))
             continue;
         fputs(first ? "\n    {\"name\": " : ",\n    {\"name\": ", o);
@@ -328,13 +359,12 @@ static void print_json(const options *opt, const ath_json *cfg, const ath_safete
         fprintf(o, ", \"dtype\": \"%s\", \"shape\": [", ath_dtype_name(e->t.dtype));
         for (int32_t d = 0; d < e->t.ndim; d++)
             fprintf(o, d ? ", %lld" : "%lld", (long long)e->t.shape[d]);
-        fprintf(o, "], \"bytes\": %llu, \"shard\": %u, \"offset\": %llu}",
-                (unsigned long long)(e->end - e->begin), e->shard,
-                (unsigned long long)(st->shards[e->shard].data_offset + e->begin));
+        fprintf(o, "], \"bytes\": %llu, \"shard\": %u, \"offset\": %llu}", (unsigned long long)e->bytes, e->shard,
+                (unsigned long long)e->offset);
     }
     fputs("\n  ],\n  \"totals\": [", o);
     first = true;
-    for (int d = 0; d < ATH_DTYPE_COUNT; d++) {
+    for (int d = 0; d < N_DTYPES; d++) {
         if (!tot[d].tensors)
             continue;
         fprintf(o, "%s\n    {\"dtype\": \"%s\", \"tensors\": %u, \"params\": %llu, \"bytes\": %llu}",
@@ -344,13 +374,15 @@ static void print_json(const options *opt, const ath_json *cfg, const ath_safete
     }
     fprintf(o, "\n  ],\n  \"selected\": {\"tensors\": %u, \"params\": %llu, \"bytes\": %llu},\n",
             all->tensors, (unsigned long long)all->params, (unsigned long long)all->bytes);
-    fprintf(o, "  \"tensor_bytes\": %llu,\n  \"data_bytes\": %llu,\n",
-            (unsigned long long)st->tensor_bytes, (unsigned long long)st->data_bytes);
-    if (st->index_total_size >= 0)
+    const uint64_t data_bytes = gguf ? c->gguf.file.size - c->gguf.data_offset : st->data_bytes;
+    fprintf(o, "  \"tensor_bytes\": %llu,\n  \"data_bytes\": %llu,\n", (unsigned long long)c->tensor_bytes,
+            (unsigned long long)data_bytes);
+    if (!gguf && st->index_total_size >= 0)
         fprintf(o, "  \"index_total_size\": %lld,\n", (long long)st->index_total_size);
     else
         fputs("  \"index_total_size\": null,\n", o);
-    fprintf(o, "  \"consistent\": %s\n}\n", st->tensor_bytes == st->data_bytes ? "true" : "false");
+    /* A GGUF file passed the reader's layout checks (padding only between tensors). */
+    fprintf(o, "  \"consistent\": %s\n}\n", gguf || st->tensor_bytes == st->data_bytes ? "true" : "false");
 }
 
 /* ---- --roles: the model contract ------------------------------------------------ */
@@ -684,35 +716,35 @@ int ath_cmd_inspect(ath_arena *a, int argc, char **argv)
         fprintf(stderr, "athanor inspect: cannot read config.json: %s\n", ath_status_str(s));
         return ATH_EXIT_FAILURE;
     }
-    ath_safetensors st;
-    s = ath_safetensors_open(&st, a, opt.dir);
+    ath_ckpt ck;
+    s = ath_ckpt_open(&ck, a, opt.dir);
     if (s != ATH_OK) {
         fprintf(stderr, "athanor inspect: cannot open the checkpoint in %s: %s\n", opt.dir,
                 ath_status_str(s));
         return ATH_EXIT_FAILURE;
     }
 
-    dtype_total tot[ATH_DTYPE_COUNT] = {{0}};
+    dtype_total tot[N_DTYPES] = {{0}};
     dtype_total all = {0};
-    for (uint32_t i = 0; i < st.n_tensors; i++) {
-        const ath_safetensors_entry *e = &st.tensors[i];
+    for (uint32_t i = 0; i < ck.n_tensors; i++) {
+        const ath_ckpt_tensor *e = &ck.tensors[i];
         if (!selected(&opt, e->name))
             continue;
         dtype_total *t = &tot[e->t.dtype];
         t->tensors++;
         t->params += (uint64_t)ath_tensor_numel(&e->t);
-        t->bytes += e->end - e->begin;
+        t->bytes += e->bytes;
         all.tensors++;
         all.params += (uint64_t)ath_tensor_numel(&e->t);
-        all.bytes += e->end - e->begin;
+        all.bytes += e->bytes;
     }
 
     if (opt.json)
-        print_json(&opt, cfg, &st, tot, &all);
+        print_json(&opt, cfg, &ck, tot, &all);
     else
-        print_text(&opt, cfg, &st, tot, &all);
+        print_text(&opt, cfg, &ck, tot, &all);
 
-    int rc = st.tensor_bytes == st.data_bytes ? ATH_EXIT_OK : ATH_EXIT_FAILURE;
-    ath_safetensors_close(&st);
+    int rc = ck.format == ATH_CKPT_GGUF || ck.st.tensor_bytes == ck.st.data_bytes ? ATH_EXIT_OK : ATH_EXIT_FAILURE;
+    ath_ckpt_close(&ck);
     return rc;
 }

@@ -32,16 +32,34 @@ typedef enum {
     ATH_DTYPE_F8_E5M2,
     ATH_DTYPE_COUNT,       /* number of plain element types */
 
-    /* Values 64..127 are reserved for athanor's quantized block formats
-     * (phase 2, milestone Q1). They pack several elements with shared scales,
-     * so they have no per-element size: ath_dtype_size() returns 0 for them. */
+    /* Values 64..127 are quantized block formats: a block of elements
+     * shares a scale, so a format has no per-element size (ath_dtype_size()
+     * returns 0) but a block size and the bytes of one block. A tensor in a
+     * block format is stored row by row, its last dimension a whole number
+     * of blocks. Step 12 brings the first, Q8_0; the others are phase 2,
+     * milestone Q1. */
     ATH_DTYPE_QUANT_FIRST = 64,
+    /* GGML's Q8_0, as GGUF files store it: blocks of 32 elements, each an
+     * f16 scale d followed by 32 int8 values q; element i of a block is
+     * d · q[i] (exact in f32). 34 bytes per block, no padding. */
+    ATH_DTYPE_Q8_0 = ATH_DTYPE_QUANT_FIRST,
     ATH_DTYPE_QUANT_LAST  = 127
 } ath_dtype;
 
-/* Bytes per element; 0 for reserved or unknown values. */
+#define ATH_Q8_0_BLOCK 32           /* elements per Q8_0 block           */
+#define ATH_Q8_0_BYTES 34           /* bytes per Q8_0 block: f16 + 32 i8 */
+
+/* Bytes per element; 0 for block formats and for reserved or unknown values. */
 size_t      ath_dtype_size(ath_dtype dt);
-/* Lower-case name ("bf16"); "?" for reserved or unknown values. */
+/* Elements per block: 1 for plain element types, the block size of a block
+ * format; 0 for reserved or unknown values. */
+int64_t     ath_dtype_block(ath_dtype dt);
+/* Bytes of n elements; n must be a multiple of the block size. 0 for
+ * reserved or unknown values. */
+size_t      ath_dtype_bytes(ath_dtype dt, int64_t n);
+/* true for the block formats (values 64..127 that athanor knows). */
+bool        ath_dtype_is_quant(ath_dtype dt);
+/* Lower-case name ("bf16", "q8_0"); "?" for reserved or unknown values. */
 const char *ath_dtype_name(ath_dtype dt);
 
 /* Where the bytes live. Kernels never branch on the tier; the engine moves
@@ -67,18 +85,22 @@ typedef struct {
 
 /* Contiguous row-major descriptor. Checks the dtype, that 0 <= ndim <=
  * ATH_MAX_DIMS, that no dimension is negative and that the byte size fits in
- * size_t. Unused shape and stride entries are zeroed. */
+ * size_t; for a block format also that ndim >= 1 and the last dimension is a
+ * multiple of the block size (ATH_ERR_INVALID_ARG otherwise). Unused shape
+ * and stride entries are zeroed. */
 ath_status ath_tensor_init(ath_tensor *t, ath_dtype dtype, int32_t ndim, const int64_t *shape,
                            void *data, ath_tier tier);
 
 int64_t ath_tensor_numel(const ath_tensor *t);
-/* numel * element size: the bytes the elements occupy if packed. */
+/* The bytes the elements occupy if packed (numel times the element size,
+ * or whole blocks for a block format). */
 size_t  ath_tensor_nbytes(const ath_tensor *t);
 bool    ath_tensor_is_contiguous(const ath_tensor *t);
 
 /* View of elements [start, start + len) along dimension dim. The view shares
  * memory with t; it is contiguous only if t is and dim is the outermost
- * dimension with more than one element. */
+ * dimension with more than one element. In a block format a slice of the
+ * last dimension must start and end on block boundaries (ATH_ERR_INVALID_ARG). */
 ath_status ath_tensor_slice(const ath_tensor *t, int32_t dim, int64_t start, int64_t len,
                             ath_tensor *out);
 
