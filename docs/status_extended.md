@@ -974,12 +974,16 @@ Branch `step8-engine`, from `main` after step 7 was merged. The gate of `docs/PL
 | `src/backend/backend.h`, `gpu.cu`, `gpu_none.c`, `compat.h` | Changed | `ath_copy_2d` (`cudaMemcpy2DAsync`; `hipMemcpy2DAsync`) |
 | `tests/test_backend.c` | Changed | A gather of columns on the device and a scatter into wider host rows, byte for byte; a pitch smaller than the width refused |
 
+Commit `ee6fff1`.
+
 #### 8.2 Op entry points
 
 | File | Kind | What it is for |
 | --- | --- | --- |
 | `src/ops/ops.h` | Changed | `ath_<op>(d, ...)` for the 13 ops |
 | `src/ops/dispatch.c` | New | The op on device d (`_gpu`) or on the CPU (`_ref`, `ath_matmul_fast`) |
+
+Commit `0b1013a`.
 
 #### 8.3 The contract on two devices
 
@@ -1014,6 +1018,8 @@ The CPU pass is unchanged: the entry points call the same functions with the sam
 | --- | --- | --- |
 | `tools/chat.c` | Changed | `--device cpu\|gpu` (the GPU by default when there is one, the CPU as fallback); the engine's exec and states; `ath_state_reset` checked |
 
+8.3 to 8.6, and the GPU runs of `test_forward` (8.8): commit `faddfcc`.
+
 #### 8.7 Golden generations
 
 | File | Kind | What it is for |
@@ -1036,6 +1042,8 @@ What was found while testing:
 
 - **The gate's noise.** The bf16 noise of the 50 prompts ranges from 0.17 to 0.62, with one prompt at 1.24. The largest over all prompts, the rule of the forward records, would check 8,352 of the 12,800 steps; each prompt's own noise checks 11,445. The gate uses the prompt's own, and reports the other: 0 differences either way.
 - **On the tiny model the GPU gives the same bits** all at once, in pieces and token by token (cuBLASLt chose the same algorithm for every row count there), and differs from the CPU by 9.8e-6 in f32.
+
+8.7 and `test_engine`: commit `fc151ee`; the documentation: `98d16f7` and the commit that names them here.
 
 #### 8.9 Documentation
 
