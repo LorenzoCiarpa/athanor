@@ -63,9 +63,9 @@ static ath_status gdn_args(const ath_tensor *q, const ath_tensor *k, const ath_t
                            ops_where where)
 {
     const char *op = gdn_op;
-    ATH_CHECK(ops_float(q, op, "q"));
-    ATH_CHECK(ops_float(k, op, "k"));
-    ATH_CHECK(ops_float(v, op, "v"));
+    ATH_CHECK(ops_float_rows(q, op, "q"));
+    ATH_CHECK(ops_float_rows(k, op, "k"));
+    ATH_CHECK(ops_float_rows(v, op, "v"));
     ATH_CHECK(ops_float(g, op, "g"));
     ATH_CHECK(ops_float(beta, op, "beta"));
     ATH_CHECK(ops_tensor(state, ATH_DTYPE_F32, op, "state"));
@@ -110,24 +110,25 @@ ath_status ath_gdn_ref(const ath_tensor *q, const ath_tensor *k, const ath_tenso
     for (int64_t t = 0; t < T; t++)
         for (int64_t h = 0; h < nv; h++) {
             float *S = S0 + h * dk * dv;
-            const int64_t qk = (t * nk + h / group) * dk;   /* query/key head of value head h */
-            const int64_t vb = (t * nv + h) * dv;
+            const int64_t qb = t * q->stride[0] + (h / group) * dk;   /* query/key head of value head h */
+            const int64_t kb = t * k->stride[0] + (h / group) * dk;
+            const int64_t vb = t * v->stride[0] + h * dv, ob = (t * nv + h) * dv;
             const float alpha = expf(ld(g, t * nv + h));
             const float b = ld(beta, t * nv + h);
-            const float iq = l2_inv(q, qk, dk, l2_eps), ik = l2_inv(k, qk, dk, l2_eps);
+            const float iq = l2_inv(q, qb, dk, l2_eps), ik = l2_inv(k, kb, dk, l2_eps);
             for (int64_t j = 0; j < dv; j++) {
                 float u = 0.0f;
                 for (int64_t i = 0; i < dk; i++) {
                     S[i * dv + j] *= alpha;
-                    u += S[i * dv + j] * (ld(k, qk + i) * ik);
+                    u += S[i * dv + j] * (ld(k, kb + i) * ik);
                 }
                 float delta = (ld(v, vb + j) - u) * b;
                 float o = 0.0f;
                 for (int64_t i = 0; i < dk; i++) {
-                    S[i * dv + j] += (ld(k, qk + i) * ik) * delta;
-                    o += S[i * dv + j] * ((ld(q, qk + i) * iq) * q_scale);
+                    S[i * dv + j] += (ld(k, kb + i) * ik) * delta;
+                    o += S[i * dv + j] * ((ld(q, qb + i) * iq) * q_scale);
                 }
-                st(out, vb + j, o);
+                st(out, ob + j, o);
             }
         }
     return ATH_OK;

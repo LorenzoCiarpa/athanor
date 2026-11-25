@@ -58,7 +58,7 @@ extern "C" ath_status ath_gdn_gates_launch(const ath_device *d, const ath_tensor
 static __global__ void __launch_bounds__(GDN_WARPS *ATH_WARP)
 gdn_kernel(const void *q, int qdt, const void *k, int kdt, const void *v, int vdt, const void *g, int gdt,
            const void *beta, int bdt, float q_scale, float l2_eps, float *state, void *out, int odt, int64_t T,
-           int64_t nk, int64_t dk, int64_t nv, int64_t dv)
+           int64_t nk, int64_t dk, int64_t nv, int64_t dv, int64_t qs, int64_t ks, int64_t vs)
 {
     __shared__ float kq[2][ATH_GDN_MAX_DK];         /* the token's k and q, as given  */
     __shared__ float part[GDN_WARPS][ATH_WARP];      /* the warps' partial sums      */
@@ -78,10 +78,10 @@ gdn_kernel(const void *q, int qdt, const void *k, int kdt, const void *v, int vd
         s[r] = live && i < dk ? S[i * dv + j] : 0.0f;
     }
     for (int64_t t = 0; t < T; t++) {
-        const int64_t qk = (t * nk + kh) * dk, tv = t * nv + h;
+        const int64_t qb = t * qs + kh * dk, kb = t * ks + kh * dk, tv = t * nv + h;
         float sk = 0.0f, sq = 0.0f;
         for (int64_t i = threadIdx.x; i < dk; i += blockDim.x) {
-            const float kv = k_ld(k, kdt, qk + i), qv = k_ld(q, qdt, qk + i);
+            const float kv = k_ld(k, kdt, kb + i), qv = k_ld(q, qdt, qb + i);
             kq[0][i] = kv;
             kq[1][i] = qv;
             sk += kv * kv;
@@ -112,7 +112,7 @@ gdn_kernel(const void *q, int qdt, const void *k, int kdt, const void *v, int vd
         u = part[0][lane];
         for (int w = 1; w < GDN_WARPS; w++)
             u += part[w][lane];
-        const float delta = live ? (k_ld(v, vdt, tv * dv + j) - u) * b : 0.0f;
+        const float delta = live ? (k_ld(v, vdt, t * vs + h * dv + j) - u) * b : 0.0f;
         float o = 0.0f;
 #pragma unroll
         for (int r = 0; r < GDN_ROWS; r++) {
@@ -159,6 +159,6 @@ extern "C" ath_status ath_gdn_launch(const ath_device *d, const ath_tensor *q, c
     gdn_kernel<<<grid, GDN_WARPS * ATH_WARP, 0, k_stream(d)>>>(q->data, q->dtype, k->data, k->dtype, v->data, v->dtype,
                                                                g->data, g->dtype, beta->data, beta->dtype, q_scale,
                                                                l2_eps, (float *)state->data, out->data, out->dtype, T, nk, dk,
-                                                               nv, dv);
+                                                               nv, dv, q->stride[0], k->stride[0], v->stride[0]);
     return ath_gpu_launched("gdn_kernel");
 }

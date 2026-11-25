@@ -77,7 +77,7 @@ static __device__ __forceinline__ void tri_mul(const float (*at)[AP], const floa
 #pragma unroll
         for (int e = 0; e < 8; e++)
             o[a][e] = 0.0f;
-#pragma unroll 4
+#pragma unroll 2
     for (int j = 0; j < GC; j++) {
         const float4 a0 = *(const float4 *)&at[j][8 * ti], a1 = *(const float4 *)&at[j][8 * ti + 4];
         const float4 x0 = *(const float4 *)&x[j][c], x1 = *(const float4 *)&x[j][c + 64];
@@ -119,45 +119,40 @@ static __device__ __forceinline__ void tri_store_t(float *dst, int n, const floa
 }
 
 /* Rows of the chunk's keys or queries into a tile, L2-normalized: row i is
- * dk elements of dtype dt at element base + i stride of x. Half-warp hw
- * takes rows hw, hw + 8, ..., a lane 8 elements of each; inv[i] gets
- * 1 / |row i|. Rows past n and columns past dk are zeros. */
+ * dk elements of dtype dt at element base + i stride of x (the staged bf16
+ * rows in shared memory, or f32 rows in global memory). Half-warp hw takes
+ * rows hw, hw + 8, ..., a lane 8 elements of each; inv[i] gets 1 / |row i|.
+ * Rows past n and columns past dk are zeros. A loop, not unrolled: code run
+ * once per block costs its fetch from L2 (the kernel is larger than the
+ * instruction cache). */
 static __device__ __forceinline__ void prep_rows(float (*tile)[XP], float *inv, const void *x, int dt,
                                                  int64_t base, int64_t stride, int dk, int n, float eps)
 {
     const int lane = threadIdx.x % 16, hw = threadIdx.x / 16;
-    float v[GC / (PT / 16)][8];                        /* every load issued before any is used */
-#pragma unroll
-    for (int m = 0; m < GC / (PT / 16); m++) {
-        const int i = hw + m * (PT / 16);
-#pragma unroll
-        for (int e = 0; e < 8; e++)
-            v[m][e] = 0.0f;
+#pragma unroll 1
+    for (int i = hw; i < GC; i += PT / 16) {
+        float v[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
         if (i < n && 8 * lane < dk)
-            k_ld8(x, dt, (base + i * stride) / 8 + lane, v[m]);
-    }
-#pragma unroll
-    for (int m = 0; m < GC / (PT / 16); m++) {
-        const int i = hw + m * (PT / 16);
+            k_ld8(x, dt, (base + i * stride) / 8 + lane, v);
         float ss = 0.0f;
 #pragma unroll
         for (int e = 0; e < 8; e++)
-            ss += v[m][e] * v[m][e];
+            ss += v[e] * v[e];
 #pragma unroll
         for (int s = 1; s < 16; s <<= 1)
             ss += ath_shfl_xor(ss, s);
         const float r = 1.0f / sqrtf(ss + eps);
         if (lane == 0)
             inv[i] = r;
-        *(float4 *)&tile[i][8 * lane] = make_float4(v[m][0] * r, v[m][1] * r, v[m][2] * r, v[m][3] * r);
-        *(float4 *)&tile[i][8 * lane + 4] = make_float4(v[m][4] * r, v[m][5] * r, v[m][6] * r, v[m][7] * r);
+        *(float4 *)&tile[i][8 * lane] = make_float4(v[0] * r, v[1] * r, v[2] * r, v[3] * r);
+        *(float4 *)&tile[i][8 * lane + 4] = make_float4(v[4] * r, v[5] * r, v[6] * r, v[7] * r);
     }
 }
 
 static __global__ void __launch_bounds__(PT)
 gdn_prep(const void *q, int qdt, const void *k, int kdt, const void *v, int vdt, const float *g, const void *beta,
          int bdt, float q_scale, float l2_eps, int64_t T, int64_t c0, int64_t nk, int dk, int64_t nv, int dv,
-         float *Qp, float *W, float *U, float *OU, float *gam, float *ikg)
+         int64_t qs, int64_t ks, int64_t vs, float *Qp, float *W, float *U, float *OU, float *gam, float *ikg)
 {
     extern __shared__ __align__(16) float pm[];
     float (*x0)[XP] = (float (*)[XP])pm;
@@ -177,7 +172,7 @@ gdn_prep(const void *q, int qdt, const void *k, int kdt, const void *v, int vdt,
      * (padding) and columns past dk zeros. bf16 rows travel by cp.async, all
      * at once: the keys into Tᵀ's place, the queries into the top of x0,
      * which they leave (into x1) before the keys arrive there. */
-    const int64_t qkb = (t0 * nk + kh) * dk, qks = nk * dk;
+    const int64_t qb = t0 * qs + kh * dk, kb = t0 * ks + kh * dk;   /* rows qs, ks elements apart */
     const bool stage = kdt == ATH_DTYPE_BF16 && qdt == ATH_DTYPE_BF16;
     uint16_t *kraw = (uint16_t *)&tt[0][0];
     uint16_t *qraw = (uint16_t *)((char *)&x0[0][0] + sizeof(float[GC][XP]) - sizeof(uint16_t[GC][GD]));
@@ -185,8 +180,8 @@ gdn_prep(const void *q, int qdt, const void *k, int kdt, const void *v, int vdt,
         for (int e = tid; e < GC * (dk / 8); e += PT) {
             const int i = e / (dk / 8), c = 8 * (e % (dk / 8));
             const bool ok = i < n;
-            k_cp16(&kraw[i * GD + c], ok ? (const uint16_t *)k + qkb + i * qks + c : (const uint16_t *)k, ok);
-            k_cp16(&qraw[i * GD + c], ok ? (const uint16_t *)q + qkb + i * qks + c : (const uint16_t *)q, ok);
+            k_cp16(&kraw[i * GD + c], ok ? (const uint16_t *)k + kb + i * ks + c : (const uint16_t *)k, ok);
+            k_cp16(&qraw[i * GD + c], ok ? (const uint16_t *)q + qb + i * qs + c : (const uint16_t *)q, ok);
         }
         k_cp_commit();
     }
@@ -206,8 +201,8 @@ gdn_prep(const void *q, int qdt, const void *k, int kdt, const void *v, int vdt,
         __syncthreads();                               /* the staged queries are read: x0 is free */
         prep_rows(x0, ik, kraw, ATH_DTYPE_BF16, 0, GD, dk, n, l2_eps);
     } else {
-        prep_rows(x1, iq, q, qdt, qkb, qks, dk, n, l2_eps);
-        prep_rows(x0, ik, k, kdt, qkb, qks, dk, n, l2_eps);
+        prep_rows(x1, iq, q, qdt, qb, qs, dk, n, l2_eps);
+        prep_rows(x0, ik, k, kdt, kb, ks, dk, n, l2_eps);
     }
     __syncthreads();                                   /* the staged keys are read: Tᵀ starts as I */
     for (int e = tid; e < GC * AP; e += PT)
@@ -248,17 +243,29 @@ gdn_prep(const void *q, int qdt, const void *k, int kdt, const void *v, int vdt,
                 }
         }
         __syncthreads();                               /* the queries are read: A and Mᵀ replace them */
+        /* the dot products first, as they are (64 stores), then their
+         * factors in a loop: straight-line code for every element would be
+         * longer than the instruction cache holds */
 #pragma unroll
         for (int a = 0; a < 8; a++)
 #pragma unroll
             for (int b = 0; b < 8; b++) {
                 const int i = 8 * (ti & 7) + a, j = tj + 8 * b;
-                const float decay = j <= i ? expf(__fsub_rn(gm[i], gm[j])) : 0.0f;
                 if (ti < 8)
-                    aa[i][j] = j < i ? __fmul_rn(__fmul_rn(bt[i], acc[a][b]), decay) : 0.0f;
+                    aa[i][j] = acc[a][b];
                 else
-                    mt[j][i] = j <= i ? __fmul_rn(__fmul_rn(q_scale, acc[a][b]), decay) : 0.0f;
+                    mt[j][i] = acc[a][b];
             }
+    }
+    __syncthreads();
+    /* A_ij = β_i (k_i · k_j) Γ_ij for j < i, M_ij = q_scale (q_i · k_j) Γ_ij for
+     * j <= i, zeros above */
+#pragma unroll 1
+    for (int e = tid; e < GC * GC; e += PT) {
+        const int i = e / GC, j = e % GC;
+        const float decay = j <= i ? expf(__fsub_rn(gm[i], gm[j])) : 0.0f;
+        aa[i][j] = j < i ? __fmul_rn(__fmul_rn(bt[i], aa[i][j]), decay) : 0.0f;
+        mt[j][i] = j <= i ? __fmul_rn(__fmul_rn(q_scale, mt[j][i]), decay) : 0.0f;
     }
     __syncthreads();
 
@@ -300,14 +307,14 @@ gdn_prep(const void *q, int qdt, const void *k, int kdt, const void *v, int vdt,
 
     /* the values: a bf16 chunk is 16 KiB, A's place now that T is built;
      * they load while W and Q'' are computed */
-    const bool vstage = vdt == ATH_DTYPE_BF16 && dv % 8 == 0;
-    uint16_t *vs = (uint16_t *)&aa[0][0];
+    const bool vstage = vdt == ATH_DTYPE_BF16 && dv % 8 == 0 && vs % 8 == 0;
+    uint16_t *vraw = (uint16_t *)&aa[0][0];
     if (vstage) {
         for (int e = tid; e < GC * GD / 8; e += PT) {
             const int i = e / (GD / 8), d = 8 * (e % (GD / 8));
             const bool ok = i < n && d < dv;
-            const uint16_t *src = (const uint16_t *)v + ((t0 + i) * nv + h) * dv + d;
-            k_cp16(&vs[i * GD + d], ok ? src : (const uint16_t *)v, ok);
+            const uint16_t *src = (const uint16_t *)v + (t0 + i) * vs + h * dv + d;
+            k_cp16(&vraw[i * GD + d], ok ? src : (const uint16_t *)v, ok);
         }
         k_cp_commit();
     }
@@ -341,7 +348,7 @@ gdn_prep(const void *q, int qdt, const void *k, int kdt, const void *v, int vdt,
                 const int d = cq + 64 * hh;
                 float qv[4] = {0.0f, 0.0f, 0.0f, 0.0f};
                 if (i < n && d < dk)
-                    k_ld4(q, qdt, (((t0 + i) * nk + kh) * dk + d) / 4, qv);
+                    k_ld4(q, qdt, ((t0 + i) * qs + kh * dk + d) / 4, qv);
 #pragma unroll
                 for (int e = 0; e < 4; e++)
                     o[a][4 * hh + e] = __fsub_rn(__fmul_rn(f, __fmul_rn(qv[e], iq[i])), o[a][4 * hh + e]);
@@ -361,11 +368,11 @@ gdn_prep(const void *q, int qdt, const void *k, int kdt, const void *v, int vdt,
         float4 x = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         const float f = bt[i];
         if (vstage) {
-            const uint2 r = *(const uint2 *)&vs[i * GD + d];             /* zeros where padding */
+            const uint2 r = *(const uint2 *)&vraw[i * GD + d];           /* zeros where padding */
             x = make_float4(__fmul_rn(f, __uint_as_float(r.x << 16)), __fmul_rn(f, __uint_as_float(r.x & 0xffff0000u)),
                             __fmul_rn(f, __uint_as_float(r.y << 16)), __fmul_rn(f, __uint_as_float(r.y & 0xffff0000u)));
         } else if (i < n && d < dv) {
-            const int64_t at = ((t0 + i) * nv + h) * dv + d;
+            const int64_t at = (t0 + i) * vs + h * dv + d;
             x = make_float4(__fmul_rn(f, k_ld(v, vdt, at)), __fmul_rn(f, k_ld(v, vdt, at + 1)),
                             __fmul_rn(f, k_ld(v, vdt, at + 2)), __fmul_rn(f, k_ld(v, vdt, at + 3)));
         }
@@ -437,7 +444,7 @@ static __device__ __forceinline__ void scan_keys(float *x, const void *k, int es
 static __global__ void __launch_bounds__(ST)
 gdn_scan(const void *k, int kdt, const float *Qp, const float *W, const float *U, const float *OU, const float *gam,
          const float *ikg, float *state, void *out, int odt, int64_t T, int64_t c0, int64_t nc, int64_t nk, int dk,
-         int64_t nv, int dv)
+         int64_t nv, int dv, int64_t ks)
 {
     extern __shared__ __align__(16) unsigned char scan_smem[];
     float *const xb0 = (float *)scan_smem;                              /* two operand tiles, */
@@ -504,7 +511,7 @@ gdn_scan(const void *k, int kdt, const float *Qp, const float *W, const float *U
         k_cp_wait_all();
         __syncthreads();
         const int kes = kdt == ATH_DTYPE_BF16 ? 2 : 4;
-        scan_keys(XB(b), (const char *)k + (t0 * nk + kh) * dk * kes, kes, nk * dk, dk, n);
+        scan_keys(XB(b), (const char *)k + (t0 * ks + kh * dk) * kes, kes, ks, dk, n);
         k_cp_commit();
 #pragma unroll
         for (int a = 0; a < 4; a++)
@@ -608,9 +615,11 @@ extern "C" bool ath_gdn_chunk_fits(const ath_device *d, const ath_tensor *q, con
                                    const ath_tensor *v, const ath_tensor *g)
 {
     const int64_t dk = q->shape[2], dv = v->shape[2];
+    const int64_t es = (int64_t)ath_dtype_size(q->dtype);
     return d->smem_per_block >= PREP_SMEM && d->smem_per_block >= SCAN_SMEM && q->dtype == k->dtype &&
            g->dtype == ATH_DTYPE_F32 && dk <= GD && dv <= GD && dk % 8 == 0 && dv % 4 == 0 && dk > 0 && dv > 0 &&
-           (uintptr_t)q->data % 16 == 0 && (uintptr_t)k->data % 16 == 0;
+           (uintptr_t)q->data % 16 == 0 && (uintptr_t)k->data % 16 == 0 && q->stride[0] * es % 16 == 0 &&
+           k->stride[0] * es % 16 == 0;
 }
 
 /* Chunks per round: enough prep blocks for GDN_WAVES full waves over the
@@ -652,11 +661,12 @@ extern "C" ath_status ath_gdn_chunk_launch(const ath_device *d, const ath_tensor
         const int64_t n = nc - c0 < rc ? nc - c0 : rc;
         gdn_prep<<<dim3((unsigned)n, (unsigned)nv), PT, PREP_SMEM, k_stream(d)>>>(
             q->data, q->dtype, k->data, k->dtype, v->data, v->dtype, (const float *)g->data, beta->data, beta->dtype,
-            q_scale, l2_eps, T, c0, nk, (int)dk, nv, (int)dv, Qb, Wb, Ub, Ob, gb, ib);
+            q_scale, l2_eps, T, c0, nk, (int)dk, nv, (int)dv, q->stride[0], k->stride[0], v->stride[0], Qb, Wb, Ub, Ob,
+            gb, ib);
         ATH_CHECK(ath_gpu_launched("gdn_prep"));
         gdn_scan<<<dim3((unsigned)nv, (unsigned)((dv + GV - 1) / GV)), ST, SCAN_SMEM, k_stream(d)>>>(
             k->data, k->dtype, Qb, Wb, Ub, Ob, gb, ib, (float *)state->data, out->data, out->dtype, T, c0, n, nk,
-            (int)dk, nv, (int)dv);
+            (int)dk, nv, (int)dv, k->stride[0]);
         ATH_CHECK(ath_gpu_launched("gdn_scan"));
     }
     return ATH_OK;

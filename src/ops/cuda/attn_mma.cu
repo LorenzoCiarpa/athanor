@@ -160,20 +160,25 @@ attn_mma(const uint16_t *q, const uint16_t *k, const uint16_t *v, const int32_t 
         for (int n = 0; n < FA_KEYS / 8; n++)
 #pragma unroll
             for (int i = 0; i < 2; i++) {
-                const uint32_t w = k_pack_bf16(exp2f(__fsub_rn(s[n][2 * i], base[i])),
-                                               exp2f(__fsub_rn(s[n][2 * i + 1], base[i])));
+                const uint32_t w = k_pack_bf16_finite(exp2f(__fsub_rn(s[n][2 * i], base[i])),
+                                                      exp2f(__fsub_rn(s[n][2 * i + 1], base[i])));
                 pf[n][i] = w;
                 ls[i] = __fadd_rn(ls[i], __fadd_rn(k_bf16_to_f32((uint16_t)w), k_bf16_to_f32((uint16_t)(w >> 16))));
             }
 #pragma unroll
         for (int i = 0; i < 2; i++)
             l[i] = __fadd_rn(__fmul_rn(l[i], corr[i]), ls[i]);
+        /* O rescaled only when some row's maximum moved: a factor of 1 leaves
+         * the bits as they are, and after the first tiles it is the common
+         * case */
+        if (__any_sync(0xffffffffu, corr[0] != 1.0f || corr[1] != 1.0f)) {
 #pragma unroll
-        for (int n = 0; n < FA_DIM / 8; n++) {
-            o[n][0] = __fmul_rn(o[n][0], corr[0]);
-            o[n][1] = __fmul_rn(o[n][1], corr[0]);
-            o[n][2] = __fmul_rn(o[n][2], corr[1]);
-            o[n][3] = __fmul_rn(o[n][3], corr[1]);
+            for (int n = 0; n < FA_DIM / 8; n++) {
+                o[n][0] = __fmul_rn(o[n][0], corr[0]);
+                o[n][1] = __fmul_rn(o[n][1], corr[0]);
+                o[n][2] = __fmul_rn(o[n][2], corr[1]);
+                o[n][3] = __fmul_rn(o[n][3], corr[1]);
+            }
         }
 
         k_cp_wait_all();
@@ -199,8 +204,11 @@ attn_mma(const uint16_t *q, const uint16_t *k, const uint16_t *v, const int32_t 
         }
     }
 
-    /* l over the quad, then out = O / l (NaN for a query without a valid
-     * position, as the other kernels) */
+    /* l over the quad, then out = O · (1 / l), one reciprocal per row (128
+     * IEEE divisions would be thousands of instructions run once, more code
+     * than the instruction cache holds; the output is rounded to bf16 after
+     * anyway). NaN for a query without a valid position, as the other
+     * kernels. */
 #pragma unroll
     for (int i = 0; i < 2; i++) {
         l[i] = __fadd_rn(l[i], ath_shfl_xor(l[i], 1));
@@ -212,12 +220,12 @@ attn_mma(const uint16_t *q, const uint16_t *k, const uint16_t *v, const int32_t 
         if (t >= T)
             continue;
         const bool valid = (i ? pb : pa) >= 0;
+        const float rl = valid ? __frcp_rn(l[i]) : NAN;
         uint32_t *row = (uint32_t *)(out + (t * nh + h) * d);
 #pragma unroll
         for (int n = 0; n < FA_DIM / 8; n++)
             if (8 * n < d)
-                row[(8 * n + c) / 2] = valid ? k_pack_bf16(__fdiv_rn(o[n][2 * i], l[i]), __fdiv_rn(o[n][2 * i + 1], l[i]))
-                                             : k_pack_bf16(NAN, NAN);
+                row[(8 * n + c) / 2] = k_pack_bf16(__fmul_rn(o[n][2 * i], rl), __fmul_rn(o[n][2 * i + 1], rl));
     }
 }
 

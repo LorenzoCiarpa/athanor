@@ -249,31 +249,20 @@ static ath_status gated_deltanet(fwd *f, const ath_qwen35_layer *L, ath_tensor *
     ATH_CHECK(norm_matmuls(f, x, L->input_norm, 4, pw, po));
 
     /* convolution over all conv_dim channels, then the split into q, k, v */
-    ath_tensor conv_state, mixed, q, k, v, q2, k2, v2;
+    ath_tensor conv_state, mixed, q, k, v;
     ATH_CHECK(wrap(f, &conv_state, act, f->s->buf[L->conv_state], 2, c->conv_kernel - 1, conv_dim, 0));
     ATH_CHECK(tmp(f, &mixed, act, 2, T, conv_dim, 0));
     ATH_CHECK(ath_conv(f->dev, &qkv, W(f, L->conv), &conv_state, ATH_ACT_SILU, &mixed));
     /* fp32 from here on, as in the reference: L2 norm (inside ath_gdn, step
-     * 10), gates, recurrence */
+     * 10), gates, recurrence. q, k and v are column ranges of mixed, read
+     * where they are: views whose rows are conv_dim elements apart (step 10;
+     * step 9 did this for one token) */
     ath_tensor g, beta, rec, o;
-    if (T == 1) {
-        /* one token (decode): q, k and v are contiguous pieces of the one row
-         * of mixed, so they are views (step 9) */
-        const size_t es = ath_dtype_size(act);
-        ATH_CHECK(wrap(f, &q, act, mixed.data, 3, 1, nk, dk));
-        ATH_CHECK(wrap(f, &k, act, (char *)mixed.data + (size_t)key_dim * es, 3, 1, nk, dk));
-        ATH_CHECK(wrap(f, &v, act, (char *)mixed.data + (size_t)(2 * key_dim) * es, 3, 1, nv, dv));
-    } else {
-        ATH_CHECK(tmp(f, &q, act, 3, T, nk, dk));
-        ATH_CHECK(tmp(f, &k, act, 3, T, nk, dk));
-        ATH_CHECK(tmp(f, &v, act, 3, T, nv, dv));
-        ATH_CHECK(view(&q, &q2, 2, T, key_dim, 0));
-        ATH_CHECK(view(&k, &k2, 2, T, key_dim, 0));
-        ATH_CHECK(view(&v, &v2, 2, T, value_dim, 0));
-        ATH_CHECK(copy_cols(f, &mixed, 0, &q2));
-        ATH_CHECK(copy_cols(f, &mixed, key_dim, &k2));
-        ATH_CHECK(copy_cols(f, &mixed, 2 * key_dim, &v2));
-    }
+    const size_t es = ath_dtype_size(act);
+    ATH_CHECK(wrap(f, &q, act, mixed.data, 3, T, nk, dk));
+    ATH_CHECK(wrap(f, &k, act, (char *)mixed.data + (size_t)key_dim * es, 3, T, nk, dk));
+    ATH_CHECK(wrap(f, &v, act, (char *)mixed.data + (size_t)(2 * key_dim) * es, 3, T, nv, dv));
+    q.stride[0] = k.stride[0] = v.stride[0] = conv_dim;
     /* beta = sigmoid(b) is rounded to the activation dtype, as the reference
      * computes it on the bf16 projection; g is fp32 */
     ATH_CHECK(tmp(f, &g, ATH_DTYPE_F32, 2, T, nv, 0));

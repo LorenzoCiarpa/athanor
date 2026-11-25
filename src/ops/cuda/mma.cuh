@@ -113,6 +113,20 @@ static __device__ __forceinline__ uint32_t k_pack_bf16(float lo, float hi)
     return (uint32_t)k_f32_to_bf16(lo) | (uint32_t)k_f32_to_bf16(hi) << 16;
 }
 
+/* The same for finite values, in one instruction (round to nearest even;
+ * NaN patterns may differ from k_f32_to_bf16's, so only for values that
+ * cannot be NaN, as probabilities). */
+static __device__ __forceinline__ uint32_t k_pack_bf16_finite(float lo, float hi)
+{
+#ifdef ATH_MMA_ARCH
+    uint32_t r;
+    asm("cvt.rn.bf16x2.f32 %0, %1, %2;\n" : "=r"(r) : "f"(hi), "f"(lo));
+    return r;
+#else
+    return k_pack_bf16(lo, hi);
+#endif
+}
+
 #endif /* !__HIP_PLATFORM_AMD__ */
 
 #endif /* ATH_OPS_MMA_CUH */

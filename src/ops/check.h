@@ -74,6 +74,22 @@ static inline ath_status ops_float(const ath_tensor *t, const char *op, const ch
     return ops_tensor(t, ATH_DTYPE_COUNT, op, name);
 }
 
+/* f32 or bf16, its rows (the first dimension) any stride apart, at least
+ * a row's elements, and each row contiguous: columns of a wider matrix
+ * (step 10: the gated delta rule reads q, k and v out of the convolution's
+ * output where they are). */
+static inline ath_status ops_float_rows(const ath_tensor *t, const char *op, const char *name)
+{
+    if (!t || !t->data || t->ndim < 1)
+        return ops_fail(ATH_ERR_INVALID_ARG, op, "%s: missing", name);
+    ath_tensor row = *t;
+    row.stride[0] = row.ndim > 1 ? row.shape[1] * row.stride[1] : 1;
+    ATH_CHECK(ops_float(&row, op, name));
+    if (t->shape[0] > 1 && t->stride[0] < row.stride[0])
+        return ops_fail(ATH_ERR_INVALID_ARG, op, "%s: rows overlap", name);
+    return ATH_OK;
+}
+
 static inline int64_t ops_last(const ath_tensor *t)
 {
     return t->ndim > 0 ? t->shape[t->ndim - 1] : 1;
