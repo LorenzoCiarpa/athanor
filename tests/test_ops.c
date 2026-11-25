@@ -511,7 +511,7 @@ ATH_TEST(gdn_hand)
     ath_tensor v = F(SHAPE(1, 1, 2), VALS(3, 5));
     ath_tensor g = F(SHAPE(1, 1), VALS(0)), one = F(SHAPE(1, 1), VALS(1));
     ath_tensor S = F(SHAPE(1, 2, 2), NULL), out = F(SHAPE(1, 1, 2), NULL);
-    ATH_REQUIRE_OK(ath_gdn_ref(&q, &k, &v, &g, &one, 1.0f, &S, &out));
+    ATH_REQUIRE_OK(ath_gdn_ref(&q, &k, &v, &g, &one, 1.0f, 0.0f, &S, &out));
     ATH_EXPECT_NEAR(at(&out, 0), 1.8, 1e-6);
     ATH_EXPECT_NEAR(at(&out, 1), 3.0, 1e-6);
     ATH_EXPECT(at(&S, 0) == 3.0f && at(&S, 1) == 5.0f && at(&S, 2) == 0.0f && at(&S, 3) == 0.0f);
@@ -519,19 +519,19 @@ ATH_TEST(gdn_hand)
     /* The delta rule replaces what the key stored: a second write along the
      * same key leaves S = k v2ᵀ; the query scale multiplies the read. */
     ath_tensor v2 = F(SHAPE(1, 1, 2), VALS(-1, 2));
-    ATH_REQUIRE_OK(ath_gdn_ref(&q, &k, &v2, &g, &one, 0.5f, &S, &out));
+    ATH_REQUIRE_OK(ath_gdn_ref(&q, &k, &v2, &g, &one, 0.5f, 0.0f, &S, &out));
     ATH_EXPECT(at(&S, 0) == -1.0f && at(&S, 1) == 2.0f);
     ATH_EXPECT_NEAR(at(&out, 0), -0.3, 1e-6);
     ATH_EXPECT_NEAR(at(&out, 1), 0.6, 1e-6);
 
     /* beta 0 writes nothing; g = log(1/2) halves the state. */
     ath_tensor half = F(SHAPE(1, 1), VALS(logf(0.5f))), zero = F(SHAPE(1, 1), VALS(0));
-    ATH_REQUIRE_OK(ath_gdn_ref(&q, &k, &v, &half, &zero, 1.0f, &S, &out));
+    ATH_REQUIRE_OK(ath_gdn_ref(&q, &k, &v, &half, &zero, 1.0f, 0.0f, &S, &out));
     ATH_EXPECT_NEAR(at(&S, 0), -0.5, 1e-7);
     ATH_EXPECT_NEAR(at(&S, 1), 1.0, 1e-7);
 
     ath_tensor Sb = B(SHAPE(1, 2, 2), NULL);
-    ATH_EXPECT_STATUS(ath_gdn_ref(&q, &k, &v, &g, &one, 1.0f, &Sb, &out), ATH_ERR_TYPE);
+    ATH_EXPECT_STATUS(ath_gdn_ref(&q, &k, &v, &g, &one, 1.0f, 0.0f, &Sb, &out), ATH_ERR_TYPE);
 }
 
 ATH_TEST(gdn_heads_and_streaming)
@@ -551,7 +551,7 @@ ATH_TEST(gdn_heads_and_streaming)
         ath_store_f32(beta.data, beta.dtype, i, 0.5f + 0.5f * at(&beta, i));
     }
     ath_tensor S = F(SHAPE(nv, dk, dv), NULL), out = B(SHAPE(T, nv, dv), NULL);
-    ATH_REQUIRE_OK(ath_gdn_ref(&q, &k, &v, &g, &beta, 0.5f, &S, &out));
+    ATH_REQUIRE_OK(ath_gdn_ref(&q, &k, &v, &g, &beta, 0.5f, 1e-6f, &S, &out));
 
     ath_tensor qr = F(SHAPE(T, nv, dk), NULL), kr = F(SHAPE(T, nv, dk), NULL);
     for (int64_t t = 0; t < T; t++)
@@ -561,7 +561,7 @@ ATH_TEST(gdn_heads_and_streaming)
                 ath_store_f32(kr.data, kr.dtype, (t * nv + h) * dk + i, at(&k, (t * nk + h / 2) * dk + i));
             }
     ath_tensor S2 = F(SHAPE(nv, dk, dv), NULL), out2 = B(SHAPE(T, nv, dv), NULL);
-    ATH_REQUIRE_OK(ath_gdn_ref(&qr, &kr, &v, &g, &beta, 0.5f, &S2, &out2));
+    ATH_REQUIRE_OK(ath_gdn_ref(&qr, &kr, &v, &g, &beta, 0.5f, 1e-6f, &S2, &out2));
     ATH_EXPECT(same_bits(&out, &out2));
     ATH_EXPECT(same_bits(&S, &S2));
 
@@ -569,7 +569,7 @@ ATH_TEST(gdn_heads_and_streaming)
     for (int64_t t = 0; t < T; t++) {
         ath_tensor qt = rows(&q, t, 1), kt = rows(&k, t, 1), vt = rows(&v, t, 1);
         ath_tensor gt = rows(&g, t, 1), bt = rows(&beta, t, 1), ot = rows(&out3, t, 1);
-        ATH_REQUIRE_OK(ath_gdn_ref(&qt, &kt, &vt, &gt, &bt, 0.5f, &S3, &ot));
+        ATH_REQUIRE_OK(ath_gdn_ref(&qt, &kt, &vt, &gt, &bt, 0.5f, 1e-6f, &S3, &ot));
     }
     ATH_EXPECT(same_bits(&out, &out3));
     ATH_EXPECT(same_bits(&S, &S3));

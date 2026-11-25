@@ -665,21 +665,17 @@ static void run_gdn(ctx *c)
     ath_tensor *y = out(c, "out");
     float eps = (float)num(c, "l2norm_eps"), q_scale = (float)num(c, "q_scale");
     NEED(q, k, v, g, beta, s_out, y);
-    ath_tensor *qn = new_tensor(c, ATH_DTYPE_F32, q), *kn = new_tensor(c, ATH_DTYPE_F32, k);
     ath_tensor *state = s_in ? copy_as(c, s_in, ATH_DTYPE_F32) : new_tensor(c, ATH_DTYPE_F32, s_out);
     ath_tensor *sg = c->gpu ? dev(c, state) : NULL;                                 /* before the update */
-    RUN(ath_l2norm_ref(q, eps, qn));
-    RUN(ath_l2norm_ref(k, eps, kn));
-    RUN(ath_gdn_ref(qn, kn, v, g, beta, q_scale, state, y));
+    /* the op normalizes q and k itself (step 10), as l2norm does with eps */
+    RUN(ath_gdn_ref(q, k, v, g, beta, q_scale, eps, state, y));
     compare(c, "out", y);
     compare(c, "state_out", state);
     if (c->gpu) {
-        /* the same composition on the GPU: its l2norm, then its recurrence */
-        ath_tensor *qg = dev_out(c, qn), *kg = dev_out(c, kn), *yg = dev_out(c, y);
-        NEED(sg, qg, kg, yg);
-        GPU_RUN(ath_l2norm_gpu(&c->gpu->d, dev(c, q), eps, qg));
-        GPU_RUN(ath_l2norm_gpu(&c->gpu->d, dev(c, k), eps, kg));
-        GPU_RUN(ath_gdn_gpu(&c->gpu->d, qg, kg, dev(c, v), dev(c, g), dev(c, beta), q_scale, sg, &c->gpu->mem, yg));
+        ath_tensor *yg = dev_out(c, y);
+        NEED(sg, yg);
+        GPU_RUN(ath_gdn_gpu(&c->gpu->d, dev(c, q), dev(c, k), dev(c, v), dev(c, g), dev(c, beta), q_scale, eps, sg,
+                            &c->gpu->mem, yg));
         gpu_compare(c, "out", yg, y);
         gpu_compare(c, "state_out", sg, state);
     }

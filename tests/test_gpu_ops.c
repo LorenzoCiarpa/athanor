@@ -230,7 +230,7 @@ ATH_TEST(gpu_argument_checks)
     ath_tensor gq = fake(ATH_DTYPE_F32, ATH_TIER_VRAM, SHAPE(1, 1, ATH_GDN_MAX_DK + 1));
     ath_tensor gv = fake(ATH_DTYPE_F32, ATH_TIER_VRAM, SHAPE(1, 1, 8)), gg = fake(ATH_DTYPE_F32, ATH_TIER_VRAM, SHAPE(1, 1));
     ath_tensor gs = fake(ATH_DTYPE_F32, ATH_TIER_VRAM, SHAPE(1, ATH_GDN_MAX_DK + 1, 8));
-    ATH_EXPECT_STATUS(ath_gdn_gpu(d, &gq, &gq, &gv, &gg, &gg, 1.0f, &gs, NULL, &gv), ATH_ERR_UNSUPPORTED);
+    ATH_EXPECT_STATUS(ath_gdn_gpu(d, &gq, &gq, &gv, &gg, &gg, 1.0f, 1e-6f, &gs, NULL, &gv), ATH_ERR_UNSUPPORTED);
     ath_tensor rx = fake(ATH_DTYPE_F32, ATH_TIER_VRAM, SHAPE(1, 1, ATH_ROPE_MAX_DIM + 2));
     ath_tensor rp = fake(ATH_DTYPE_I32, ATH_TIER_VRAM, SHAPE(1));
     ATH_EXPECT_STATUS(ath_rope_gpu(d, &rx, &rp, ATH_ROPE_MAX_DIM + 2, 1e4f, &rx), ATH_ERR_UNSUPPORTED);
@@ -880,14 +880,13 @@ typedef struct {
     ath_tensor q, k, v, g, beta, state;
 } gdn_in;
 
+/* q and k as the forward pass gives them, not normalized (the op does it,
+ * step 10), in the dtype of v. */
 static gdn_in gdn_inputs(gpu *g, ath_dtype vdt, int64_t T, int64_t nk, int64_t dk, int64_t nv, int64_t dv)
 {
     gdn_in in;
-    ath_tensor q = rand_t(g, ATH_DTYPE_F32, -1, 1, SHAPE(T, nk, dk)), k = rand_t(g, ATH_DTYPE_F32, -1, 1, SHAPE(T, nk, dk));
-    in.q = host(g, ATH_DTYPE_F32, SHAPE(T, nk, dk));
-    in.k = host(g, ATH_DTYPE_F32, SHAPE(T, nk, dk));
-    if (ath_l2norm_ref(&q, 1e-6f, &in.q) != ATH_OK || ath_l2norm_ref(&k, 1e-6f, &in.k) != ATH_OK)
-        abort();
+    in.q = rand_t(g, vdt, -1, 1, SHAPE(T, nk, dk));
+    in.k = rand_t(g, vdt, -1, 1, SHAPE(T, nk, dk));
     in.v = rand_t(g, vdt, -1, 1, SHAPE(T, nv, dv));
     in.g = rand_t(g, ATH_DTYPE_F32, -2, 0, SHAPE(T, nv));
     in.beta = rand_t(g, vdt, 0, 1, SHAPE(T, nv));
@@ -913,8 +912,8 @@ ATH_TEST(gpu_gdn)
             ath_tensor qd = up(&g, &in.q), kd = up(&g, &in.k), vd = up(&g, &in.v), gd = up(&g, &in.g);
             ath_tensor bd = up(&g, &in.beta), sd = up(&g, &in.state), out = up(&g, &want);
             const float q_scale = 1.0f / sqrtf((float)dk);
-            ATH_REQUIRE_OK(ath_gdn_ref(&in.q, &in.k, &in.v, &in.g, &in.beta, q_scale, &in.state, &want));
-            ATH_EXPECT_OK(ath_gdn_gpu(&g.d, &qd, &kd, &vd, &gd, &bd, q_scale, &sd, NULL, &out));
+            ATH_REQUIRE_OK(ath_gdn_ref(&in.q, &in.k, &in.v, &in.g, &in.beta, q_scale, 1e-6f, &in.state, &want));
+            ATH_EXPECT_OK(ath_gdn_gpu(&g.d, &qd, &kd, &vd, &gd, &bd, q_scale, 1e-6f, &sd, NULL, &out));
             char what[96];
             snprintf(what, sizeof what, "gdn T %lld heads %lld/%lld dims %lld/%lld, %s", (long long)T, (long long)nk,
                      (long long)nv, (long long)dk, (long long)dv, dt_name(dts[c]));
@@ -929,7 +928,7 @@ ATH_TEST(gpu_gdn)
     ath_tensor o = host(&g, ATH_DTYPE_BF16, SHAPE(12, 4, 128));
     ath_tensor qd = up(&g, &in.q), kd = up(&g, &in.k), vd = up(&g, &in.v), gd = up(&g, &in.g), bd = up(&g, &in.beta);
     ath_tensor s_all = up(&g, &in.state), s_parts = up(&g, &in.state), o_all = up(&g, &o), o_parts = up(&g, &o);
-    ATH_EXPECT_OK(ath_gdn_gpu(&g.d, &qd, &kd, &vd, &gd, &bd, 0.088f, &s_all, NULL, &o_all));
+    ATH_EXPECT_OK(ath_gdn_gpu(&g.d, &qd, &kd, &vd, &gd, &bd, 0.088f, 1e-6f, &s_all, NULL, &o_all));
     const int64_t cuts[] = {0, 5, 6, 12};
     for (int p = 0; p < 3; p++) {
         const int64_t t0 = cuts[p], n = cuts[p + 1] - cuts[p];
@@ -940,7 +939,7 @@ ATH_TEST(gpu_gdn)
         ATH_REQUIRE_OK(ath_tensor_slice(&gd, 0, t0, n, &a[3]));
         ATH_REQUIRE_OK(ath_tensor_slice(&bd, 0, t0, n, &a[4]));
         ATH_REQUIRE_OK(ath_tensor_slice(&o_parts, 0, t0, n, &a[5]));
-        ATH_EXPECT_OK(ath_gdn_gpu(&g.d, &a[0], &a[1], &a[2], &a[3], &a[4], 0.088f, &s_parts, NULL, &a[5]));
+        ATH_EXPECT_OK(ath_gdn_gpu(&g.d, &a[0], &a[1], &a[2], &a[3], &a[4], 0.088f, 1e-6f, &s_parts, NULL, &a[5]));
     }
     ATH_EXPECT(same_bits(&g, &o_all, &o_parts));
     ATH_EXPECT(same_bits(&g, &s_all, &s_parts));
@@ -970,8 +969,8 @@ ATH_TEST(gpu_gdn_chunk)
             ath_tensor qd = up(&g, &in.q), kd = up(&g, &in.k), vd = up(&g, &in.v), gd = up(&g, &in.g);
             ath_tensor bd = up(&g, &in.beta), sd = up(&g, &in.state), out = up(&g, &want);
             const float q_scale = 1.0f / sqrtf((float)dk);
-            ATH_REQUIRE_OK(ath_gdn_ref(&in.q, &in.k, &in.v, &in.g, &in.beta, q_scale, &in.state, &want));
-            ATH_EXPECT_OK(ath_gdn_gpu(&g.d, &qd, &kd, &vd, &gd, &bd, q_scale, &sd, &g.dev, &out));
+            ATH_REQUIRE_OK(ath_gdn_ref(&in.q, &in.k, &in.v, &in.g, &in.beta, q_scale, 1e-6f, &in.state, &want));
+            ATH_EXPECT_OK(ath_gdn_gpu(&g.d, &qd, &kd, &vd, &gd, &bd, q_scale, 1e-6f, &sd, &g.dev, &out));
             char what[96];
             snprintf(what, sizeof what, "gdn chunks T %lld heads %lld/%lld dims %lld/%lld, %s", (long long)T,
                      (long long)nk, (long long)nv, (long long)dk, (long long)dv, dt_name(dts[c]));
@@ -986,7 +985,7 @@ ATH_TEST(gpu_gdn_chunk)
     ath_tensor o = host(&g, ATH_DTYPE_BF16, SHAPE(256, 4, 128));
     ath_tensor qd = up(&g, &in.q), kd = up(&g, &in.k), vd = up(&g, &in.v), gd = up(&g, &in.g), bd = up(&g, &in.beta);
     ath_tensor s_all = up(&g, &in.state), s_parts = up(&g, &in.state), o_all = up(&g, &o), o_parts = up(&g, &o);
-    ATH_EXPECT_OK(ath_gdn_gpu(&g.d, &qd, &kd, &vd, &gd, &bd, 0.088f, &s_all, &g.dev, &o_all));
+    ATH_EXPECT_OK(ath_gdn_gpu(&g.d, &qd, &kd, &vd, &gd, &bd, 0.088f, 1e-6f, &s_all, &g.dev, &o_all));
     const int64_t cuts[] = {0, 128, 192, 256};
     for (int p = 0; p < 3; p++) {
         const int64_t t0 = cuts[p], n = cuts[p + 1] - cuts[p];
@@ -997,7 +996,7 @@ ATH_TEST(gpu_gdn_chunk)
         ATH_REQUIRE_OK(ath_tensor_slice(&gd, 0, t0, n, &a[3]));
         ATH_REQUIRE_OK(ath_tensor_slice(&bd, 0, t0, n, &a[4]));
         ATH_REQUIRE_OK(ath_tensor_slice(&o_parts, 0, t0, n, &a[5]));
-        ATH_EXPECT_OK(ath_gdn_gpu(&g.d, &a[0], &a[1], &a[2], &a[3], &a[4], 0.088f, &s_parts, &g.dev, &a[5]));
+        ATH_EXPECT_OK(ath_gdn_gpu(&g.d, &a[0], &a[1], &a[2], &a[3], &a[4], 0.088f, 1e-6f, &s_parts, &g.dev, &a[5]));
     }
     ATH_EXPECT(same_bits(&g, &o_all, &o_parts));
     ATH_EXPECT(same_bits(&g, &s_all, &s_parts));

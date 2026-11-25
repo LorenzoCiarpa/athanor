@@ -253,20 +253,16 @@ static ath_status gated_deltanet(fwd *f, const ath_qwen35_layer *L, ath_tensor *
     ATH_CHECK(wrap(f, &conv_state, act, f->s->buf[L->conv_state], 2, c->conv_kernel - 1, conv_dim, 0));
     ATH_CHECK(tmp(f, &mixed, act, 2, T, conv_dim, 0));
     ATH_CHECK(ath_conv(f->dev, &qkv, W(f, L->conv), &conv_state, ATH_ACT_SILU, &mixed));
-    /* fp32 from here on, as in the reference: L2 norm, gates, recurrence */
-    ath_tensor qn, kn, g, beta, rec, o;
+    /* fp32 from here on, as in the reference: L2 norm (inside ath_gdn, step
+     * 10), gates, recurrence */
+    ath_tensor g, beta, rec, o;
     if (T == 1) {
         /* one token (decode): q, k and v are contiguous pieces of the one row
-         * of mixed, q and k side by side, so they are views, and one L2 norm
-         * over the 2 nk heads gives qn and kn (step 9); the same values */
+         * of mixed, so they are views (step 9) */
         const size_t es = ath_dtype_size(act);
-        ath_tensor qk, qkn;
-        ATH_CHECK(wrap(f, &qk, act, mixed.data, 2, 2 * nk, dk, 0));
+        ATH_CHECK(wrap(f, &q, act, mixed.data, 3, 1, nk, dk));
+        ATH_CHECK(wrap(f, &k, act, (char *)mixed.data + (size_t)key_dim * es, 3, 1, nk, dk));
         ATH_CHECK(wrap(f, &v, act, (char *)mixed.data + (size_t)(2 * key_dim) * es, 3, 1, nv, dv));
-        ATH_CHECK(tmp(f, &qkn, ATH_DTYPE_F32, 2, 2 * nk, dk, 0));
-        ATH_CHECK(ath_l2norm(f->dev, &qk, L2NORM_EPS, &qkn));
-        ATH_CHECK(wrap(f, &qn, ATH_DTYPE_F32, qkn.data, 3, 1, nk, dk));
-        ATH_CHECK(wrap(f, &kn, ATH_DTYPE_F32, (char *)qkn.data + (size_t)key_dim * sizeof(float), 3, 1, nk, dk));
     } else {
         ATH_CHECK(tmp(f, &q, act, 3, T, nk, dk));
         ATH_CHECK(tmp(f, &k, act, 3, T, nk, dk));
@@ -277,10 +273,6 @@ static ath_status gated_deltanet(fwd *f, const ath_qwen35_layer *L, ath_tensor *
         ATH_CHECK(copy_cols(f, &mixed, 0, &q2));
         ATH_CHECK(copy_cols(f, &mixed, key_dim, &k2));
         ATH_CHECK(copy_cols(f, &mixed, 2 * key_dim, &v2));
-        ATH_CHECK(tmp(f, &qn, ATH_DTYPE_F32, 3, T, nk, dk));
-        ATH_CHECK(tmp(f, &kn, ATH_DTYPE_F32, 3, T, nk, dk));
-        ATH_CHECK(ath_l2norm(f->dev, &q, L2NORM_EPS, &qn));
-        ATH_CHECK(ath_l2norm(f->dev, &k, L2NORM_EPS, &kn));
     }
     /* beta = sigmoid(b) is rounded to the activation dtype, as the reference
      * computes it on the bf16 projection; g is fp32 */
@@ -289,7 +281,7 @@ static ath_status gated_deltanet(fwd *f, const ath_qwen35_layer *L, ath_tensor *
     ATH_CHECK(ath_gdn_gates(f->dev, &a, &b, W(f, L->a_log), W(f, L->dt_bias), &g, &beta));
     ATH_CHECK(wrap(f, &rec, ATH_DTYPE_F32, f->s->buf[L->recurrent], 3, nv, dk, dv));
     ATH_CHECK(tmp(f, &o, act, 3, T, nv, dv));
-    ATH_CHECK(ath_gdn(f->dev, &qn, &kn, &v, &g, &beta, (float)(1.0 / sqrt((double)dk)), &rec, f->da, &o));
+    ATH_CHECK(ath_gdn(f->dev, &q, &k, &v, &g, &beta, (float)(1.0 / sqrt((double)dk)), L2NORM_EPS, &rec, f->da, &o));
 
     /* gated RMSNorm per value head, then the output projection */
     ath_tensor o_rows, z_rows, on, on_flat;

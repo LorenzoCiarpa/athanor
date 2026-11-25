@@ -110,7 +110,9 @@ ath_status ath_matmul_gpu(const ath_device *d, const ath_tensor *x, const ath_te
  * (ath_matmul_fits_gemv) and fails with ATH_ERR_UNSUPPORTED otherwise, where
  * the caller uses the two ops. (Normalizing x in the same launch was
  * measured and dropped: the blocks' prologue cost more than the norm
- * kernel it saved.) */
+ * kernel it saved. Adding a prompt's product inside cuBLASLt, beta = 1, was
+ * measured and dropped in step 10: one rounding instead of the reference's
+ * two moved a greedy token above the noise in the gate of step 8.) */
 bool       ath_matmul_fits_gemv(const ath_tensor *x, const ath_tensor *w);
 /* GPU fusion of a SwiGLU MLP's first half for one row of x (step 9):
  * out = silu(x · wgᵀ) · (x · wuᵀ), each product rounded to out's dtype
@@ -259,24 +261,27 @@ ath_status ath_gdn_gates_gpu(const ath_device *d, const ath_tensor *a, const ath
  *   u = Sᵀ k_t
  *   S ← S + k_t (beta_t (v_t − u))ᵀ
  *   out_t = Sᵀ (q_scale q_t)
- * q, k [T, nk, dk], already L2-normalized; v, out [T, nv, dv]; g, beta [T, nv];
+ * where q_t and k_t are the query and key L2-normalized per head, as
+ * ath_l2norm does with l2_eps, in fp32 (step 10: the op normalizes them, so
+ * that the normalized values are never stored; l2_eps 0 leaves a unit
+ * vector as it is). q, k [T, nk, dk]; v, out [T, nv, dv]; g, beta [T, nv];
  * state [nv, dk, dv] f32, read and updated in place (zero it at the start of
  * a sequence). Value head h reads query/key head h / (nv / nk). */
 ath_status ath_gdn_ref(const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
-                       const ath_tensor *g, const ath_tensor *beta, float q_scale,
+                       const ath_tensor *g, const ath_tensor *beta, float q_scale, float l2_eps,
                        ath_tensor *state, ath_tensor *out);
 /* GPU: dk <= ATH_GDN_MAX_DK. The recurrent form, as the reference: one step
- * per token. With a scratch arena, from ATH_GDN_CHUNK_MIN_T tokens on, f32
- * q, k and g and dk, dv up to 128 (prompts, step 10): the chunked form of
- * the reference (torch_chunk_gated_delta_rule, chunks of 64 tokens), which
- * computes the same recurrence in fp32 with another order of operations
- * (tests/README.md, Prompt kernels). Every call of this kind gives the same
- * bits for a prompt fed whole or in pieces whose lengths are multiples of
- * 64. */
+ * per token. With a scratch arena, from ATH_GDN_CHUNK_MIN_T tokens on, f32 g,
+ * dk up to 128 and a multiple of 8, dv up to 128 and a multiple of 4
+ * (prompts, step 10): the chunked form of the reference
+ * (torch_chunk_gated_delta_rule, chunks of 64 tokens), which computes the
+ * same recurrence in fp32 with another order of operations (tests/README.md,
+ * Prompt kernels). Every call of this kind gives the same bits for a prompt
+ * fed whole or in pieces whose lengths are multiples of 64. */
 #define ATH_GDN_MAX_DK 256
 #define ATH_GDN_CHUNK_MIN_T 64
 ath_status ath_gdn_gpu(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
-                       const ath_tensor *g, const ath_tensor *beta, float q_scale, ath_tensor *state,
+                       const ath_tensor *g, const ath_tensor *beta, float q_scale, float l2_eps, ath_tensor *state,
                        ath_dev_arena *scratch, ath_tensor *out);
 
 /* ---- dispatch.c (step 8): one entry point per op ------------------------------
@@ -305,7 +310,7 @@ ath_status ath_scatter_rows(const ath_device *d, const ath_tensor *src, const at
 ath_status ath_gdn_gates(const ath_device *d, const ath_tensor *a, const ath_tensor *b, const ath_tensor *a_log,
                          const ath_tensor *dt_bias, ath_tensor *g, ath_tensor *beta);
 ath_status ath_gdn(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
-                   const ath_tensor *g, const ath_tensor *beta, float q_scale, ath_tensor *state,
+                   const ath_tensor *g, const ath_tensor *beta, float q_scale, float l2_eps, ath_tensor *state,
                    ath_dev_arena *scratch, ath_tensor *out);
 
 /* ---- sample.c (step 5) ----------------------------------------------------- */

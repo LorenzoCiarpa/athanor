@@ -27,6 +27,11 @@
  * value head and 32 columns of the state (columns never interact, gdn.c):
  * three small matrix products per chunk instead of 64 steps.
  *
+ * The query and key come as the op takes them, not normalized: prep
+ * normalizes its chunk's rows (L2 per head, the factor 1 / |x| from a sum of
+ * squares over the 16 lanes that hold a row) and keeps 1 / |k| of every row
+ * for the scan, which reads the keys as given and folds the factor into Δ.
+ *
  * Everything is fp32, as in the reference's chunked function. The products
  * are summed in a fixed order, so a call gives the same bits every time, and
  * a prompt fed in pieces whose lengths are multiples of 64 gives the bits of
@@ -59,7 +64,7 @@
 #define PT 128                /* threads per prep block                   */
 #define XP (GD + 4)           /* row of an x tile: rows 4 banks apart     */
 #define AP (GC + 4)           /* row of a transposed triangular matrix    */
-#define PREP_FLOATS (2 * GC * XP + GC * AP + 3 * GC + 3 * 256)
+#define PREP_FLOATS (2 * GC * XP + GC * AP + 5 * GC + 3 * 256)
 
 /* o[a][e] = Σ_j at[j][8 ti + a] x[j][c_e] over every j (at is zero above the
  * diagonal), the lane's rows 8 ti + a and columns c_e = 4 tj + (e < 4 ?
@@ -113,10 +118,46 @@ static __device__ __forceinline__ void tri_store_t(float *dst, int n, const floa
     }
 }
 
+/* Rows of the chunk's keys or queries into a tile, L2-normalized: row i is
+ * dk elements of dtype dt at element base + i stride of x. Half-warp hw
+ * takes rows hw, hw + 8, ..., a lane 8 elements of each; inv[i] gets
+ * 1 / |row i|. Rows past n and columns past dk are zeros. */
+static __device__ __forceinline__ void prep_rows(float (*tile)[XP], float *inv, const void *x, int dt,
+                                                 int64_t base, int64_t stride, int dk, int n, float eps)
+{
+    const int lane = threadIdx.x % 16, hw = threadIdx.x / 16;
+    float v[GC / (PT / 16)][8];                        /* every load issued before any is used */
+#pragma unroll
+    for (int m = 0; m < GC / (PT / 16); m++) {
+        const int i = hw + m * (PT / 16);
+#pragma unroll
+        for (int e = 0; e < 8; e++)
+            v[m][e] = 0.0f;
+        if (i < n && 8 * lane < dk)
+            k_ld8(x, dt, (base + i * stride) / 8 + lane, v[m]);
+    }
+#pragma unroll
+    for (int m = 0; m < GC / (PT / 16); m++) {
+        const int i = hw + m * (PT / 16);
+        float ss = 0.0f;
+#pragma unroll
+        for (int e = 0; e < 8; e++)
+            ss += v[m][e] * v[m][e];
+#pragma unroll
+        for (int s = 1; s < 16; s <<= 1)
+            ss += ath_shfl_xor(ss, s);
+        const float r = 1.0f / sqrtf(ss + eps);
+        if (lane == 0)
+            inv[i] = r;
+        *(float4 *)&tile[i][8 * lane] = make_float4(v[m][0] * r, v[m][1] * r, v[m][2] * r, v[m][3] * r);
+        *(float4 *)&tile[i][8 * lane + 4] = make_float4(v[m][4] * r, v[m][5] * r, v[m][6] * r, v[m][7] * r);
+    }
+}
+
 static __global__ void __launch_bounds__(PT)
-gdn_prep(const float *q, const float *k, const void *v, int vdt, const float *g, const void *beta, int bdt,
-         float q_scale, int64_t T, int64_t c0, int64_t nk, int dk, int64_t nv, int dv, float *Qp, float *W,
-         float *U, float *OU, float *gam)
+gdn_prep(const void *q, int qdt, const void *k, int kdt, const void *v, int vdt, const float *g, const void *beta,
+         int bdt, float q_scale, float l2_eps, int64_t T, int64_t c0, int64_t nk, int dk, int64_t nv, int dv,
+         float *Qp, float *W, float *U, float *OU, float *gam, float *ikg)
 {
     extern __shared__ __align__(16) float pm[];
     float (*x0)[XP] = (float (*)[XP])pm;
@@ -125,37 +166,55 @@ gdn_prep(const float *q, const float *k, const void *v, int vdt, const float *g,
     float (*mt)[AP] = (float (*)[AP])(pm + GC * XP + GC * GC);        /* Mᵀ, after A               */
     float (*tt)[AP] = (float (*)[AP])(pm + 2 * GC * XP);              /* Tᵀ                        */
     float *gm = pm + 2 * GC * XP + GC * AP, *bt = gm + GC, *be = bt + GC;   /* γ, β, β e^γ           */
-    float (*xt)[16][16] = (float (*)[16][16])(be + GC);               /* blocks of T being built   */
+    float *iq = be + GC, *ik = iq + GC;                               /* 1 / |q|, 1 / |k| per row  */
+    float (*xt)[16][16] = (float (*)[16][16])(ik + GC);               /* blocks of T being built   */
     const int tid = threadIdx.x, lane = tid % ATH_WARP, w = tid / ATH_WARP;
     const int64_t c = c0 + blockIdx.x, h = blockIdx.y, kh = h / (nv / nk), t0 = c * GC;
     const int n = (int)(T - t0 < GC ? T - t0 : GC);
     const int64_t out = ((int64_t)blockIdx.x * nv + h) * GC;     /* this chunk's rows in the round's scratch */
 
-    /* the keys into x0, the queries into x1; rows past n (padding) and
-     * columns past dk zeros */
-    for (int e = tid; e < GC * GD / 4; e += PT) {
-        const int i = e / (GD / 4), d = 4 * (e % (GD / 4));
-        const bool ok = i < n && d < dk;
-        const int64_t at = ((t0 + i) * nk + kh) * dk + d;
-        k_cp16(&x0[i][d], ok ? k + at : k, ok);
-        k_cp16(&x1[i][d], ok ? q + at : q, ok);
+    /* the keys into x0, the queries into x1, normalized; rows past n
+     * (padding) and columns past dk zeros. bf16 rows travel by cp.async, all
+     * at once: the keys into Tᵀ's place, the queries into the top of x0,
+     * which they leave (into x1) before the keys arrive there. */
+    const int64_t qkb = (t0 * nk + kh) * dk, qks = nk * dk;
+    const bool stage = kdt == ATH_DTYPE_BF16 && qdt == ATH_DTYPE_BF16;
+    uint16_t *kraw = (uint16_t *)&tt[0][0];
+    uint16_t *qraw = (uint16_t *)((char *)&x0[0][0] + sizeof(float[GC][XP]) - sizeof(uint16_t[GC][GD]));
+    if (stage) {
+        for (int e = tid; e < GC * (dk / 8); e += PT) {
+            const int i = e / (dk / 8), c = 8 * (e % (dk / 8));
+            const bool ok = i < n;
+            k_cp16(&kraw[i * GD + c], ok ? (const uint16_t *)k + qkb + i * qks + c : (const uint16_t *)k, ok);
+            k_cp16(&qraw[i * GD + c], ok ? (const uint16_t *)q + qkb + i * qks + c : (const uint16_t *)q, ok);
+        }
+        k_cp_commit();
     }
-    k_cp_commit();
     /* γ (in token order, as the reference's cumsum), β; padding: zeros, γ constant */
     if (tid < GC) {
         bt[tid] = tid < n ? k_ld(beta, bdt, (t0 + tid) * nv + h) : 0.0f;
         gm[tid] = tid < n ? g[(t0 + tid) * nv + h] : 0.0f;
     }
-    for (int e = tid; e < GC * AP; e += PT)
-        (&tt[0][0])[e] = e / AP == e % AP ? 1.0f : 0.0f;
+    if (stage)
+        k_cp_wait_all();
     __syncthreads();
     if (tid == 0)
         for (int i = 1; i < GC; i++)
             gm[i] = __fadd_rn(gm[i - 1], gm[i]);
-    k_cp_wait_all();
-    __syncthreads();
+    if (stage) {
+        prep_rows(x1, iq, qraw, ATH_DTYPE_BF16, 0, GD, dk, n, l2_eps);
+        __syncthreads();                               /* the staged queries are read: x0 is free */
+        prep_rows(x0, ik, kraw, ATH_DTYPE_BF16, 0, GD, dk, n, l2_eps);
+    } else {
+        prep_rows(x1, iq, q, qdt, qkb, qks, dk, n, l2_eps);
+        prep_rows(x0, ik, k, kdt, qkb, qks, dk, n, l2_eps);
+    }
+    __syncthreads();                                   /* the staged keys are read: Tᵀ starts as I */
+    for (int e = tid; e < GC * AP; e += PT)
+        (&tt[0][0])[e] = e / AP == e % AP ? 1.0f : 0.0f;
     if (tid < GC) {
         gam[out + tid] = gm[tid];
+        ikg[out + tid] = ik[tid];
         be[tid] = __fmul_rn(bt[tid], expf(gm[tid]));
     }
 
@@ -280,12 +339,12 @@ gdn_prep(const float *q, const float *k, const void *v, int vdt, const float *g,
 #pragma unroll
             for (int hh = 0; hh < 2; hh++) {
                 const int d = cq + 64 * hh;
-                const float4 qv = i < n && d < dk ? *(const float4 *)&q[((t0 + i) * nk + kh) * dk + d]
-                                                  : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-                o[a][4 * hh] = __fsub_rn(__fmul_rn(f, qv.x), o[a][4 * hh]);
-                o[a][4 * hh + 1] = __fsub_rn(__fmul_rn(f, qv.y), o[a][4 * hh + 1]);
-                o[a][4 * hh + 2] = __fsub_rn(__fmul_rn(f, qv.z), o[a][4 * hh + 2]);
-                o[a][4 * hh + 3] = __fsub_rn(__fmul_rn(f, qv.w), o[a][4 * hh + 3]);
+                float qv[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                if (i < n && d < dk)
+                    k_ld4(q, qdt, (((t0 + i) * nk + kh) * dk + d) / 4, qv);
+#pragma unroll
+                for (int e = 0; e < 4; e++)
+                    o[a][4 * hh + e] = __fsub_rn(__fmul_rn(f, __fmul_rn(qv[e], iq[i])), o[a][4 * hh + e]);
             }
         }
     }
@@ -362,20 +421,23 @@ static __device__ __forceinline__ void scan_copy(float *x, const float *src, int
         k_cp16(&x[4 * e], src + 4 * e, true);
 }
 
-/* The chunk's keys, [GC][dk], from rows of `stride` floats starting at k;
- * rows at or past n zeros. */
-static __device__ __forceinline__ void scan_keys(float *x, const float *k, int64_t stride, int dk, int n)
+/* The chunk's keys as given, [GC][dk] elements of es bytes, from rows of
+ * `stride` elements starting at k; rows at or past n zeros. */
+static __device__ __forceinline__ void scan_keys(float *x, const void *k, int es, int64_t stride, int dk, int n)
 {
-    for (int e = threadIdx.x; e < GC * dk / 4; e += ST) {
-        const int i = (4 * e) / dk, d = (4 * e) % dk;
+    const int per = dk * es / 16;                     /* 16-byte pieces of a row */
+    for (int e = threadIdx.x; e < GC * per; e += ST) {
+        const int i = e / per, c = e % per;
         const bool ok = i < n;
-        k_cp16(&x[i * dk + d], ok ? k + i * stride + d : k, ok);
+        k_cp16((char *)x + (i * per + c) * 16, ok ? (const char *)k + (i * stride) * es + c * 16 : (const char *)k,
+               ok);
     }
 }
 
 static __global__ void __launch_bounds__(ST)
-gdn_scan(const float *k, const float *Qp, const float *W, const float *U, const float *OU, const float *gam,
-         float *state, void *out, int odt, int64_t T, int64_t c0, int64_t nc, int64_t nk, int dk, int64_t nv, int dv)
+gdn_scan(const void *k, int kdt, const float *Qp, const float *W, const float *U, const float *OU, const float *gam,
+         const float *ikg, float *state, void *out, int odt, int64_t T, int64_t c0, int64_t nc, int64_t nk, int dk,
+         int64_t nv, int dv)
 {
     extern __shared__ __align__(16) unsigned char scan_smem[];
     float *const xb0 = (float *)scan_smem;                              /* two operand tiles, */
@@ -411,6 +473,12 @@ gdn_scan(const float *k, const float *Qp, const float *W, const float *U, const 
         const int64_t c = c0 + ci, t0 = c * GC, rows = (ci * nv + h) * GC;
         const int n = (int)(T - t0 < GC ? T - t0 : GC);
         const float glast = gam[rows + GC - 1];
+        float fr[4];                                   /* the Δ factors of this lane's rows, loaded early */
+#pragma unroll
+        for (int a = 0; a < 4; a++) {
+            const int64_t at = rows + 16 * w + 4 * (lane / 8) + a;
+            fr[a] = __fmul_rn(expf(__fsub_rn(glast, gam[at])), ikg[at]);
+        }
         const int r0 = 16 * w + 4 * (lane / 8), cc = 4 * (lane % 8);   /* this lane's rows and columns */
         float acc[4][4], pre[4][4];
 
@@ -432,10 +500,11 @@ gdn_scan(const float *k, const float *Qp, const float *W, const float *U, const 
                 if (r0 + a < n && cc + q < jn)
                     k_st(out, odt, ((t0 + r0 + a) * nv + h) * dv + j0 + cc + q, __fadd_rn(acc[a][q], pre[a][q]));
 
-        /* Δ = U − W S, kept as e^(γ_last − γ_i) Δ_i for the update */
+        /* Δ = U − W S, kept as e^(γ_last − γ_i) Δ_i / |k_i| for the update */
         k_cp_wait_all();
         __syncthreads();
-        scan_keys(XB(b), k + (t0 * nk + kh) * dk, nk * dk, dk, n);
+        const int kes = kdt == ATH_DTYPE_BF16 ? 2 : 4;
+        scan_keys(XB(b), (const char *)k + (t0 * nk + kh) * dk * kes, kes, nk * dk, dk, n);
         k_cp_commit();
 #pragma unroll
         for (int a = 0; a < 4; a++)
@@ -445,18 +514,42 @@ gdn_scan(const float *k, const float *Qp, const float *W, const float *U, const 
         scan_rows(XB(b ^ 1), sm, dk, acc);
 #pragma unroll
         for (int a = 0; a < 4; a++) {
-            const float f = expf(__fsub_rn(glast, gam[rows + r0 + a]));
+            const float f = fr[a];
             *(float4 *)&dl[r0 + a][cc] =
                 make_float4(__fmul_rn(f, __fsub_rn(pre[a][0], acc[a][0])), __fmul_rn(f, __fsub_rn(pre[a][1], acc[a][1])),
                             __fmul_rn(f, __fsub_rn(pre[a][2], acc[a][2])), __fmul_rn(f, __fsub_rn(pre[a][3], acc[a][3])));
         }
 
-        /* S = e^γ_last S + Kᵀ (e^(γ_last − γ) Δ) */
+        /* S = e^γ_last S + K̂ᵀ (e^(γ_last − γ) Δ), K̂ = K / |k|: the keys as
+         * given and 1 / |k| in Δ's factor */
         k_cp_wait_all();
         __syncthreads();
         if (ci + 1 < nc) {
             scan_copy(XB(b ^ 1), Qp + ((ci + 1) * nv + h) * GC * dk, GC * dk);
             k_cp_commit();
+        }
+        if (kdt == ATH_DTYPE_BF16) {
+            /* bf16 keys to f32 in place, once: every lane reads its pieces,
+             * then writes them twice as wide */
+            uint4 raw[GC * GD / 8 / ST];
+            const uint4 *src = (const uint4 *)XB(b);
+#pragma unroll
+            for (int q = 0; q < GC * GD / 8 / ST; q++)
+                if (threadIdx.x + ST * q < GC * dk / 8)
+                    raw[q] = src[threadIdx.x + ST * q];
+            __syncthreads();
+            float4 *dst = (float4 *)XB(b);
+#pragma unroll
+            for (int q = 0; q < GC * GD / 8 / ST; q++) {
+                const int u = threadIdx.x + ST * q;
+                if (u < GC * dk / 8) {
+                    float f[8];
+                    k_unpack_bf16x8(raw[q], f);
+                    dst[2 * u] = make_float4(f[0], f[1], f[2], f[3]);
+                    dst[2 * u + 1] = make_float4(f[4], f[5], f[6], f[7]);
+                }
+            }
+            __syncthreads();
         }
         {
             const float *x = XB(b);
@@ -471,8 +564,8 @@ gdn_scan(const float *k, const float *Qp, const float *W, const float *U, const 
 #pragma unroll 4
                 for (int i = 0; i < GC; i++) {
                     const float4 k0 = *(const float4 *)&x[i * dk + r0], k1 = *(const float4 *)&x[i * dk + r0 + 4];
-                    const float4 dd = *(const float4 *)&dl[i][4 * lc];
                     const float kv[8] = {k0.x, k0.y, k0.z, k0.w, k1.x, k1.y, k1.z, k1.w};
+                    const float4 dd = *(const float4 *)&dl[i][4 * lc];
                     const float dv4[4] = {dd.x, dd.y, dd.z, dd.w};
 #pragma unroll
                     for (int a = 0; a < 8; a++)
@@ -505,19 +598,19 @@ gdn_scan(const float *k, const float *Qp, const float *W, const float *U, const 
 #define SCAN_SMEM (2 * TILE * sizeof(float) + sizeof(float[GD + GC][GV]))
 
 /* Scratch for one round: W and Q'' [chunks, nv, GC, dk], U and O_U
- * [chunks, nv, GC, dv], γ [chunks, nv, GC]. */
+ * [chunks, nv, GC, dv], γ and 1 / |k| [chunks, nv, GC]. */
 static size_t round_floats(int64_t chunks, int64_t nv, int64_t dk, int64_t dv)
 {
-    return (size_t)(chunks * nv * GC * (2 * dk + 2 * dv + 1));
+    return (size_t)(chunks * nv * GC * (2 * dk + 2 * dv + 2));
 }
 
 extern "C" bool ath_gdn_chunk_fits(const ath_device *d, const ath_tensor *q, const ath_tensor *k,
                                    const ath_tensor *v, const ath_tensor *g)
 {
     const int64_t dk = q->shape[2], dv = v->shape[2];
-    return d->smem_per_block >= PREP_SMEM && d->smem_per_block >= SCAN_SMEM && q->dtype == ATH_DTYPE_F32 &&
-           k->dtype == ATH_DTYPE_F32 && g->dtype == ATH_DTYPE_F32 && dk <= GD && dv <= GD && dk % 4 == 0 &&
-           dv % 4 == 0 && dk > 0 && dv > 0 && (uintptr_t)q->data % 16 == 0 && (uintptr_t)k->data % 16 == 0;
+    return d->smem_per_block >= PREP_SMEM && d->smem_per_block >= SCAN_SMEM && q->dtype == k->dtype &&
+           g->dtype == ATH_DTYPE_F32 && dk <= GD && dv <= GD && dk % 8 == 0 && dv % 4 == 0 && dk > 0 && dv > 0 &&
+           (uintptr_t)q->data % 16 == 0 && (uintptr_t)k->data % 16 == 0;
 }
 
 /* Chunks per round: enough prep blocks for GDN_WAVES full waves over the
@@ -537,7 +630,8 @@ extern "C" size_t ath_gdn_chunk_bytes(const ath_device *d, const ath_tensor *q, 
 
 extern "C" ath_status ath_gdn_chunk_launch(const ath_device *d, const ath_tensor *q, const ath_tensor *k,
                                            const ath_tensor *v, const ath_tensor *g, const ath_tensor *beta,
-                                           float q_scale, ath_tensor *state, void *work, ath_tensor *out)
+                                           float q_scale, float l2_eps, ath_tensor *state, void *work,
+                                           ath_tensor *out)
 {
     const int64_t T = q->shape[0], nk = q->shape[1], dk = q->shape[2], nv = v->shape[1], dv = v->shape[2];
     const int64_t nc = (T + GC - 1) / GC;
@@ -553,15 +647,15 @@ extern "C" ath_status ath_gdn_chunk_launch(const ath_device *d, const ath_tensor
         return ath_gpu_launched("gdn chunks (shared memory)");
     const int64_t rc = round_chunks(d, nc, nv);
     float *Wb = (float *)work, *Qb = Wb + rc * nv * GC * dk, *Ub = Qb + rc * nv * GC * dk;
-    float *Ob = Ub + rc * nv * GC * dv, *gb = Ob + rc * nv * GC * dv;
+    float *Ob = Ub + rc * nv * GC * dv, *gb = Ob + rc * nv * GC * dv, *ib = gb + rc * nv * GC;
     for (int64_t c0 = 0; c0 < nc; c0 += rc) {
         const int64_t n = nc - c0 < rc ? nc - c0 : rc;
         gdn_prep<<<dim3((unsigned)n, (unsigned)nv), PT, PREP_SMEM, k_stream(d)>>>(
-            (const float *)q->data, (const float *)k->data, v->data, v->dtype, (const float *)g->data, beta->data,
-            beta->dtype, q_scale, T, c0, nk, (int)dk, nv, (int)dv, Qb, Wb, Ub, Ob, gb);
+            q->data, q->dtype, k->data, k->dtype, v->data, v->dtype, (const float *)g->data, beta->data, beta->dtype,
+            q_scale, l2_eps, T, c0, nk, (int)dk, nv, (int)dv, Qb, Wb, Ub, Ob, gb, ib);
         ATH_CHECK(ath_gpu_launched("gdn_prep"));
         gdn_scan<<<dim3((unsigned)nv, (unsigned)((dv + GV - 1) / GV)), ST, SCAN_SMEM, k_stream(d)>>>(
-            (const float *)k->data, Qb, Wb, Ub, Ob, gb, (float *)state->data, out->data, out->dtype, T, c0, n, nk,
+            k->data, k->dtype, Qb, Wb, Ub, Ob, gb, ib, (float *)state->data, out->data, out->dtype, T, c0, n, nk,
             (int)dk, nv, (int)dv);
         ATH_CHECK(ath_gpu_launched("gdn_scan"));
     }

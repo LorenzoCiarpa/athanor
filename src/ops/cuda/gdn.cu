@@ -15,7 +15,9 @@
  * output with the query, added in warp order again. The order of every sum
  * is fixed by dk, so feeding tokens in pieces gives the bits of feeding them
  * at once. Tokens run one after the other, as the recurrence requires;
- * the chunked form that parallelizes a long prompt is step 10.
+ * the chunked form that parallelizes a long prompt is gdn_chunk.cu (step
+ * 10). The query and key of each token are L2-normalized here (step 10):
+ * sums of squares over the warps, added in warp order.
  */
 #include "ops/cuda/kernel.cuh"
 
@@ -55,11 +57,12 @@ extern "C" ath_status ath_gdn_gates_launch(const ath_device *d, const ath_tensor
 
 static __global__ void __launch_bounds__(GDN_WARPS *ATH_WARP)
 gdn_kernel(const void *q, int qdt, const void *k, int kdt, const void *v, int vdt, const void *g, int gdt,
-           const void *beta, int bdt, float q_scale, float *state, void *out, int odt, int64_t T, int64_t nk,
-           int64_t dk, int64_t nv, int64_t dv)
+           const void *beta, int bdt, float q_scale, float l2_eps, float *state, void *out, int odt, int64_t T,
+           int64_t nk, int64_t dk, int64_t nv, int64_t dv)
 {
-    __shared__ float kq[2][ATH_GDN_MAX_DK];         /* the token's k, and q · q_scale */
+    __shared__ float kq[2][ATH_GDN_MAX_DK];         /* the token's k and q, as given  */
     __shared__ float part[GDN_WARPS][ATH_WARP];      /* the warps' partial sums      */
+    __shared__ float l2[2][GDN_WARPS];               /* the warps' sums of k², q²     */
     const int lane = threadIdx.x % ATH_WARP, warp = threadIdx.x / ATH_WARP;
     const int64_t h = blockIdx.x, j = (int64_t)blockIdx.y * ATH_WARP + lane;   /* this lane's column */
     const bool live = j < dv;
@@ -76,12 +79,24 @@ gdn_kernel(const void *q, int qdt, const void *k, int kdt, const void *v, int vd
     }
     for (int64_t t = 0; t < T; t++) {
         const int64_t qk = (t * nk + kh) * dk, tv = t * nv + h;
+        float sk = 0.0f, sq = 0.0f;
         for (int64_t i = threadIdx.x; i < dk; i += blockDim.x) {
-            kq[0][i] = k_ld(k, kdt, qk + i);
-            kq[1][i] = k_ld(q, qdt, qk + i) * q_scale;
+            const float kv = k_ld(k, kdt, qk + i), qv = k_ld(q, qdt, qk + i);
+            kq[0][i] = kv;
+            kq[1][i] = qv;
+            sk += kv * kv;
+            sq += qv * qv;
         }
+        sk = k_warp_sum(sk);
+        sq = k_warp_sum(sq);
+        if (lane == 0)
+            l2[0][warp] = sk, l2[1][warp] = sq;
         const float alpha = expf(k_ld(g, gdt, tv)), b = k_ld(beta, bdt, tv);
         __syncthreads();
+        sk = l2[0][0], sq = l2[1][0];
+        for (int w = 1; w < GDN_WARPS; w++)
+            sk += l2[0][w], sq += l2[1][w];
+        const float ik = 1.0f / sqrtf(sk + l2_eps), iq = 1.0f / sqrtf(sq + l2_eps);
         /* u = Sᵀk over this warp's rows, then over the warps in order */
         float u = 0.0f;
 #pragma unroll
@@ -89,7 +104,7 @@ gdn_kernel(const void *q, int qdt, const void *k, int kdt, const void *v, int vd
             const int64_t i = warp + (int64_t)r * GDN_WARPS;
             if (i < dk) {
                 s[r] *= alpha;
-                u += s[r] * kq[0][i];
+                u += s[r] * (kq[0][i] * ik);
             }
         }
         part[warp][lane] = u;
@@ -103,8 +118,8 @@ gdn_kernel(const void *q, int qdt, const void *k, int kdt, const void *v, int vd
         for (int r = 0; r < GDN_ROWS; r++) {
             const int64_t i = warp + (int64_t)r * GDN_WARPS;
             if (i < dk) {
-                s[r] += kq[0][i] * delta;
-                o += s[r] * kq[1][i];
+                s[r] += (kq[0][i] * ik) * delta;
+                o += s[r] * ((kq[1][i] * iq) * q_scale);
             }
         }
         __syncthreads();                             /* every warp has read part */
@@ -128,7 +143,7 @@ gdn_kernel(const void *q, int qdt, const void *k, int kdt, const void *v, int vd
 
 extern "C" ath_status ath_gdn_launch(const ath_device *d, const ath_tensor *q, const ath_tensor *k,
                                      const ath_tensor *v, const ath_tensor *g, const ath_tensor *beta, float q_scale,
-                                     ath_tensor *state, ath_tensor *out)
+                                     float l2_eps, ath_tensor *state, ath_tensor *out)
 {
     const int64_t T = q->shape[0], nk = q->shape[1], dk = q->shape[2], nv = v->shape[1], dv = v->shape[2];
     if (nv == 0 || dv == 0 || T == 0)
@@ -143,7 +158,7 @@ extern "C" ath_status ath_gdn_launch(const ath_device *d, const ath_tensor *q, c
     const dim3 grid((unsigned)nv, (unsigned)col_blocks);
     gdn_kernel<<<grid, GDN_WARPS * ATH_WARP, 0, k_stream(d)>>>(q->data, q->dtype, k->data, k->dtype, v->data, v->dtype,
                                                                g->data, g->dtype, beta->data, beta->dtype, q_scale,
-                                                               (float *)state->data, out->data, out->dtype, T, nk, dk,
+                                                               l2_eps, (float *)state->data, out->data, out->dtype, T, nk, dk,
                                                                nv, dv);
     return ath_gpu_launched("gdn_kernel");
 }

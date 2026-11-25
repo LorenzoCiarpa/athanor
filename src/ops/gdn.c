@@ -8,6 +8,9 @@
  * token-by-token form (torch_recurrent_gated_delta_rule in the reference); the
  * chunked form used for prefill by the reference and, from step 10, by the GPU
  * computes the same recurrence (contract, Gated DeltaNet layer).
+ *
+ * The query and key are L2-normalized here (step 10), with the expression of
+ * ath_l2norm_ref, so the values are the bits that op would have stored.
  */
 #include "ops/check.h"
 #include "ops/launch.h"
@@ -84,8 +87,19 @@ static ath_status gdn_args(const ath_tensor *q, const ath_tensor *k, const ath_t
     return OPS_PLACE(op, where, q, k, v, g, beta, state, out);
 }
 
+/* 1 / |x| over x[base .. base + n), as ath_l2norm_ref computes it. */
+static float l2_inv(const ath_tensor *x, int64_t base, int64_t n, float eps)
+{
+    float ss = 0.0f;
+    for (int64_t i = 0; i < n; i++) {
+        float v = ld(x, base + i);
+        ss += v * v;
+    }
+    return 1.0f / sqrtf(ss / 1.0f + eps);
+}
+
 ath_status ath_gdn_ref(const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
-                       const ath_tensor *g, const ath_tensor *beta, float q_scale,
+                       const ath_tensor *g, const ath_tensor *beta, float q_scale, float l2_eps,
                        ath_tensor *state, ath_tensor *out)
 {
     ATH_CHECK(gdn_args(q, k, v, g, beta, state, out, OPS_HOST));
@@ -100,17 +114,18 @@ ath_status ath_gdn_ref(const ath_tensor *q, const ath_tensor *k, const ath_tenso
             const int64_t vb = (t * nv + h) * dv;
             const float alpha = expf(ld(g, t * nv + h));
             const float b = ld(beta, t * nv + h);
+            const float iq = l2_inv(q, qk, dk, l2_eps), ik = l2_inv(k, qk, dk, l2_eps);
             for (int64_t j = 0; j < dv; j++) {
                 float u = 0.0f;
                 for (int64_t i = 0; i < dk; i++) {
                     S[i * dv + j] *= alpha;
-                    u += S[i * dv + j] * ld(k, qk + i);
+                    u += S[i * dv + j] * (ld(k, qk + i) * ik);
                 }
                 float delta = (ld(v, vb + j) - u) * b;
                 float o = 0.0f;
                 for (int64_t i = 0; i < dk; i++) {
-                    S[i * dv + j] += ld(k, qk + i) * delta;
-                    o += S[i * dv + j] * (ld(q, qk + i) * q_scale);
+                    S[i * dv + j] += (ld(k, qk + i) * ik) * delta;
+                    o += S[i * dv + j] * ((ld(q, qk + i) * iq) * q_scale);
                 }
                 st(out, vb + j, o);
             }
@@ -126,7 +141,7 @@ ath_status ath_gdn_gates_gpu(const ath_device *d, const ath_tensor *a, const ath
 }
 
 ath_status ath_gdn_gpu(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
-                       const ath_tensor *g, const ath_tensor *beta, float q_scale, ath_tensor *state,
+                       const ath_tensor *g, const ath_tensor *beta, float q_scale, float l2_eps, ath_tensor *state,
                        ath_dev_arena *scratch, ath_tensor *out)
 {
     ATH_CHECK(gdn_args(q, k, v, g, beta, state, out, OPS_GPU));
@@ -139,9 +154,9 @@ ath_status ath_gdn_gpu(const ath_device *d, const ath_tensor *q, const ath_tenso
         void *work = ath_dev_arena_alloc(scratch, ath_gdn_chunk_bytes(d, q, v), 0);
         if (!work)
             return ATH_ERR_NOMEM;
-        ath_status st = ath_gdn_chunk_launch(d, q, k, v, g, beta, q_scale, state, work, out);
+        ath_status st = ath_gdn_chunk_launch(d, q, k, v, g, beta, q_scale, l2_eps, state, work, out);
         ath_dev_arena_reset(scratch, mark);   /* the next work on the stream comes after the kernels */
         return st;
     }
-    return ath_gdn_launch(d, q, k, v, g, beta, q_scale, state, out);
+    return ath_gdn_launch(d, q, k, v, g, beta, q_scale, l2_eps, state, out);
 }

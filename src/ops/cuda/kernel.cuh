@@ -79,6 +79,20 @@ static __device__ __forceinline__ void k_ld8(const void *p, int dt, int64_t e, f
     }
 }
 
+/* Elements 4e … 4e + 3 of a bf16 or f32 buffer on an 8- or 16-byte boundary,
+ * in one load. */
+static __device__ __forceinline__ void k_ld4(const void *p, int dt, int64_t e, float f[4])
+{
+    if (dt == ATH_DTYPE_BF16) {
+        const uint2 u = ((const uint2 *)p)[e];
+        f[0] = __uint_as_float(u.x << 16), f[1] = __uint_as_float(u.x & 0xffff0000u);
+        f[2] = __uint_as_float(u.y << 16), f[3] = __uint_as_float(u.y & 0xffff0000u);
+    } else {
+        const float4 a = ((const float4 *)p)[e];
+        f[0] = a.x, f[1] = a.y, f[2] = a.z, f[3] = a.w;
+    }
+}
+
 /* The value v takes once stored as dt. */
 static __device__ __forceinline__ float k_round(int dt, float v)
 {

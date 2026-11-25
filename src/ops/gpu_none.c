@@ -79,10 +79,10 @@ ath_status ath_gdn_gates_launch(const ath_device *d, const ath_tensor *a, const 
 }
 
 ath_status ath_gdn_launch(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
-                          const ath_tensor *g, const ath_tensor *beta, float q_scale, ath_tensor *state,
+                          const ath_tensor *g, const ath_tensor *beta, float q_scale, float l2_eps, ath_tensor *state,
                           ath_tensor *out)
 {
-    (void)d, (void)q, (void)k, (void)v, (void)g, (void)beta, (void)q_scale, (void)state, (void)out;
+    (void)d, (void)q, (void)k, (void)v, (void)g, (void)beta, (void)q_scale, (void)l2_eps, (void)state, (void)out;
     return none("gdn");
 }
 
@@ -151,9 +151,10 @@ size_t ath_gdn_chunk_bytes(const ath_device *d, const ath_tensor *q, const ath_t
 }
 
 ath_status ath_gdn_chunk_launch(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
-                                const ath_tensor *g, const ath_tensor *beta, float q_scale, ath_tensor *state,
-                                void *work, ath_tensor *out)
+                                const ath_tensor *g, const ath_tensor *beta, float q_scale, float l2_eps,
+                                ath_tensor *state, void *work, ath_tensor *out)
 {
-    (void)d, (void)q, (void)k, (void)v, (void)g, (void)beta, (void)q_scale, (void)state, (void)work, (void)out;
+    (void)d, (void)q, (void)k, (void)v, (void)g, (void)beta, (void)q_scale, (void)l2_eps, (void)state, (void)work,
+        (void)out;
     return none("gdn");
 }

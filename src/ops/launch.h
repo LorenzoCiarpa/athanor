@@ -70,7 +70,7 @@ ath_status ath_conv_launch(const ath_device *d, const ath_tensor *x, const ath_t
 ath_status ath_gdn_gates_launch(const ath_device *d, const ath_tensor *a, const ath_tensor *b,
                                 const ath_tensor *a_log, const ath_tensor *dt_bias, ath_tensor *g, ath_tensor *beta);
 ath_status ath_gdn_launch(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
-                          const ath_tensor *g, const ath_tensor *beta, float q_scale, ath_tensor *state,
+                          const ath_tensor *g, const ath_tensor *beta, float q_scale, float l2_eps, ath_tensor *state,
                           ath_tensor *out);
 /* The chunked form (gdn_chunk.cu, step 10): whether it takes these tensors
  * on d, the bytes of device memory it needs as work, and the launch. */
@@ -78,8 +78,8 @@ bool       ath_gdn_chunk_fits(const ath_device *d, const ath_tensor *q, const at
                               const ath_tensor *g);
 size_t     ath_gdn_chunk_bytes(const ath_device *d, const ath_tensor *q, const ath_tensor *v);
 ath_status ath_gdn_chunk_launch(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
-                                const ath_tensor *g, const ath_tensor *beta, float q_scale, ath_tensor *state,
-                                void *work, ath_tensor *out);
+                                const ath_tensor *g, const ath_tensor *beta, float q_scale, float l2_eps,
+                                ath_tensor *state, void *work, ath_tensor *out);
 
 #ifdef __cplusplus
 }
