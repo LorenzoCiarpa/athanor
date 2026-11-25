@@ -44,9 +44,11 @@
  *   - In a build without a GPU backend (make) every _gpu function checks its
  *     arguments, then fails with ATH_ERR_UNSUPPORTED.
  *
- * The entry point per op that chooses _ref, a fast CPU path or the GPU
- * kernel from where the tensors live joins this header with its first
- * caller, the GPU forward pass (step 8).
+ * One entry point per op (step 8), ath_<op>(d, ...) at the end of this
+ * header, runs it where a forward pass runs: on device d when d is not NULL
+ * (ath_<op>_gpu, every tensor in d's memory), on the CPU otherwise
+ * (ath_<op>_ref, or the fast path where there is one). A family composes
+ * its forward pass from these, once for both devices.
  */
 #ifndef ATH_OPS_H
 #define ATH_OPS_H
@@ -212,6 +214,31 @@ ath_status ath_gdn_ref(const ath_tensor *q, const ath_tensor *k, const ath_tenso
 ath_status ath_gdn_gpu(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
                        const ath_tensor *g, const ath_tensor *beta, float q_scale, ath_tensor *state,
                        ath_tensor *out);
+
+/* ---- dispatch.c (step 8): one entry point per op ------------------------------
+ *
+ * d NULL: the CPU (ath_<op>_ref; ath_matmul_fast on the threads of pool).
+ * d set: the GPU kernel on d, asynchronous on its compute stream. */
+ath_status ath_embed(const ath_device *d, const ath_tensor *table, const ath_tensor *ids, ath_tensor *out);
+ath_status ath_matmul(const ath_device *d, ath_pool *pool, const ath_tensor *x, const ath_tensor *w, ath_tensor *out);
+ath_status ath_rmsnorm(const ath_device *d, const ath_tensor *x, const ath_tensor *w, float w_offset, float eps,
+                       ath_tensor *out);
+ath_status ath_rmsnorm_gated(const ath_device *d, const ath_tensor *x, const ath_tensor *z, const ath_tensor *w,
+                             float eps, ath_tensor *out);
+ath_status ath_l2norm(const ath_device *d, const ath_tensor *x, float eps, ath_tensor *out);
+ath_status ath_rope(const ath_device *d, const ath_tensor *x, const ath_tensor *pos, int32_t rope_dim, float theta,
+                    ath_tensor *out);
+ath_status ath_swiglu(const ath_device *d, const ath_tensor *gate, const ath_tensor *up, ath_tensor *out);
+ath_status ath_sigmoid_mul(const ath_device *d, const ath_tensor *x, const ath_tensor *gate, ath_tensor *out);
+ath_status ath_add(const ath_device *d, const ath_tensor *a, const ath_tensor *b, ath_tensor *out);
+ath_status ath_attn(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v, float scale,
+                    ath_tensor *out);
+ath_status ath_conv(const ath_device *d, const ath_tensor *x, const ath_tensor *w, ath_tensor *state, ath_act act,
+                    ath_tensor *out);
+ath_status ath_gdn_gates(const ath_device *d, const ath_tensor *a, const ath_tensor *b, const ath_tensor *a_log,
+                         const ath_tensor *dt_bias, ath_tensor *g, ath_tensor *beta);
+ath_status ath_gdn(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
+                   const ath_tensor *g, const ath_tensor *beta, float q_scale, ath_tensor *state, ath_tensor *out);
 
 /* ---- sample.c (step 5) ----------------------------------------------------- */
 
