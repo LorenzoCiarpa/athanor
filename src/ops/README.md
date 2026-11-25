@@ -9,7 +9,11 @@ src/ops/<op>.cu   GPU kernel(s), CUDA C compiled for CUDA and HIP
 tests/test_ops.c  ref vs golden data; GPU vs ref; fast vs ref
 ```
 
-`ops.h` declares the functions with their shapes, dtypes and math. Step 3 landed the CPU references; step 4 the first fast CPU path, `ath_matmul_fast`; step 7 a GPU kernel for every op of the forward pass, `ath_<op>_gpu`. The entry point per op that chooses one of them from where the tensors live joins `ops.h` with its first caller, the GPU forward pass (step 8). Until then the CPU forward pass calls the `_ref` functions and `ath_matmul_fast`.
+`ops.h` declares the functions with their shapes, dtypes and math. Step 3 landed the CPU references; step 4 the first fast CPU path, `ath_matmul_fast`; step 7 a GPU kernel for every op of the forward pass, `ath_<op>_gpu`; step 8 one entry point per op, `ath_<op>(d, ...)` in `dispatch.c`, which a family's forward pass calls for both devices.
+
+## Entry points (step 8)
+
+`ath_<op>(const ath_device *d, ...)` runs the op on device d when d is set (`ath_<op>_gpu`) and on the CPU otherwise (`ath_<op>_ref`; `ath_matmul(d, pool, ...)` runs `ath_matmul_fast` on the pool). The caller chooses, from where its forward pass runs; each implementation checks that the tensors are on its side, so a tensor left behind is an error and never a silent copy. `src/models/qwen35/forward.c` is written once against these.
 
 ## The references (step 3)
 
@@ -26,6 +30,7 @@ tests/test_ops.c  ref vs golden data; GPU vs ref; fast vs ref
 | `conv.c` | `ath_conv_ref`: causal depthwise conv1d over time with a `[K − 1, C]` running state, optional SiLU |
 | `gdn.c` | `ath_gdn_gates_ref` (decay and write strength), `ath_gdn_ref` (gated delta rule, recurrent form, state `[nv, dk, dv]` in f32) |
 | `sample.c` (step 5) | `ath_sample_ref`: the next token from the logits, below |
+| `dispatch.c` (step 8) | `ath_<op>(d, ...)`: the op on device d, or on the CPU without one |
 
 Conventions, stated once in `ops.h`:
 

@@ -6,11 +6,55 @@ This file is the overview. [`status_extended.md`](status_extended.md) goes one l
 
 ## Current step
 
-**Step 7: GPU ops, one by one** (see `docs/PLAN.md` §4). Started 2026-11-25 on branch `step7-gpu-ops`. **Done 2026-11-25** (pushed, to be merged into `main`); step 8 is next.
+**Step 8: sequence state and engine** (see `docs/PLAN.md` §4). Started 2026-11-25 on branch `step8-engine`. **Done 2026-11-25** (pushed and merged into `main` at the maintainer's request); step 9 is next.
+
+Goal: the model on the GPU. The forward pass runs there from the kernels of step 7, with the weights copied once and the state of a sequence in device memory, through the same contract and the same family code as on the CPU; `athanor chat` uses it. The gate of `docs/PLAN.md`: a GPU chat in bf16, and greedy output identical to the reference for 256 tokens on 50 prompts. "Identical" is read as the step 4 and 5 gates read it: at every step where the fp32 reference's top-2 margin exceeds the bf16 noise, since below it rounding alone can flip a greedy choice (the bf16 reference itself flips some).
+
+### Tasks
+
+- [x] **8.1 Strided copies.** `ath_copy_2d` in the backend, for the slices the forward pass gathers into contiguous tensors.
+- [x] **8.2 Op entry points.** `ath_<op>(d, ...)` in `src/ops/dispatch.c`: the GPU kernel on device d, the reference (`ath_matmul_fast` for the matmul) without one.
+- [x] **8.3 The contract on two devices.** `ath_exec` (pool, device, the params' device copies, device scratch) replaces the pool in `forward` and `ath_model_forward`; `ath_state.dev` and `ath_state_init_gpu`; reset and copy on a device; `ath_model_forward` checks that a pass runs where its state is.
+- [x] **8.4 The forward pass on both devices.** `src/models/qwen35/forward.c` composed once from the entry points; on a GPU, weights through the params' copies, scratch on the device, ids and positions copied there, logits copied back.
+- [x] **8.5 The engine.** `src/infer/engine.{h,c}`: the device, every used param copied once (1.40 GiB for Qwen3.5-0.8B), the exec, states on the device.
+- [x] **8.6 `athanor chat` on the GPU.** `--device cpu|gpu`, the GPU by default when there is one.
+- [x] **8.7 Golden generations.** `tests/golden/generate.py` (`make golden-generate`): 50 prompts, 256 greedy tokens each by the fp32 reference, margins and bf16 noise.
+- [x] **8.8 Tests.** `tests/test_engine.c` (the engine, states on the device, pieces, the gate); the forward records on the GPU in `tests/test_forward.c`; `ath_copy_2d` in `tests/test_backend.c`.
+- [x] **8.9 Documentation.**
+
+### Acceptance criteria
+
+1. `athanor chat` runs on the GPU in bf16, by default when the build and the machine have one, with the conversation's state reused across turns as on the CPU.
+2. The gate: on 50 prompts of 256 tokens, the engine's greedy token in bf16 equals the fp32 reference's at every step whose top-2 margin exceeds the bf16 noise.
+3. The GPU forward pass meets the step 4 gate on the forward records: pooled mean KL no larger than the bf16 reference's, greedy agreement above the noise; with f32 activations, the residual stream within 2e-4 and the logits within 1e-4 of the fp32 reference.
+4. The CPU forward pass is unchanged (every CPU number of `test_forward` and `test_text` the same).
+5. `make cuda test` green, also with `DEBUG=1`; `make test` green; compute-sanitizer clean on `test_engine`.
+6. No warnings; `ldd` as in step 7.
+7. Documentation updated.
+
+Result (2026-11-25, RTX 5080 `sm_120`, driver 580.178.04 (CUDA 13.0), CUDA toolkit 13.5.0, cuBLASLt 13.10, gcc 15.2; reference transformers 5.24.0):
+
+| # | Criterion | Result |
+| --- | --- | --- |
+| 1 | GPU chat | `athanor chat` on the GPU by default (`--device cpu` for the CPU): 1.40 GiB of weights on the device; a three-turn conversation reuses the state as on the CPU (the second and third prompts run 45 of 58 and 48 of 99 tokens) and gives the CPU's answers up to near-ties |
+| 2 | the gate | 50 prompts × 256 steps, teacher-forced: the engine's greedy token equals the fp32 reference's at all 11,445 steps whose margin exceeds the prompt's bf16 noise (0 differences); it differs at 78 of the 1,355 steps below it. With the largest noise of all prompts (1.237), 0 of 8,352. Generating freely, 15 of 50 prompts equal the reference for all 256 tokens, 6,572 of 12,800 tokens before each prompt's first difference, always at a near-tie |
+| 3 | forward records on the GPU | bf16: pooled mean KL 2.4e-4 against the bf16 reference's 5.0e-4 (ratio 0.49; the CPU 0.60), 0 greedy differences at the 104 positions above the noise; f32: residual stream 1.5e-5 (tolerance 2e-4), logits 9.4e-6 (1e-4) |
+| 4 | CPU unchanged | every CPU number of `test_forward` (KL 3.018e-4, ratio 0.60, f32 4.7e-5 and 2.7e-5) and `test_text` as before |
+| 5 | tests | `make cuda test`: 24 + 11 + 17 + 1 + 7 + 12 + 6 (1 skipped) + 10 + 4 (1 skipped) pass; `make cuda DEBUG=1 test` and `make test`, `make DEBUG=1 test` green (the GPU tests skipped in the CPU builds); compute-sanitizer: `test_engine` and a GPU chat on the real model, memcheck with leak check 0 errors and 0 bytes leaked, initcheck 0 errors, racecheck (`test_engine`) 0 hazards |
+| 6 | build | no warnings; `ldd` as in step 7 (CPU: libm, libc; CUDA: libm, libc, `libcublasLt.so.13`) |
+| 7 | documentation | `docs/ARCHITECTURE.md` (the contract on two devices), READMEs of `src/model`, `src/models/qwen35`, `src/infer`, `src/ops`, `src/backend`, `tools`, `tests`, `tests/golden`; `README.md`; `docs/program/PROGRAM.md` row 9; this file and `status_extended.md` |
+
+For the record (no performance claim; `docs/BENCHMARKS.md`): greedy decoding of Qwen3.5-0.8B in bf16 runs at about 282 to 290 tokens/s on the GPU (`test_engine`, `athanor chat --stats`), against 8.5 on the CPU with 8 threads. Nothing is tuned yet: a kernel launch per op, a cuBLASLt heuristic query per matmul, logits copied back every token. Step 9 is about that.
+
+## Completed steps
+
+### Step 7
+
+**Step 7: GPU ops, one by one** (see `docs/PLAN.md` §4). Started 2026-11-25 on branch `step7-gpu-ops`. **Done 2026-11-25** (pushed, to be merged into `main`); step 8 is next. Merged into `main` (fast-forward) on 2026-11-25, at the maintainer's request.
 
 Goal: a GPU kernel for every op of the forward pass, each checked against its CPU reference on random and on real inputs, as AGENTS.md's op checklist asks. Correct and simple first: fast decode is step 9, fast prefill step 10.
 
-### Tasks
+#### Tasks
 
 - [x] **7.1 The matmul library in the backend.** A cuBLASLt handle and a 32 MiB workspace per device, created by `ath_device_open` (`ath_device.blas`, `blas_ws`); cuBLASLt linked as a shared library through the toolkit's path, `tools/dev/check_nvcc.sh` checks it is there; hipBLASLt names in `compat.h`. `src/backend/gpu.h`: what GPU code shares (errors, device, streams, the check after a launch).
 - [x] **7.2 The GPU entry points.** `ath_<op>_gpu(const ath_device *d, ...)` in `src/ops/ops.h` for every op of the forward pass, asynchronous on the compute stream. The argument checks are the reference's (one `args` function per op; `ops_place` says on which side the tensors must be); the launchers (`src/ops/launch.h`) are in the `.cu` files, stubbed by `src/ops/gpu_none.c` without a GPU. `make cuda` builds `src/ops/*.cu`.
@@ -19,7 +63,7 @@ Goal: a GPU kernel for every op of the forward pass, each checked against its CP
 - [x] **7.5 GPU replay of the golden records.** `tests/test_golden.c` runs every record through the GPU kernel too, when the build has a GPU, and compares it with `_ref` on the same inputs, native and exact.
 - [x] **7.6 Documentation.**
 
-### Acceptance criteria
+#### Acceptance criteria
 
 1. Every op of the forward pass has a GPU kernel: `embed`, `matmul`, `rmsnorm`, `rmsnorm_gated`, `l2norm`, `rope`, `swiglu`, `sigmoid_mul`, `add`, `attn`, `conv`, `gdn_gates`, `gdn`.
 2. Every kernel matches its CPU reference within the tolerances of `tests/README.md` (GPU kernels), on random inputs and on the real inputs of every golden record; copies, the residual add and the conv state bit for bit.
@@ -38,8 +82,6 @@ Result (2026-11-25, RTX 5080 `sm_120`, driver 580.178.04 (CUDA 13.0), CUDA toolk
 | 4 | tests | `make cuda test`: 24 + 11 + 17 + 1 + 7 + 12 + 6 (1 skipped) + 10 pass; `make cuda DEBUG=1 test` the same; `make test` and `make DEBUG=1 test`: the same suites with the GPU tests skipped (`test_gpu_ops` 1 pass, 9 skipped); compute-sanitizer on `test_gpu_ops`: memcheck 0 errors and 0 bytes leaked, racecheck 0 hazards, initcheck 0 errors |
 | 5 | build | no warnings (host and device); `ldd build/athanor`: libm, libc; `ldd build/cuda/athanor`: libm, libc, `libcublasLt.so.13` (with the librt, libpthread and libdl it loads) |
 | 6 | documentation | `src/ops/README.md` (GPU kernels), `src/backend/README.md` (cuBLASLt, `gpu.h`, linking), `tests/README.md` (GPU kernels), `src/core/README.md`, `docs/ARCHITECTURE.md`, `docs/program/PROGRAM.md` rows 7, 8 and 10, this file and `status_extended.md` |
-
-## Completed steps
 
 ### Step 6
 
@@ -296,7 +338,9 @@ Result (2026-11-23, Qwen3.5-0.8B revision `2fc0636`, gcc 15.2, glibc 2.43):
 
 ## Next step (preview)
 
-**Step 8: sequence state and engine.** The forward pass on the GPU: the weights uploaded once, the state of a sequence (KV cache, conv and recurrent state) in device memory, the ops chosen by where the tensors live (the dispatching entry point per op joins `ops.h` with this first caller), and an engine in `src/infer/` that runs prompts and decodes with the GPU forward pass; `athanor chat` on the GPU in bf16. Gate (`docs/PLAN.md`): GPU chat in bf16; greedy output identical to the reference for 256 tokens on 50 prompts.
+**Step 9: fast decode and bench.** Decode at batch 1 reads every weight once per token, so its speed is the memory bandwidth: GEMV kernels of athanor's own for the matmuls of one token (fused where it pays), split-K attention for a long cache, graph capture so that a token is one launch, sampling on the GPU, and `athanor bench` with a report under `docs/results/` (`docs/BENCHMARKS.md`). Gate (`docs/PLAN.md`): decode tokens/s at least llama.cpp's at batch 1, same model, precision and GPU.
+
+Superseded preview (written in step 7): **Step 8: sequence state and engine.** The forward pass on the GPU: the weights uploaded once, the state of a sequence (KV cache, conv and recurrent state) in device memory, the ops chosen by where the tensors live (the dispatching entry point per op joins `ops.h` with this first caller), and an engine in `src/infer/` that runs prompts and decodes with the GPU forward pass; `athanor chat` on the GPU in bf16. Gate (`docs/PLAN.md`): GPU chat in bf16; greedy output identical to the reference for 256 tokens on 50 prompts.
 
 Superseded preview (written in step 6): **Step 7: GPU ops, one by one.** A CUDA kernel in `src/ops/<op>.cu` for every op of the forward pass (embed, matmul through cuBLASLt with its handle in the backend, the norms, RoPE, activations, attention, the short convolution, the Gated DeltaNet gates and recurrence), each compared with its CPU reference on random and real inputs, as AGENTS.md's op checklist asks. Gate: every kernel matches its CPU reference.
 
@@ -404,3 +448,16 @@ Superseded preview (written in step 1): **Step 2: contract and family loading.**
   - Kernels are compiled with `-fno-threadsafe-statics`, because the launch stubs nvcc writes would otherwise need libstdc++; `.cu` files compile to `.cu.o`, since a kernel file shares its op's name.
   - The GPU kernels are compared with `_ref` on the same inputs, in `test_gpu_ops` (random) and in `test_golden` (every record), with tolerances at least four times the worst error measured; bf16 outputs within one ulp (two where the op rounds an intermediate value). The step 3 tolerances against the reference implementation are unchanged.
   - Core headers that GPU code includes through `ops.h` (`tensor.h`, `threads.h`) carry `extern "C"` guards, like `base.h` and `arena.h`.
+- 2026-11-25: `step7-gpu-ops` merged into `main` (fast-forward) at the maintainer's request, who asked to go on with step 8 and to merge it at its end as well; step 8 started on `step8-engine`.
+- 2026-11-25: step 8 implemented on branch `step8-engine`: `ath_copy_2d` in the backend; `src/ops/dispatch.c`; `ath_exec`, states on a device and the new `forward` signature in `src/model/{model.h,state.c}`; the qwen35 forward pass on both devices; `src/infer/engine.{h,c}`; `athanor chat --device`; `tests/golden/generate.py` and `make golden-generate`; `tests/test_engine.c` and the GPU runs of `tests/test_forward.c`. All acceptance criteria met (table above).
+- 2026-11-25: decisions taken within step 8 (`PLAN.md` unchanged):
+  - `ath_exec` replaces the pool argument of `forward` and `ath_model_forward`: where a pass runs is one value (threads, or a device with the weights' copies and scratch memory), passed explicitly since the code has no globals. A NULL exec is the CPU on the calling thread, as a NULL pool was.
+  - The ops' entry points dispatch on the device the caller gives, not on the tensors' tiers: the forward pass knows where it runs, and every implementation still checks that its tensors are on its side, so a misplaced tensor is an error, never a silent copy.
+  - The device copies of the weights are indexed like `m->params`; the family finds a copy from its param's offset, so the layer table and the binding code stay as they are.
+  - The state of one sequence on a device is in `src/model/state.c` (`ath_state_init_gpu`), next to the host one, so that reset and copy keep one interface for both sides; the step 4 notes had placed the engine's state in `src/infer/state.c`, which keeps paged KV memory and snapshots (steps 13 and 14). `ath_state_reset` returns a status, since on a device it queues work.
+  - Logits stay in host memory and sampling on the host: the GPU pass ends by copying the logits back, its only wait. Sampling on the GPU is step 9.
+  - Hooks see the residual stream where the pass runs, a device tensor on a GPU; a hook copies it back on the compute stream (`test_forward` does).
+  - The engine copies every param the forward pass reads, once, unchanged (bf16), from the memory-mapped checkpoint; ignored params (vision encoder, MTP head) stay on the host. One sequence per batch, as on the CPU.
+  - `athanor chat` runs on the GPU by default when there is one, and falls back to the CPU with a note when the device cannot be used (`--device gpu` fails instead).
+  - The gate is checked with teacher forcing: at each of the 12,800 steps the engine picks its token from the reference's prefix, so steps after a near-tie are checked too. The noise is each prompt's own: the largest over the 50 prompts (1.237, from one prompt; the others 0.17 to 0.62), as the forward records use for their two, would leave a third of the steps unchecked; both are reported, and both give 0 differences. Differences below the noise are allowed and counted; how far the engine generates freely before its first difference is reported.
+  - The reference's generations decode with its cache (as a server does) and do not stop at the end-of-turn token, so both sides have 256 tokens per prompt; at 11 tokens/s on the CPU they take about 20 minutes, so they have their own target, `make golden-generate`.

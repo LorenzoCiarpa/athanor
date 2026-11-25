@@ -4,7 +4,7 @@ Device runtimes. The GPU runtime landed in step 6, for CUDA, written once for NV
 
 | File | Content | Step |
 | --- | --- | --- |
-| `backend.h` | the interface: devices and their properties, device and pinned host memory, copies, memset, three streams per device, events for ordering and timing, the device arena; the matmul library's handle and workspace in `ath_device` (step 7) | 6, 7 |
+| `backend.h` | the interface: devices and their properties, device and pinned host memory, copies, memset, three streams per device, events for ordering and timing, the device arena; the matmul library's handle and workspace in `ath_device` (step 7); `ath_copy_2d`, strided copies (step 8) | 6, 7, 8 |
 | `gpu.cu` | the CUDA implementation (HIP through `compat.h`), in the C subset of CUDA C++ with C linkage; built by `make cuda`; creates the cuBLASLt handle and workspace with the device (step 7) | 6, 7 |
 | `gpu.h` | private to GPU code (`.cu` files): runtime errors mapped to a status (`ath_gpu_fail`, `ATH_GPU_CHECK`), the device made current, its streams, the check after a kernel launch (`ath_gpu_launched`) | 7 |
 | `gpu_none.c` | the same interface in a build without a GPU backend (`make`): no devices, every call `ATH_ERR_UNSUPPORTED` | 6 |
@@ -46,6 +46,7 @@ ATH_CHECK(ath_stream_wait(&d, ATH_STREAM_COMPUTE, &up));   // compute starts aft
 ATH_CHECK(ath_stream_sync(&d, ATH_STREAM_COMPUTE));
 ```
 
+- `ath_copy_2d` (step 8) copies rows of a strided layout in one call: the forward pass gathers the query and gate interleaved in a projection, and q, k, v inside the convolution's output, into contiguous tensors with it.
 - Every copy and memset is asynchronous with respect to the host. Work on one stream runs in order; work on different streams is ordered only by events, never by synchronizing the whole device.
 - **Errors.** Runtime errors become `ATH_ERR_DEVICE` (`ATH_ERR_NOMEM` when memory runs out) with the runtime's message logged, and the runtime's sticky "last error" is cleared, so that the error is not reported again by an unrelated call.
 - **Several devices.** Every call selects the device its handle names first, because the runtime keeps a current device per host thread.

@@ -114,6 +114,45 @@ ATH_FORWARD_DETAIL=1 ./build/test_forward golden     # KL, margin and greedy cho
 
 A `DEBUG=1` build runs the first 4 positions of each prompt (three in one call, one alone) and checks the f32 tolerances; the gate needs every position.
 
+## Engine
+
+Step 8 runs the forward pass on the GPU through the engine (`src/infer/engine.h`). Three checks hold it to the reference.
+
+**The forward records, on the GPU too.** `test_forward`'s `forward_golden` runs its four runs again on the GPU after the CPU ones, and holds them to the same gate and tolerances (Forward pass, above). Measured 2026-11-25:
+
+| Run | Check | CPU | GPU |
+| --- | --- | --- | --- |
+| bf16 | mean KL against the fp32 reference, every position of both prompts; the bf16 reference: 5.0e-4 | 3.0e-4 (ratio 0.60) | 2.4e-4 (ratio 0.49) |
+| bf16 | greedy token against the fp32 reference where the margin exceeds the noise (0.21) | 0 differences of 104 | 0 differences of 104 |
+| f32 | residual stream, every layer (tolerance 2e-4) | 4.7e-5 | 1.5e-5 |
+| f32 | logits (tolerance 1e-4) | 2.7e-5 | 9.4e-6 |
+
+The GPU's f32 run lands closer to the fp32 reference than the CPU's. A likely reason, not measured separately: its sums round less (fused multiply-adds, partial sums added in a tree, as torch's blocked kernels also do), where the CPU references add one term at a time, in order, as their contract asks.
+
+**The gate: greedy generation.** `test_engine`'s `generate_golden` reads `generate.json` (`tests/golden/generate.py`): 50 chat prompts, 256 greedy tokens each from the fp32 reference, the top-2 margin of every step, and each prompt's bf16 noise (the largest change of that margin in the bf16 reference). The engine runs each prompt in bf16 and, at every step, picks its own token and is then fed the reference's (teacher forcing), so every one of the 12,800 steps is checked, also after a near-tie. Where the margin exceeds the prompt's noise the two tokens must be equal: rounding alone cannot flip a choice there, so a difference would be an error. (The largest noise over all prompts, as the forward records use for their two, would check fewer steps: one prompt's noise is 1.237, the others' 0.17 to 0.62. It is reported too.) Below it they may differ, and the report counts how often. As long as the choices agree, teacher forcing is generation, so the report also gives how many tokens the engine generates exactly as the reference before its first difference.
+
+Measured 2026-11-25 (RTX 5080, bf16; reference: transformers 5.24.0, fp32, eager attention):
+
+| Check | Result |
+| --- | --- |
+| steps whose margin exceeds the prompt's noise (the gate) | 11,445 of 12,800; the engine's token differs at **0** |
+| steps below the noise | 1,355; the engine's token differs at 78 |
+| the same with the largest noise of all prompts (1.237; the others 0.17 to 0.62) | 8,352 steps above it; 0 differ |
+| free-running generation | 15 of 50 prompts equal the reference for all 256 tokens; 6,572 of 12,800 tokens equal before each prompt's first difference |
+| the bf16 noise per prompt | 0.171 to 0.619, and 1.237 for one prompt |
+
+The first difference of a prompt is always at a near-tie, and the 0.8B model meets near-ties often: several prompts part at their first or second token (the Italian letter at token 0, where the reference's top-2 margin is 0.023; the C linked list at token 1, margin 0.017), others agree for all 256. Every prompt's run takes about a second (282 tokens/s decoding, for the record), the 50 about 55 s.
+
+**Pieces and devices.** `test_engine` on tiny random checkpoints: the weights on the device byte for byte, states on the device (reset, copy, a pass refused on the other side), and 12 tokens at once, as 5 + 1 + 6 and one at a time on the GPU in f32, against each other (at most 1e-5; measured: the same bits) and against the CPU (at most 1e-4, the tiny model being ill-conditioned; measured 9.8e-6).
+
+```
+./build/cuda/test_engine generate                            # the gate only
+ATH_GENERATE_DETAIL=1 ./build/cuda/test_engine generate      # equal tokens per prompt
+ATH_GENERATE_PROMPTS=5 ATH_GENERATE_STEPS=32 ./build/cuda/test_engine generate
+```
+
+A `DEBUG=1` build runs 2 prompts of 8 steps.
+
 ## Text
 
 `tests/golden/text.py` records, with the pinned reference (transformers 5.24.0, tokenizers 0.23.3), what `test_text` compares exactly:
@@ -148,7 +187,8 @@ Synthetic files (safetensors shards, indexes, broken headers) are written by the
 | `test_model.c` | role names and the registry; qwen35 config parsing (dense, MoE, text-only, schedule fallback, 20 rejected configs); binding of tiny synthetic checkpoints (dense, MoE with fused experts, text-only) and every failure mode (missing, unexpected, misshaped, integer dtype, tie mismatches); the real checkpoint (coverage, schedule against `layer_types`, residual writers) |
 | `test_ops.c` | every `_ref` function of `src/ops/` on hand-computed cases (bf16 rounding, norms, RoPE pairing and relative positions, attention averaging and head grouping, conv taps, the delta rule step by step, gates around the softplus threshold) and on exact properties: streaming equals all at once for conv and Gated DeltaNet, decode equals the last prefill row for attention, causality, argument checks; `ath_matmul_fast` bit for bit against `ath_matmul_ref` (7 shapes × 8 dtype combinations, without and with threads) |
 | `test_golden.c` | every op the reference computes on Qwen3.5-0.8B (24 layers, prefill and decode, 906 records), replayed through the `_ref` functions on the real weights, native and exact (above); every matmul record also through `ath_matmul_fast` on 8 threads, required bit-identical to `ath_matmul_ref`; with a GPU, every record also through the GPU kernel, against `_ref` (GPU kernels) |
-| `test_forward.c` | the forward pass through the contract: state specs and sizes, argument checks, hooks, all at once = in pieces = token by token on tiny random checkpoints; the real checkpoint against the forward records (above) |
+| `test_forward.c` | the forward pass through the contract: state specs and sizes, argument checks, hooks, all at once = in pieces = token by token on tiny random checkpoints; the real checkpoint against the forward records (above), on the CPU and, with a GPU, on the GPU through the engine (Engine) |
 | `test_gpu_ops.c` | every GPU kernel against its `_ref` on random inputs (GPU kernels, above): three dtype configurations, odd shapes, a misaligned matmul operand, the matmul's two paths, pieces equal all at once bit for bit, argument checks and the kernels' limits. In the CPU build only the argument checks run |
-| `test_backend.c` | the GPU runtime (`src/backend/backend.h`). In the CPU build: the stub refuses everything cleanly, the GPU tests are skipped. In the CUDA build, on device 0: properties, copies in every direction at odd sizes and offsets from pinned and ordinary memory, memset, three streams ordered only by events (8 rounds overwriting each other's buffers), event timing with a sanity range, an allocation larger than the device, the device arena; every byte checked |
+| `test_engine.c` | the model on a GPU (Engine, above): in the CPU build, that the engine needs a GPU; on the GPU, the weights the engine copies, states on the device, sequences in pieces against each other and the CPU, and the gate, greedy generation on 50 prompts of 256 tokens against the fp32 reference |
+| `test_backend.c` | the GPU runtime (`src/backend/backend.h`). In the CPU build: the stub refuses everything cleanly, the GPU tests are skipped. In the CUDA build, on device 0: properties, copies in every direction at odd sizes and offsets from pinned and ordinary memory, memset, three streams ordered only by events (8 rounds overwriting each other's buffers), event timing with a sanity range, an allocation larger than the device, the device arena, a strided 2D copy (step 8); every byte checked |
 | `test_text.c` | text, through the contract only: UTF-8, character classes, NFC, the Python-style JSON writer, pre-tokenization pieces, the output parser (17 fixtures, each also split at every byte and fed byte by byte), template errors, sampling (hand-computed cases and a distribution with a fixed seed); against the text golden data (below): the corpus, the templates, the greedy chat generation |

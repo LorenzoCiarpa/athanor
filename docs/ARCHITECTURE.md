@@ -89,7 +89,10 @@ typedef struct {
     void             *family_data;             /* family-private, opaque to pipelines   */
 } ath_model;
 
-typedef struct { ath_dtype act; int32_t capacity, n_past; void **buf; } ath_state;   /* one sequence */
+typedef struct { ath_dtype act; int32_t capacity, n_past; void **buf;
+                 const ath_device *dev; } ath_state;   /* one sequence; dev NULL: host memory */
+typedef struct { ath_pool *pool; const ath_device *dev;      /* where a forward pass runs (step 8) */
+                 const ath_tensor *weights; ath_dev_arena *scratch; } ath_exec;
 typedef struct { const int32_t *tokens; int32_t n_tokens; ath_tensor *logits; } ath_batch;
 typedef struct {
     void (*on_residual)(void *u, int32_t layer, const ath_tensor *x);   /* stream entering a layer */
@@ -125,7 +128,7 @@ struct ath_family {
     bool        (*match)  (const ath_json *config);
     ath_status  (*load)   (ath_model *m, ath_arena *a);      /* reads m->config, m->ckpt */
     ath_status  (*forward)(const ath_model *m, const ath_batch *b, ath_state *s,
-                           const ath_hooks *h, ath_arena *scratch, ath_pool *pool);
+                           const ath_hooks *h, ath_arena *scratch, const ath_exec *x);
     const char  *pretokenize_regex;                          /* the tokenizer.json Split regex it implements */
     ath_status  (*pretokenize)(const char *text, size_t n, ath_spans *out);
     ath_status  (*chat) (const ath_msg *msgs, int32_t n_msgs, const ath_tool_def *tools, int32_t n_tools,
@@ -139,10 +142,12 @@ ath_status ath_model_open(ath_model *m, ath_arena *a, const char *dir);
 void       ath_model_close(ath_model *m);
 ath_status ath_state_bytes(const ath_model *m, ath_dtype act, int32_t capacity, size_t *bytes);
 ath_status ath_state_init(ath_state *s, const ath_model *m, ath_dtype act, int32_t capacity, ath_arena *a);
-void       ath_state_reset(ath_state *s, const ath_model *m);
+ath_status ath_state_init_gpu(ath_state *s, const ath_model *m, ath_dtype act, int32_t capacity,
+                              const ath_device *d, ath_dev_arena *mem, ath_arena *a);
+ath_status ath_state_reset(ath_state *s, const ath_model *m);
 ath_status ath_state_copy(ath_state *dst, const ath_state *src, const ath_model *m);
 ath_status ath_model_forward(const ath_model *m, const ath_batch *b, ath_state *s,
-                             const ath_hooks *h, ath_arena *scratch, ath_pool *pool);
+                             const ath_hooks *h, ath_arena *scratch, const ath_exec *x);
 ath_status ath_model_tokenizer(const ath_model *m, const char *dir, ath_tokenizer *t, ath_arena *a);
 ath_status ath_model_chat(const ath_model *m, const ath_msg *msgs, int32_t n_msgs,
                           const ath_tool_def *tools, int32_t n_tools, uint32_t opts, ath_buf *out);
@@ -168,6 +173,8 @@ Since CHANGE-001 (2026-11-24) every checkpoint tensor is a param. Tensors the te
 
 Step 4 departs from the first design of the state in three places. A spec counts elements, not bytes, because the element type depends on the activation dtype the state is created with (bf16, as the reference runs, or f32 for an exact forward pass); the kind fixes the rest (KV and conv state hold activations, the recurrent state is fp32). `forward` takes the model as `const` and a scratch arena for its working tensors, which the contract releases after every call. A batch is one sequence; batches of several sequences arrive with the engine (step 8). Since task 4.7, `forward` also takes the caller's thread pool (`ath_pool`, `src/core/threads.h`; NULL runs on the calling thread). It is passed explicitly because the code has no globals. The CPU matmuls spread over it with the same bits as on one thread.
 
+Step 8 put the forward pass on the GPU without a second composition. The pool became one member of `ath_exec`, which says where a pass runs: on the CPU (`pool`, or a NULL exec), or on a device (`dev`), with a device copy of every param the pass reads (`weights`, indexed like `m->params`) and device working memory (`scratch`). A state lives where its pass runs (`ath_state.dev`; `ath_state_init_gpu`), and `ath_model_forward` refuses a pass on one side over a state on the other. The family's `forward` calls the ops' entry points (`ath_<op>(d, ...)`, `src/ops/dispatch.c`), which run the reference ops on the CPU or the kernels on the device, so `src/models/qwen35/forward.c` is one composition for both. On a GPU the logits still land in host memory, ready when the call returns; hooks see device tensors there. `ath_state_reset` now returns a status, since on a device it queues work. The engine (`src/infer/engine.h`) builds the GPU exec: it opens the device and copies the params once.
+
 ### Text
 
 The text members joined the contract in step 5, as CHANGE-001 (2026-11-24) specified them, with the details step 5 settled. `ath_spans` and `ath_tokenizer` are the generic byte-level BPE engine of `src/text/bpe.h`; `ath_buf` is a growable buffer in an arena (`src/core/buf.h`).
@@ -179,7 +186,7 @@ The text members joined the contract in step 5, as CHANGE-001 (2026-11-24) speci
 
 ### State and the forward pass
 
-A model lists the state one sequence needs as specs: for Qwen3.5, a KV cache per attention layer and a conv state plus a recurrent state per Gated DeltaNet layer. `ath_state_init` allocates one buffer per spec in host memory and `ath_state_reset` starts a new sequence; a pipeline never needs to know which layer types produced the specs. `ath_model_forward` is the only way into a family's `forward`: it checks the batch (token ids in the vocabulary, room in the state, logits f32 `[n_tokens, vocab]` or `[1, vocab]`), runs the family's forward at positions `n_past …`, releases the scratch memory and advances `n_past`. Prefill, a prompt in pieces and decode take the same path, and give the same logits and state bit for bit (`tests/test_forward.c`). `on_residual` sees the residual stream entering every layer and the final norm; abliteration will capture it, and the forward tests compare it with the reference.
+A model lists the state one sequence needs as specs: for Qwen3.5, a KV cache per attention layer and a conv state plus a recurrent state per Gated DeltaNet layer. `ath_state_init` allocates one buffer per spec in host memory and `ath_state_reset` starts a new sequence; a pipeline never needs to know which layer types produced the specs. `ath_model_forward` is the only way into a family's `forward`: it checks the batch (token ids in the vocabulary, room in the state, logits f32 `[n_tokens, vocab]` or `[1, vocab]` in host memory) and that the pass runs where the state is, runs the family's forward at positions `n_past …`, releases the scratch memory (host and device) and advances `n_past`. Prefill, a prompt in pieces and decode take the same path, and give the same logits and state bit for bit on the CPU (`tests/test_forward.c`); on the GPU the same holds for every kernel of athanor, while cuBLASLt may choose another algorithm for another number of rows (`tests/test_engine.c` measures it: the same bits on the tiny model, within 1e-5 required). `on_residual` sees the residual stream entering every layer and the final norm; abliteration will capture it, and the forward tests compare it with the reference.
 
 ### Loading and the coverage rule
 
@@ -196,7 +203,7 @@ The family list is compiled in from the Makefile: `FAMILIES=qwen35` generates `b
 | ablit | `on_residual` to capture activations; every param with `ATH_P_WRITES_RESIDUAL` is orthogonalized; `ATH_P_UNUSED` params exported unchanged |
 | train | `backward`; LoRA targets by `role`; hot/cold blocks by `layer`; `ATH_P_UNUSED` params frozen and never loaded |
 | net | `chat` with the request's tool definitions to render the prompt; `parse` to turn the output into text, thinking and tool-call events, which `api.c` converts to OpenAI and Anthropic formats |
-| `athanor chat` (step 5) | `ath_model_tokenizer`, `ath_model_chat`, `ath_model_forward`, `ath_sample_ref`, `ath_model_parse`; `ath_state_copy` to resume a conversation |
+| `athanor chat` (step 5) | `ath_model_tokenizer`, `ath_model_chat`, `ath_model_forward`, `ath_sample_ref`, `ath_model_parse`; `ath_state_copy` to resume a conversation; the engine's exec and states on the GPU (step 8) |
 
 ## Common versus family-specific
 
@@ -234,19 +241,19 @@ athanor/
 │   ├── backend/   backend.h compat.h gpu.cu gpu_none.c devarena.c (step 6), gpu.h (step 7), cpu.c (later)
 │   ├── ops/       ops.h, check.h (private); per op a .c reference and a .cu kernel:
 │   │              embed matmul norm rope act attn conv gdn (step 3, kernels step 7), sample (step 5), moe quant;
-│   │              launch.h kernel.cuh gpu_none.c (private, step 7)
+│   │              launch.h kernel.cuh gpu_none.c (private, step 7); dispatch.c (step 8)
 │   ├── text/      bpe.c unicode.c, unicode_tables.h (generated, committed)
 │   ├── model/     model.h registry.c state.c text.c
 │   ├── models/
 │   │   └── qwen35/  qwen35.h family.c config.c weights.c forward.c text.c [backward.c] [fused.cu]
-│   ├── infer/     engine.c state.c sched.c tier.c spec.c
+│   ├── infer/     engine.h engine.c (step 8), state.c sched.c tier.c spec.c (later)
 │   ├── quant/     formats.c rtn.c gptq.c awq.c recipe.c container.c gguf.c eval.c
 │   ├── ablit/     capture.c direction.c edit.c search.c eval.c
 │   ├── train/     loop.c optim.c lora.c hotcold.c data.c planner.c ckpt.c
 │   └── net/       http.c api.c
 ├── tools/         athanor.c (dispatch), one file per subcommand (inspect.c, chat.c, devices.c, ...), dev/ (development helpers)
 ├── tests/         test.h (runner) util.h tiny.h test_core.c test_model.c test_ops.c test_golden.c test_forward.c
-│                  test_text.c test_backend.c test_gpu_ops.c ...; golden/ (dump.py, text.py, requirements.txt; data/ not committed)
+│                  test_text.c test_backend.c test_gpu_ops.c test_engine.c ...; golden/ (dump.py, text.py, generate.py, requirements.txt; data/ not committed)
 └── docs/          ARCHITECTURE.md PLAN.md STATUS.md status_extended.md MODELS.md BENCHMARKS.md
                    CHANGE-*.md (specification changes, applied as recorded in STATUS.md)
                    contract/ program/ proposals/ results/

@@ -9,7 +9,7 @@ It follows the thesis of [DwarfStar](https://github.com/antirez/ds4), [Strata](h
 
 ## Status
 
-Pre-alpha. Steps 1 to 5 done: the core library and `athanor inspect` read a checkpoint without copying it, the model contract binds every tensor, the whole Qwen3.5-0.8B forward pass runs on the CPU, checked against the reference implementation, and `athanor chat` talks to it on the CPU, with the reference's tokenizer and chat template reproduced exactly, thinking and tool calls included. Live status: [docs/STATUS.md](docs/STATUS.md).
+Pre-alpha. Steps 1 to 8 done: the core library and `athanor inspect` read a checkpoint without copying it, the model contract binds every tensor, the whole Qwen3.5-0.8B forward pass runs on the CPU, checked against the reference implementation, and `athanor chat` talks to it, with the reference's tokenizer and chat template reproduced exactly, thinking and tool calls included. Since steps 6 to 8 the same forward pass runs on an NVIDIA GPU (`make cuda`), every kernel checked against its CPU reference, and `athanor chat` uses it by default; making it fast is step 9. Live status: [docs/STATUS.md](docs/STATUS.md).
 
 ## What it does
 
@@ -52,9 +52,9 @@ Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ```
 make            # CPU build
-make cuda       # NVIDIA, default arch sm_120
-make hip        # AMD, default arch gfx1201
-make test
+make cuda       # NVIDIA, default arch sm_120 (CUDA_HOME: a CUDA 12.8+ toolkit)
+make hip        # AMD, default arch gfx1201 (step 11)
+make test       # or make cuda test
 ```
 
 Linux first. Requirements: a C11 compiler; CUDA toolkit or ROCm for GPU builds. Python is used only by contributors to generate golden test data, never at runtime.

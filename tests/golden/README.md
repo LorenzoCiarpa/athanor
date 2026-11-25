@@ -6,9 +6,10 @@ Golden data: what the pinned reference implementation computes, op by op and for
 | --- | --- |
 | `dump.py` | runs the reference and writes the golden data of the ops and the forward pass |
 | `text.py` | the text golden data: tokenizer corpus, chat template renderings, a greedy chat generation (`tests/README.md`, Text) |
+| `generate.py` | the generations of the step 8 gate: 50 chat prompts, 256 greedy tokens each by the fp32 reference with its KV and recurrent cache, the top-2 margin of every step and the bf16 noise of each prompt (`tests/README.md`, Engine) |
 | `requirements.in` | the two pinned packages (transformers 5.24.0, torch 2.15.0 CPU build) |
 | `requirements.txt` | the full lock, compiled from `requirements.in` with uv |
-| `data/<model>/` | `manifest.json` and `golden.safetensors` (`dump.py`), `text.json` and `text.safetensors` (`text.py`); ignored by git, regenerated locally |
+| `data/<model>/` | `manifest.json` and `golden.safetensors` (`dump.py`), `text.json` and `text.safetensors` (`text.py`), `generate.json` (`generate.py`); ignored by git, regenerated locally |
 
 ## Making the data
 
@@ -16,10 +17,11 @@ Golden data: what the pinned reference implementation computes, op by op and for
 uv venv --python 3.14 tests/golden/.venv
 VIRTUAL_ENV=tests/golden/.venv uv pip install -r tests/golden/requirements.txt --index-strategy unsafe-best-match
 make golden                       # dump.py, then text.py, on models/Qwen3.5-0.8B
-make test                         # test_golden, test_forward and test_text use it; skipped while data/ is missing
+make golden-generate              # generate.py: about 20 minutes on 8 threads
+make test                         # test_golden, test_forward, test_text and test_engine use it; skipped while data/ is missing
 ```
 
-`dump.py` refuses to run unless transformers is 5.24.0, torch is 2.15.0+cpu, `modeling_qwen3_5.py` has the sha256 recorded in `docs/contract/qwen35-0.8b.md`, and none of `fla`, `causal_conv1d`, `kernels` is installed (any of them would replace the torch functions with fused kernels). It takes about 9 seconds and writes 620 MiB for Qwen3.5-0.8B (434 MiB of op records, the rest forward records); the numbers are reproducible run to run (one CPU thread). `text.py` takes about 35 seconds and writes 163 MiB: the token ids of the corpus (most of it the sweep over every code point), the rendered prompts, and a generation that runs the fp32 and bf16 reference; it uses `dump.py`'s environment checks and its loading of the reference (`check_text_path`, `restore_f32`).
+`dump.py` refuses to run unless transformers is 5.24.0, torch is 2.15.0+cpu, `modeling_qwen3_5.py` has the sha256 recorded in `docs/contract/qwen35-0.8b.md`, and none of `fla`, `causal_conv1d`, `kernels` is installed (any of them would replace the torch functions with fused kernels). It takes about 9 seconds and writes 620 MiB for Qwen3.5-0.8B (434 MiB of op records, the rest forward records); the numbers are reproducible run to run (one CPU thread). `text.py` takes about 35 seconds and writes 163 MiB: the token ids of the corpus (most of it the sweep over every code point), the rendered prompts, and a generation that runs the fp32 and bf16 reference; it uses `dump.py`'s environment checks and its loading of the reference (`check_text_path`, `restore_f32`). `generate.py` (step 8) has its own target because it takes about 20 minutes: 12,800 decode steps of the fp32 reference on the CPU (8 threads, about 11 tokens/s; the reference's Gated DeltaNet and convolution run their torch fallbacks), then one bf16 pass over each prompt's tokens; it writes `generate.json` (about 0.5 MiB). Decoding does not stop at the end-of-turn token, so every prompt has 256 tokens on both sides.
 
 ## What is recorded
 

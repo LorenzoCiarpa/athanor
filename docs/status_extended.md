@@ -19,6 +19,7 @@ How to read it:
   - [Step 5: tokenizer, sampling, CPU chat](#step-5-tokenizer-sampling-cpu-chat)
   - [Step 6: GPU backend](#step-6-gpu-backend)
   - [Step 7: GPU ops, one by one](#step-7-gpu-ops-one-by-one)
+  - [Step 8: sequence state and engine](#step-8-sequence-state-and-engine)
 - [Files by step](#files-by-step)
 
 ---
@@ -962,69 +963,158 @@ Commit `4dcf563`.
 
 ---
 
+### Step 8: sequence state and engine
+
+Branch `step8-engine`, from `main` after step 7 was merged. The gate of `docs/PLAN.md`: a GPU chat in bf16, and greedy output identical to the reference for 256 tokens on 50 prompts, read as the step 4 and 5 gates read it (where the reference's top-2 margin exceeds the bf16 noise).
+
+#### 8.1 Strided copies
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `src/backend/backend.h`, `gpu.cu`, `gpu_none.c`, `compat.h` | Changed | `ath_copy_2d` (`cudaMemcpy2DAsync`; `hipMemcpy2DAsync`) |
+| `tests/test_backend.c` | Changed | A gather of columns on the device and a scatter into wider host rows, byte for byte; a pitch smaller than the width refused |
+
+#### 8.2 Op entry points
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `src/ops/ops.h` | Changed | `ath_<op>(d, ...)` for the 13 ops |
+| `src/ops/dispatch.c` | New | The op on device d (`_gpu`) or on the CPU (`_ref`, `ath_matmul_fast`) |
+
+#### 8.3 The contract on two devices
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `src/model/model.h` | Changed | `ath_exec` (pool, device, the params' device copies, device scratch); `ath_state.dev`; `ath_state_init_gpu`; `ath_state_reset` returns a status; `forward` and `ath_model_forward` take `const ath_exec *` instead of `ath_pool *`; hooks may see device tensors; includes `backend/backend.h` |
+| `src/model/state.c` | Changed | States on a device (buffers from a device arena), reset and copy queued on its compute stream; `ath_model_forward` checks that the pass runs where the state is and releases the device scratch memory |
+
+What was implemented:
+
+- **One composition, two devices.** The pool became a member of `ath_exec`, which says where a pass runs. A family reads a weight through its param, so the copies on the device are indexed like `m->params`: the forward pass finds a weight's copy from the param's offset in that array, without a second layer table.
+
+#### 8.4 The forward pass on both devices
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `src/models/qwen35/forward.c` | Changed | The ops' entry points instead of `_ref` and `ath_matmul_fast`; working tensors from the host or the device scratch arena; `W()` for a param's tensor where the pass reads it; `copy_cols` with `ath_copy_2d` on a GPU; token ids and positions copied to the device; logits copied back and the stream synchronized at the end |
+| `src/models/qwen35/qwen35.h` | Changed | The new `forward` signature |
+
+The CPU pass is unchanged: the entry points call the same functions with the same arguments, and every CPU number of `test_forward` and `test_text` is the same.
+
+#### 8.5 The engine
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `src/infer/engine.h`, `engine.c` | New | `ath_engine_open` (the device, every used param copied once, the exec), `ath_engine_state`, `ath_engine_close` |
+| `Makefile` | Changed | `src/infer/*.c` in the library; `test_engine`; `golden-generate` |
+
+#### 8.6 `athanor chat` on the GPU
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `tools/chat.c` | Changed | `--device cpu\|gpu` (the GPU by default when there is one, the CPU as fallback); the engine's exec and states; `ath_state_reset` checked |
+
+#### 8.7 Golden generations
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `tests/golden/generate.py` | New | 50 chat prompts (topics, languages, code, system prompts, multi-turn, thinking), 256 greedy tokens each by the fp32 reference with its cache, the top-2 margins, and the bf16 noise of each prompt from one bf16 pass over the same tokens |
+
+What was found while making it:
+
+- **The reference decodes at 11 tokens/s** on 8 CPU threads (0.8 while the CPU was busy with the debug test suites): its Gated DeltaNet and convolution run torch fallbacks. The 12,800 steps take about 20 minutes, hence a separate make target.
+
+#### 8.8 Tests
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `tests/test_engine.c` | New | The engine without a GPU; the weights on the device byte for byte; states on the device (reset, copy, the side a pass runs on); a sequence at once, in pieces and token by token against itself and the CPU; the gate on 50 prompts |
+| `tests/test_forward.c` | Changed | `forward_golden` runs its four runs on the GPU too, through the engine, held to the same gate and tolerances; hooks copy device tensors back |
+| `tests/test_text.c` | Changed | The new `ath_model_forward` signature |
+
+What was found while testing:
+
+- **The gate's noise.** The bf16 noise of the 50 prompts ranges from 0.17 to 0.62, with one prompt at 1.24. The largest over all prompts, the rule of the forward records, would check 8,352 of the 12,800 steps; each prompt's own noise checks 11,445. The gate uses the prompt's own, and reports the other: 0 differences either way.
+- **On the tiny model the GPU gives the same bits** all at once, in pieces and token by token (cuBLASLt chose the same algorithm for every row count there), and differs from the CPU by 9.8e-6 in f32.
+
+#### 8.9 Documentation
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `docs/STATUS.md` | Changed | Step 8 current and done, step 7 completed and merged, step 9 preview, log |
+| `docs/ARCHITECTURE.md` | Changed | `ath_exec`, states on a device, the new signatures, why; the tree |
+| `src/model/README.md`, `src/models/qwen35/README.md`, `src/infer/README.md`, `src/ops/README.md`, `src/backend/README.md`, `tools/README.md`, `tests/README.md`, `tests/golden/README.md` | Changed | Running on a GPU; the forward pass on both devices; the engine; the entry points; `ath_copy_2d`; `chat --device`; the Engine section; `generate.py` |
+| `docs/program/PROGRAM.md`, `README.md` | Changed | Row 9; the status paragraph and the build commands |
+
+---
+
 ## Files by step
 
 Every file of the repository and the steps that created or changed it (documentation-only edits included).
 
-| File | Step 1 | Step 2 | Step 3 | Step 4 | Step 5 | Step 6 | Step 7 |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| `Makefile` | 1.1, 1.8 | 2.3, 2.6 | 3.3, 3.4, 3.5, 3.6 | 4.5 | 5.1, 5.3, 5.8 | 6.1 | 7.1 |
-| `src/core/base.{h,c}` | 1.2 | | | | | 6.2 |  |
-| `src/core/arena.{h,c}` | 1.3 | | | | | 6.2 (`arena.h`) |  |
-| `src/core/file.{h,c}` | 1.4, 1.7 | | | | | |  |
-| `src/core/json.{h,c}` | 1.5 | | | | 5.4 | |  |
-| `src/core/tensor.{h,c}` | 1.6 | | 3.2 | | | | 7.2 (`tensor.h`) |
-| `src/core/safetensors.{h,c}` | 1.7 | | | | | |  |
-| `src/core/threads.{h,c}` | | | | 4.7 | | | 7.2 (`threads.h`) |
-| `src/model/model.h` | | 2.2 | | 4.2, 4.7, 4.8 | 5.4 | |  |
-| `src/model/registry.c` | | 2.3 | | 4.8 | | |  |
-| `src/model/state.c` | | | | 4.2, 4.7 | 5.4 | |  |
-| `src/models/qwen35/qwen35.h`, `config.c` | | 2.4 | | 4.3, 4.7, 4.8 (`qwen35.h`) | 5.5 (`qwen35.h`) | |  |
-| `src/models/qwen35/weights.c`, `family.c` | | 2.5 | | 4.3, 4.8 (`weights.c`) | 5.5 (`family.c`) | |  |
-| `src/models/qwen35/forward.c` | | | | 4.3, 4.7 | | |  |
-| `src/ops/ops.h`, `check.h`, `embed.c`, `matmul.c`, `norm.c`, `rope.c`, `act.c`, `attn.c`, `conv.c`, `gdn.c` | | | 3.3 | 4.7 (`ops.h`, `matmul.c`) | 5.6 (`ops.h`) | | 7.2 |
-| `tools/athanor.c`, `commands.h` | 1.8 | | | | 5.7 | 6.6 |  |
-| `tools/inspect.c` | 1.8 | 2.6 | | 4.8 | | |  |
-| `tools/dev/alloc_trace.c` | 1.8 | | | | | |  |
-| `tools/dev/check_alloc.sh` | 1.8 | 2.6 | | | | |  |
-| `tests/test.h` | 1.9 | | | | | |  |
-| `tests/test_core.c` | 1.9 | 2.7 | | 4.7 | | |  |
-| `tests/util.h`, `tests/test_model.c` | | 2.7 | | 4.5, 4.8 (`test_model.c`) | | |  |
-| `tests/test_ops.c` | | | 3.5 | 4.7 | | |  |
-| `tests/test_golden.c` | | | 3.6 | 4.7 | | | 7.5 |
-| `tests/tiny.h`, `tests/test_forward.c` | | | | 4.5, 4.7 (`test_forward.c`) | | |  |
-| `tests/golden/dump.py`, `README.md` | | | 3.4 | 4.4, 4.8 | 5.9 (`README.md`) | |  |
-| `tests/golden/requirements.in`, `requirements.txt` | | | 3.1 | | | |  |
-| `src/core/buf.{h,c}`, `src/core/rng.{h,c}` | | | | | 5.4 | |  |
-| `src/text/unicode.{h,c}`, `unicode_tables.h` | | | | | 5.2 | |  |
-| `src/text/bpe.{h,c}` | | | | | 5.3 | |  |
-| `src/model/text.c` | | | | | 5.4 | |  |
-| `src/models/qwen35/text.c` | | | | | 5.5 | |  |
-| `src/ops/sample.c` | | | | | 5.6 | | 7.2 |
-| `tools/chat.c` | | | | | 5.7 | |  |
-| `tools/dev/gen_unicode.py` | | | | | 5.2 | |  |
-| `tests/test_text.c` | | | | | 5.8 | |  |
-| `tests/golden/text.py` | | | | | 5.1 | |  |
-| `src/backend/backend.h`, `gpu.cu`, `gpu_none.c`, `compat.h`, `devarena.c` | | | | | | 6.2 to 6.5 | 7.1 (`backend.h`, `gpu.cu`, `compat.h`) |
-| `tools/devices.c` | | | | | | 6.6 |  |
-| `tools/dev/check_nvcc.sh` | | | | | | 6.1 | 7.1 |
-| `tests/test_backend.c` | | | | | | 6.7 |  |
-| `src/backend/gpu.h` | | | | | | | 7.1 |
-| `src/ops/launch.h`, `gpu_none.c` | | | | | | | 7.2 |
-| `src/ops/kernel.cuh`, `embed.cu`, `matmul.cu`, `norm.cu`, `rope.cu`, `act.cu`, `attn.cu`, `conv.cu`, `gdn.cu` | | | | | | | 7.3 |
-| `tests/test_gpu_ops.c` | | | | | | | 7.4 |
-| `docs/proposals/chat-state-at-last-query.md`, `chat-shadow-sequence.md` | | | | | | 6.8 |  |
-| `CLAUDE.md` | | | | | | 6.8 |  |
-| `docs/contract/qwen35-0.8b.md` | closing | 2.1 | 3.1, 3.7 | 4.6, 4.8 | 5.9 | |  |
-| `docs/contract/qwen35-35b-a3b.md` | | 2.1 | | 4.8 | | |  |
-| `docs/MODELS.md` | | 2.1 | 3.7 | 4.6, 4.8 | | |  |
-| `docs/ARCHITECTURE.md` | closing | 2.2 | 3.7 | 4.6, 4.7, 4.8 | 5.9 | 6.8 | 7.6 |
-| `docs/PLAN.md` | | | | 4.8 | | |  |
-| `docs/STATUS.md` | closing | 2.1 to 2.7, closing | 3.1, closing | 4.1, closing, 4.7, 4.8 | 5.1 to 5.9, closing | 6.1 to 6.8 | 7.1 to 7.6 |
-| `docs/program/PROGRAM.md` | closing | closing | 3.7 | 4.6, 4.7, 4.8 | 5.9 | 6.8 | 7.6 |
-| `docs/proposals/cpu-matmul-avx512.md` | | | | 4.7 | | |  |
-| `docs/CHANGE-001-scope-tools-cache.md` | | | | 4.8 | | |  |
-| `docs/status_extended.md` | | | closing | 4.6, 4.7, 4.8 | 5.9 | 6.8 | 7.6 |
-| `AGENTS.md` | | 2.3 | 3.7 | 4.8 | | |  |
-| `README.md` | closing | | | 4.8 | 5.9 | |  |
-| module READMEs | closing (`src/core`, `tests`, `tools`) | 2.2, 2.5, 2.6, 2.7 (`src/model`, `src/models/qwen35`, `tools`, `tests`) | 3.2, 3.3, 3.6, 3.7 (`src/core`, `src/ops`, `tests`, `tests/golden`, `src/backend`) | 4.6 (`src/model`, `src/models/qwen35`, `tests`, `tests/golden`); 4.7 (`src/core`, `src/ops`, `src/backend`, `src/model`, `src/models/qwen35`, `tests`); 4.8 (`src/model`, `src/models/qwen35`, `src/net`, `src/infer`, `src/text`, `tools`) | 5.9 (`src/core`, `src/text`, `src/ops`, `src/model`, `src/models/qwen35`, `tools`, `tests`) | 6.8 (`src/backend`, `src/core`, `tools`, `tests`) | 7.6 (`src/ops`, `src/backend`, `tests`, `src/core`) |
+| File | Step 1 | Step 2 | Step 3 | Step 4 | Step 5 | Step 6 | Step 7 | Step 8 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `Makefile` | 1.1, 1.8 | 2.3, 2.6 | 3.3, 3.4, 3.5, 3.6 | 4.5 | 5.1, 5.3, 5.8 | 6.1 | 7.1 | 8.5 |
+| `src/core/base.{h,c}` | 1.2 | | | | | 6.2 |  |  |
+| `src/core/arena.{h,c}` | 1.3 | | | | | 6.2 (`arena.h`) |  |  |
+| `src/core/file.{h,c}` | 1.4, 1.7 | | | | | |  |  |
+| `src/core/json.{h,c}` | 1.5 | | | | 5.4 | |  |  |
+| `src/core/tensor.{h,c}` | 1.6 | | 3.2 | | | | 7.2 (`tensor.h`) |  |
+| `src/core/safetensors.{h,c}` | 1.7 | | | | | |  |  |
+| `src/core/threads.{h,c}` | | | | 4.7 | | | 7.2 (`threads.h`) |  |
+| `src/model/model.h` | | 2.2 | | 4.2, 4.7, 4.8 | 5.4 | |  | 8.3 |
+| `src/model/registry.c` | | 2.3 | | 4.8 | | |  |  |
+| `src/model/state.c` | | | | 4.2, 4.7 | 5.4 | |  | 8.3 |
+| `src/models/qwen35/qwen35.h`, `config.c` | | 2.4 | | 4.3, 4.7, 4.8 (`qwen35.h`) | 5.5 (`qwen35.h`) | |  | 8.4 (`qwen35.h`) |
+| `src/models/qwen35/weights.c`, `family.c` | | 2.5 | | 4.3, 4.8 (`weights.c`) | 5.5 (`family.c`) | |  |  |
+| `src/models/qwen35/forward.c` | | | | 4.3, 4.7 | | |  | 8.4 |
+| `src/ops/ops.h`, `check.h`, `embed.c`, `matmul.c`, `norm.c`, `rope.c`, `act.c`, `attn.c`, `conv.c`, `gdn.c` | | | 3.3 | 4.7 (`ops.h`, `matmul.c`) | 5.6 (`ops.h`) | | 7.2 | 8.2 (`ops.h`) |
+| `tools/athanor.c`, `commands.h` | 1.8 | | | | 5.7 | 6.6 |  |  |
+| `tools/inspect.c` | 1.8 | 2.6 | | 4.8 | | |  |  |
+| `tools/dev/alloc_trace.c` | 1.8 | | | | | |  |  |
+| `tools/dev/check_alloc.sh` | 1.8 | 2.6 | | | | |  |  |
+| `tests/test.h` | 1.9 | | | | | |  |  |
+| `tests/test_core.c` | 1.9 | 2.7 | | 4.7 | | |  |  |
+| `tests/util.h`, `tests/test_model.c` | | 2.7 | | 4.5, 4.8 (`test_model.c`) | | |  |  |
+| `tests/test_ops.c` | | | 3.5 | 4.7 | | |  |  |
+| `tests/test_golden.c` | | | 3.6 | 4.7 | | | 7.5 |  |
+| `tests/tiny.h`, `tests/test_forward.c` | | | | 4.5, 4.7 (`test_forward.c`) | | |  | 8.8 (`test_forward.c`) |
+| `tests/golden/dump.py`, `README.md` | | | 3.4 | 4.4, 4.8 | 5.9 (`README.md`) | |  | 8.9 (`README.md`) |
+| `tests/golden/requirements.in`, `requirements.txt` | | | 3.1 | | | |  |  |
+| `src/core/buf.{h,c}`, `src/core/rng.{h,c}` | | | | | 5.4 | |  |  |
+| `src/text/unicode.{h,c}`, `unicode_tables.h` | | | | | 5.2 | |  |  |
+| `src/text/bpe.{h,c}` | | | | | 5.3 | |  |  |
+| `src/model/text.c` | | | | | 5.4 | |  |  |
+| `src/models/qwen35/text.c` | | | | | 5.5 | |  |  |
+| `src/ops/sample.c` | | | | | 5.6 | | 7.2 |  |
+| `tools/chat.c` | | | | | 5.7 | |  | 8.6 |
+| `tools/dev/gen_unicode.py` | | | | | 5.2 | |  |  |
+| `tests/test_text.c` | | | | | 5.8 | |  | 8.8 |
+| `tests/golden/text.py` | | | | | 5.1 | |  |  |
+| `src/backend/backend.h`, `gpu.cu`, `gpu_none.c`, `compat.h`, `devarena.c` | | | | | | 6.2 to 6.5 | 7.1 (`backend.h`, `gpu.cu`, `compat.h`) | 8.1 (`backend.h`, `gpu.cu`, `gpu_none.c`, `compat.h`) |
+| `tools/devices.c` | | | | | | 6.6 |  |  |
+| `tools/dev/check_nvcc.sh` | | | | | | 6.1 | 7.1 |  |
+| `tests/test_backend.c` | | | | | | 6.7 |  | 8.1 |
+| `src/backend/gpu.h` | | | | | | | 7.1 |  |
+| `src/ops/launch.h`, `gpu_none.c` | | | | | | | 7.2 |  |
+| `src/ops/kernel.cuh`, `embed.cu`, `matmul.cu`, `norm.cu`, `rope.cu`, `act.cu`, `attn.cu`, `conv.cu`, `gdn.cu` | | | | | | | 7.3 |  |
+| `tests/test_gpu_ops.c` | | | | | | | 7.4 |  |
+| `src/ops/dispatch.c` | | | | | | | | 8.2 |
+| `src/infer/engine.h`, `engine.c` | | | | | | | | 8.5 |
+| `tests/golden/generate.py` | | | | | | | | 8.7 |
+| `tests/test_engine.c` | | | | | | | | 8.8 |
+| `docs/proposals/chat-state-at-last-query.md`, `chat-shadow-sequence.md` | | | | | | 6.8 |  |  |
+| `CLAUDE.md` | | | | | | 6.8 |  |  |
+| `docs/contract/qwen35-0.8b.md` | closing | 2.1 | 3.1, 3.7 | 4.6, 4.8 | 5.9 | |  |  |
+| `docs/contract/qwen35-35b-a3b.md` | | 2.1 | | 4.8 | | |  |  |
+| `docs/MODELS.md` | | 2.1 | 3.7 | 4.6, 4.8 | | |  |  |
+| `docs/ARCHITECTURE.md` | closing | 2.2 | 3.7 | 4.6, 4.7, 4.8 | 5.9 | 6.8 | 7.6 | 8.9 |
+| `docs/PLAN.md` | | | | 4.8 | | |  |  |
+| `docs/STATUS.md` | closing | 2.1 to 2.7, closing | 3.1, closing | 4.1, closing, 4.7, 4.8 | 5.1 to 5.9, closing | 6.1 to 6.8 | 7.1 to 7.6 | 8.1 to 8.9 |
+| `docs/program/PROGRAM.md` | closing | closing | 3.7 | 4.6, 4.7, 4.8 | 5.9 | 6.8 | 7.6 | 8.9 |
+| `docs/proposals/cpu-matmul-avx512.md` | | | | 4.7 | | |  |  |
+| `docs/CHANGE-001-scope-tools-cache.md` | | | | 4.8 | | |  |  |
+| `docs/status_extended.md` | | | closing | 4.6, 4.7, 4.8 | 5.9 | 6.8 | 7.6 | 8.9 |
+| `AGENTS.md` | | 2.3 | 3.7 | 4.8 | | |  |  |
+| `README.md` | closing | | | 4.8 | 5.9 | |  | 8.9 |
+| module READMEs | closing (`src/core`, `tests`, `tools`) | 2.2, 2.5, 2.6, 2.7 (`src/model`, `src/models/qwen35`, `tools`, `tests`) | 3.2, 3.3, 3.6, 3.7 (`src/core`, `src/ops`, `tests`, `tests/golden`, `src/backend`) | 4.6 (`src/model`, `src/models/qwen35`, `tests`, `tests/golden`); 4.7 (`src/core`, `src/ops`, `src/backend`, `src/model`, `src/models/qwen35`, `tests`); 4.8 (`src/model`, `src/models/qwen35`, `src/net`, `src/infer`, `src/text`, `tools`) | 5.9 (`src/core`, `src/text`, `src/ops`, `src/model`, `src/models/qwen35`, `tools`, `tests`) | 6.8 (`src/backend`, `src/core`, `tools`, `tests`) | 7.6 (`src/ops`, `src/backend`, `tests`, `src/core`) | 8.9 (`src/model`, `src/models/qwen35`, `src/infer`, `src/ops`, `src/backend`, `tools`, `tests`, `tests/golden`) |
