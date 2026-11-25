@@ -176,6 +176,7 @@ typedef struct {
     int64_t      M[ATH_MATMUL_N_MAX];
     int64_t      first[ATH_MATMUL_N_MAX + 1];
     int          n;
+    bool         add;   /* the product added to out, as ath_add does (step 9) */
 } gemv_set;
 
 /* The warps that share one output column: long rows are split so that every
@@ -183,8 +184,20 @@ typedef struct {
  * only, so a column's bits do not depend on the other columns. */
 static inline int gemv_split(int64_t K) { return K >= 3072 ? 4 : K >= 1536 ? 2 : 1; }
 
-static __global__ void __launch_bounds__(GEMV_WARPS * ATH_WARP)
-gemv_kernel(const void *x, int xdt, gemv_set set, int N, int64_t K, int S)
+/* Output element e of matrix j: the sum rounded to the output's dtype, and
+ * with set.add, then added to what is there and rounded again (ath_add). */
+static __device__ __forceinline__ void gemv_store(const gemv_set *set, int j, int64_t e, float v)
+{
+    if (set->add)
+        v = k_ld(set->out[j], set->odt[j], e) + k_round(set->odt[j], v);
+    k_st(set->out[j], set->odt[j], e, v);
+}
+
+/* The kernel body for at most `rows` rows of x, a constant in each kernel
+ * below, so that the decode kernel (one row) keeps one accumulator and its
+ * registers stay few: the same arithmetic per row in both. */
+static __device__ __forceinline__ void gemv_body(const void *x, int xdt, const gemv_set &set, int N, int64_t K, int S,
+                                                 const int rows)
 {
     __shared__ float part[GEMV_WARPS][GEMV_ROWS];
     const int lane = threadIdx.x % ATH_WARP, warp = threadIdx.x / ATH_WARP;
@@ -200,15 +213,23 @@ gemv_kernel(const void *x, int xdt, gemv_set set, int N, int64_t K, int S)
     const uint4 *row = set.w[j] + m * pieces;
     float acc[GEMV_ROWS];
 #pragma unroll
-    for (int r = 0; r < GEMV_ROWS; r++)
+    for (int r = 0; r < rows; r++)
         acc[r] = 0.0f;
-    for (int64_t c0 = c_begin + lane; live && c0 < c_end; c0 += (int64_t)ATH_WARP * GEMV_UNROLL) {
-        uint4 wv[GEMV_UNROLL];
+    /* the first round of weights */
+    const int64_t step = (int64_t)ATH_WARP * GEMV_UNROLL;
+    uint4 wv[GEMV_UNROLL];
 #pragma unroll
-        for (int u = 0; u < GEMV_UNROLL; u++) {
-            const int64_t c = c0 + (int64_t)u * ATH_WARP;
-            wv[u] = c < c_end ? row[c] : make_uint4(0, 0, 0, 0);
-        }
+    for (int u = 0; u < GEMV_UNROLL; u++) {
+        const int64_t c = c_begin + lane + (int64_t)u * ATH_WARP;
+        wv[u] = live && c < c_end ? row[c] : make_uint4(0, 0, 0, 0);
+    }
+    for (int64_t c0 = c_begin + lane; live && c0 < c_end; c0 += step) {
+        if (c0 != c_begin + lane)
+#pragma unroll
+            for (int u = 0; u < GEMV_UNROLL; u++) {
+                const int64_t c = c0 + (int64_t)u * ATH_WARP;
+                wv[u] = c < c_end ? row[c] : make_uint4(0, 0, 0, 0);
+            }
 #pragma unroll
         for (int u = 0; u < GEMV_UNROLL; u++) {
             const int64_t c = c0 + (int64_t)u * ATH_WARP;
@@ -217,7 +238,7 @@ gemv_kernel(const void *x, int xdt, gemv_set set, int N, int64_t K, int S)
             float wf[8];
             k_unpack_bf16x8(wv[u], wf);
 #pragma unroll
-            for (int r = 0; r < GEMV_ROWS; r++) {
+            for (int r = 0; r < rows; r++) {
                 if (r < N) {
                     float xf[8];
                     k_ld8(x, xdt, (r * K) / 8 + c, xf);
@@ -230,12 +251,12 @@ gemv_kernel(const void *x, int xdt, gemv_set set, int N, int64_t K, int S)
     }
     /* each warp's sum, then the parts of a column in order */
 #pragma unroll
-    for (int r = 0; r < GEMV_ROWS; r++) {
+    for (int r = 0; r < rows; r++) {
         if (r < N) {
             const float v = k_warp_sum(acc[r]);
             if (S == 1) {
                 if (live && lane == 0)
-                    k_st(set.out[j], set.odt[j], r * M + m, v);
+                    gemv_store(&set, j, r * M + m, v);
             } else if (lane == 0) {
                 part[warp][r] = v;
             }
@@ -249,7 +270,19 @@ gemv_kernel(const void *x, int xdt, gemv_set set, int N, int64_t K, int S)
     float v = 0.0f;
     for (int p = 0; p < S; p++)
         v += part[warp + p][lane];
-    k_st(set.out[j], set.odt[j], (int64_t)lane * M + m, v);
+    gemv_store(&set, j, (int64_t)lane * M + m, v);
+}
+
+static __global__ void __launch_bounds__(GEMV_WARPS * ATH_WARP)
+gemv_one(const void *x, int xdt, gemv_set set, int N, int64_t K, int S)
+{
+    gemv_body(x, xdt, set, N, K, S, 1);
+}
+
+static __global__ void __launch_bounds__(GEMV_WARPS * ATH_WARP)
+gemv_few(const void *x, int xdt, gemv_set set, int N, int64_t K, int S)
+{
+    gemv_body(x, xdt, set, N, K, S, GEMV_ROWS);
 }
 
 /* The GEMV kernel takes the product: few rows, bf16 weights, rows of 16-byte
@@ -265,8 +298,11 @@ static ath_status gemv_launch(const ath_device *d, const ath_tensor *x, const ge
 {
     const int S = gemv_split(K), per_block = GEMV_WARPS / S;
     const int64_t blocks = (set->first[set->n] + per_block - 1) / per_block;
-    gemv_kernel<<<(unsigned)blocks, GEMV_WARPS * ATH_WARP, 0, k_stream(d)>>>(x->data, x->dtype, *set, (int)N, K, S);
-    return ath_gpu_launched("gemv_kernel");
+    if (N == 1)
+        gemv_one<<<(unsigned)blocks, GEMV_WARPS * ATH_WARP, 0, k_stream(d)>>>(x->data, x->dtype, *set, 1, K, S);
+    else
+        gemv_few<<<(unsigned)blocks, GEMV_WARPS * ATH_WARP, 0, k_stream(d)>>>(x->data, x->dtype, *set, (int)N, K, S);
+    return ath_gpu_launched("gemv");
 }
 
 static void gemv_add(gemv_set *set, const ath_tensor *w, ath_tensor *out)
@@ -323,4 +359,24 @@ extern "C" ath_status ath_matmul_launch(const ath_device *d, const ath_tensor *x
     matmul_kernel<<<k_blocks(N * M * ATH_WARP, 256), 256, 0, k_stream(d)>>>(x->data, x->dtype, w->data, w->dtype,
                                                                             out->data, out->dtype, N, M, K);
     return ath_gpu_launched("matmul_kernel");
+}
+
+/* ---- fusions (step 9) ---------------------------------------------------------- */
+
+extern "C" bool ath_gemv_fits(const ath_tensor *x, const ath_tensor *w)
+{
+    const int64_t K = x->shape[x->ndim - 1];
+    return K > 0 && gemv_fits(x, w, ath_tensor_numel(x) / K, K);
+}
+
+extern "C" ath_status ath_matmul_add_launch(const ath_device *d, const ath_tensor *x, const ath_tensor *w,
+                                            ath_tensor *out)
+{
+    const int64_t K = x->shape[x->ndim - 1], N = ath_tensor_numel(x) / K;
+    ATH_CHECK(ath_gpu_use(d));
+    gemv_set set;
+    memset(&set, 0, sizeof set);
+    gemv_add(&set, w, out);
+    set.add = true;
+    return gemv_launch(d, x, &set, N, K);
 }

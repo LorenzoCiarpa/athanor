@@ -24,6 +24,8 @@ extern "C" {
 
 ath_status ath_embed_launch(const ath_device *d, const ath_tensor *table, const ath_tensor *ids, ath_tensor *out);
 ath_status ath_matmul_launch(const ath_device *d, const ath_tensor *x, const ath_tensor *w, ath_tensor *out);
+bool       ath_gemv_fits(const ath_tensor *x, const ath_tensor *w);
+ath_status ath_matmul_add_launch(const ath_device *d, const ath_tensor *x, const ath_tensor *w, ath_tensor *out);
 ath_status ath_matmul_n_launch(const ath_device *d, const ath_tensor *x, int n, const ath_tensor *const *w,
                                ath_tensor *const *out);
 

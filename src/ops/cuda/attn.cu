@@ -250,6 +250,213 @@ attn_merge(const float *part, const int32_t *pos, void *out, int odt, int64_t T,
     attn_store(out, odt, th, dv, l, acc, last >= 0);
 }
 
+/* ---- the fast path: head dims up to 256 in 16-byte pieces (step 9) ---------------
+ *
+ * The kernels above load one key, or one key's values, at a time and wait
+ * for each: a tile costs some 16 trips to memory one after the other, which
+ * at decode (a few blocks) is the whole time. Here warp w takes keys
+ * 8w … 8w + 7 of a tile and lane l the 8 elements 8l … 8l + 7 of a head:
+ * the warp loads its 8 keys at once, then its 8 value rows at once, one
+ * trip each. The softmax of a tile runs head g on warp g and key j on lane
+ * j (warp reductions for its maximum and sum), once, instead of every
+ * thread walking the scores; each warp keeps the weighted sum of its own
+ * keys, and the four are added in warp order at the end of the piece. Rows and split use these functions both,
+ * so they keep giving the same bits. */
+#define FAST_DIM 256
+#define FAST_KEYS (ATTN_TILE / (ATTN_THREADS / ATH_WARP))
+#define FAST_WARPS (ATTN_THREADS / ATH_WARP)
+
+/* The largest of the 32 values of a warp, on every lane. */
+static __device__ __forceinline__ float k_warp_max(float v)
+{
+    for (int m = ATH_WARP / 2; m > 0; m >>= 1)
+        v = fmaxf(v, ath_shfl_xor(v, m));
+    return v;
+}
+
+static __device__ __forceinline__ void fast_piece(const float *qs, float *sc, float *xch, float *st, int G, const void *k,
+                                                  int kdt, const void *v, int vdt, int64_t nkv, int64_t kh, int64_t d,
+                                                  int64_t dv, float scale, int64_t j0, int64_t j1,
+                                                  float m[ATTN_MAX_GROUP], float l[ATTN_MAX_GROUP],
+                                                  float accp[ATTN_MAX_GROUP][8])
+{
+    const int lane = threadIdx.x % ATH_WARP, warp = threadIdx.x / ATH_WARP;
+    float accw[ATTN_MAX_GROUP][8];
+#pragma unroll
+    for (int g = 0; g < ATTN_MAX_GROUP; g++) {
+        m[g] = -INFINITY;
+        l[g] = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 8; i++)
+            accw[g][i] = 0.0f;
+    }
+    const bool kq = lane < d / 8, vq = lane < dv / 8;
+    for (int64_t t0 = j0; t0 < j1; t0 += ATTN_TILE) {
+        const int n = (int)(j1 - t0 < ATTN_TILE ? j1 - t0 : ATTN_TILE);
+        float kv[FAST_KEYS][8];
+#pragma unroll
+        for (int q = 0; q < FAST_KEYS; q++) {
+            const int jj = warp * FAST_KEYS + q;
+            if (jj < n && kq)
+                k_ld8(k, kdt, (((t0 + jj) * nkv + kh) * d) / 8 + lane, kv[q]);
+            else
+#pragma unroll
+                for (int i = 0; i < 8; i++)
+                    kv[q][i] = 0.0f;
+        }
+#pragma unroll
+        for (int g = 0; g < ATTN_MAX_GROUP; g++)
+#pragma unroll
+            for (int q = 0; q < FAST_KEYS; q++) {
+                if (g >= G)
+                    break;
+                float s = 0.0f;
+#pragma unroll
+                for (int i = 0; i < 8; i++)
+                    s = kq ? __fmaf_rn(qs[g * d + 8 * lane + i], kv[q][i], s) : s;
+                s = k_warp_sum(s);
+                const int jj = warp * FAST_KEYS + q;
+                if (lane == 0 && jj < n)
+                    sc[g * ATTN_TILE + jj] = __fmul_rn(s, scale);
+            }
+        __syncthreads();
+        /* the tile's softmax, head g on warp g, key j on lane j: the
+         * probabilities replace the scores in sc, and st gets the new
+         * maximum, the correction of the old one and the tile's sum */
+        if (warp < G) {
+            const int g = warp;
+            const float sv = lane < n ? sc[g * ATTN_TILE + lane] : -INFINITY;
+            const float mt = fmaxf(m[g], k_warp_max(sv));
+            const float pv = lane < n ? expf(__fsub_rn(sv, mt)) : 0.0f;
+            const float lt = k_warp_sum(pv);
+            sc[g * ATTN_TILE + lane] = pv;
+            if (lane == 0) {
+                st[3 * g] = mt;
+                st[3 * g + 1] = expf(__fsub_rn(m[g], mt));    /* 0 on the first tile, where m = −inf */
+                st[3 * g + 2] = lt;
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int g = 0; g < ATTN_MAX_GROUP; g++) {
+            if (g >= G)
+                break;
+            const float corr = st[3 * g + 1];
+            l[g] = __fadd_rn(__fmul_rn(l[g], corr), st[3 * g + 2]);
+#pragma unroll
+            for (int i = 0; i < 8; i++)
+                accw[g][i] = __fmul_rn(accw[g][i], corr);
+            m[g] = st[3 * g];
+        }
+#pragma unroll
+        for (int q = 0; q < FAST_KEYS; q++) {
+            const int jj = warp * FAST_KEYS + q;
+            if (jj < n && vq)
+                k_ld8(v, vdt, (((t0 + jj) * nkv + kh) * dv) / 8 + lane, kv[q]);
+        }
+#pragma unroll
+        for (int q = 0; q < FAST_KEYS; q++) {
+            const int jj = warp * FAST_KEYS + q;
+            if (jj >= n)
+                break;
+#pragma unroll
+            for (int g = 0; g < ATTN_MAX_GROUP; g++) {
+                if (g >= G)
+                    break;
+                const float p = sc[g * ATTN_TILE + jj];          /* the probability */
+#pragma unroll
+                for (int i = 0; i < 8; i++)
+                    accw[g][i] = __fmaf_rn(p, kv[q][i], accw[g][i]);
+            }
+        }
+        __syncthreads();                    /* the next tile overwrites sc and st */
+    }
+    /* the four warps' sums, in warp order, on warp 0 */
+#pragma unroll
+    for (int g = 0; g < ATTN_MAX_GROUP; g++)
+#pragma unroll
+        for (int i = 0; i < 8; i++)
+            if (g < G)
+                xch[(warp * ATTN_MAX_GROUP + g) * FAST_DIM + 8 * lane + i] = accw[g][i];
+    __syncthreads();
+    if (warp == 0)
+#pragma unroll
+        for (int g = 0; g < ATTN_MAX_GROUP; g++)
+#pragma unroll
+            for (int i = 0; i < 8; i++) {
+                if (g >= G)
+                    break;
+                float a = xch[g * FAST_DIM + 8 * lane + i];
+                for (int w = 1; w < FAST_WARPS; w++)
+                    a = __fadd_rn(a, xch[(w * ATTN_MAX_GROUP + g) * FAST_DIM + 8 * lane + i]);
+                accp[g][i] = a;
+            }
+    __syncthreads();
+}
+
+static __global__ void __launch_bounds__(ATTN_THREADS)
+fast_rows(const void *q, int qdt, const void *k, int kdt, const void *v, int vdt, const int32_t *pos, void *out,
+          int odt, int64_t T, int64_t S, int64_t nh, int64_t nkv, int64_t d, int64_t dv, float scale)
+{
+    __shared__ float qs[FAST_DIM], sc[ATTN_TILE], st[3], xch[FAST_WARPS * ATTN_MAX_GROUP * FAST_DIM];
+    const int lane = threadIdx.x % ATH_WARP, warp = threadIdx.x / ATH_WARP;
+    const int64_t th = blockIdx.x, t = th / nh, kh = th % nh / (nh / nkv);
+    const int64_t last = attn_last(pos, S, T, t);
+    for (int64_t i = threadIdx.x; i < d; i += ATTN_THREADS)
+        qs[i] = k_ld(q, qdt, th * d + i);
+    __syncthreads();
+    float m = -INFINITY, l = 0.0f, acc[ATTN_PER_THREAD];
+#pragma unroll
+    for (int r = 0; r < ATTN_PER_THREAD; r++)
+        acc[r] = 0.0f;
+    for (int64_t j0 = 0; j0 <= last; j0 += ATH_ATTN_SPLIT) {
+        const int64_t j1 = j0 + ATH_ATTN_SPLIT < last + 1 ? j0 + ATH_ATTN_SPLIT : last + 1;
+        float mp[ATTN_MAX_GROUP], lp[ATTN_MAX_GROUP], ap[ATTN_MAX_GROUP][8];
+        fast_piece(qs, sc, xch, st, 1, k, kdt, v, vdt, nkv, kh, d, dv, scale, j0, j1, mp, lp, ap);
+        if (warp == 0)
+            attn_combine(&m, &l, acc, mp[0], lp[0], ap[0]);
+    }
+    if (warp == 0)
+#pragma unroll
+        for (int i = 0; i < 8; i++)
+            if (8 * lane + i < dv)
+                k_st(out, odt, th * dv + 8 * lane + i, last >= 0 ? __fdiv_rn(acc[i], l) : NAN);
+}
+
+static __global__ void __launch_bounds__(ATTN_THREADS)
+fast_split(const void *q, int qdt, const void *k, int kdt, const void *v, int vdt, const int32_t *pos, float *part,
+           int64_t T, int64_t S, int64_t nh, int64_t nkv, int64_t d, int64_t dv, float scale, int G)
+{
+    __shared__ float qs[ATTN_MAX_GROUP * FAST_DIM], sc[ATTN_MAX_GROUP * ATTN_TILE], st[3 * ATTN_MAX_GROUP],
+        xch[FAST_WARPS * ATTN_MAX_GROUP * FAST_DIM];
+    const int lane = threadIdx.x % ATH_WARP, warp = threadIdx.x / ATH_WARP;
+    const int64_t pieces = gridDim.x, p = blockIdx.x, t = blockIdx.z, h0 = (int64_t)blockIdx.y * G;
+    const int64_t kh = h0 / (nh / nkv);
+    const int64_t last = attn_last(pos, S, T, t), j0 = p * ATH_ATTN_SPLIT;
+    if (j0 > last)
+        return;
+    const int64_t j1 = j0 + ATH_ATTN_SPLIT < last + 1 ? j0 + ATH_ATTN_SPLIT : last + 1;
+    for (int64_t i = threadIdx.x; i < G * d; i += ATTN_THREADS)
+        qs[i] = k_ld(q, qdt, (t * nh + h0) * d + i);
+    __syncthreads();
+    float m[ATTN_MAX_GROUP], l[ATTN_MAX_GROUP], ap[ATTN_MAX_GROUP][8];
+    fast_piece(qs, sc, xch, st, G, k, kdt, v, vdt, nkv, kh, d, dv, scale, j0, j1, m, l, ap);
+    if (warp != 0)
+        return;
+#pragma unroll
+    for (int g = 0; g < ATTN_MAX_GROUP; g++) {
+        if (g >= G)
+            break;
+        float *o = part + ((t * nh + h0 + g) * pieces + p) * (dv + 2);
+        if (lane == 0)
+            o[0] = m[g], o[1] = l[g];
+#pragma unroll
+        for (int i = 0; i < 8; i++)
+            if (8 * lane + i < dv)
+                o[2 + 8 * lane + i] = ap[g][i];
+    }
+}
+
 extern "C" ath_status ath_attn_launch(const ath_device *d, const ath_tensor *q, const ath_tensor *k,
                                       const ath_tensor *v, const ath_tensor *pos, float scale, float *part,
                                       ath_tensor *out)
@@ -264,6 +471,14 @@ extern "C" ath_status ath_attn_launch(const ath_device *d, const ath_tensor *q, 
         return ATH_ERR_UNSUPPORTED;
     }
     ATH_CHECK(ath_gpu_use(d));
+    const bool fast = hd <= FAST_DIM && dv <= FAST_DIM && hd % 8 == 0 && dv % 8 == 0 &&
+                      (uintptr_t)k->data % 16 == 0 && (uintptr_t)v->data % 16 == 0;
+    if (fast && !part) {
+        fast_rows<<<(unsigned)(T * nh), ATTN_THREADS, 0, k_stream(d)>>>(q->data, q->dtype, k->data, k->dtype, v->data,
+                                                                       v->dtype, p, out->data, out->dtype, T, S, nh,
+                                                                       nkv, hd, dv, scale);
+        return ath_gpu_launched("attn fast_rows");
+    }
     if (!part) {
         const size_t smem = (size_t)(hd + ATTN_TILE) * sizeof(float);
         attn_rows<<<(unsigned)(T * nh), ATTN_THREADS, smem, k_stream(d)>>>(
@@ -279,8 +494,12 @@ extern "C" ath_status ath_attn_launch(const ath_device *d, const ath_tensor *q, 
     const int64_t pieces = (S + ATH_ATTN_SPLIT - 1) / ATH_ATTN_SPLIT;
     const dim3 grid((unsigned)pieces, (unsigned)(nh / G), (unsigned)T);
     const size_t smem = (size_t)G * (hd + ATTN_TILE) * sizeof(float);
-    attn_split<<<grid, ATTN_THREADS, smem, k_stream(d)>>>(q->data, q->dtype, k->data, k->dtype, v->data, v->dtype, p,
-                                                         part, T, S, nh, nkv, hd, dv, scale, G);
+    if (fast)
+        fast_split<<<grid, ATTN_THREADS, 0, k_stream(d)>>>(q->data, q->dtype, k->data, k->dtype, v->data, v->dtype, p,
+                                                           part, T, S, nh, nkv, hd, dv, scale, G);
+    else
+        attn_split<<<grid, ATTN_THREADS, smem, k_stream(d)>>>(q->data, q->dtype, k->data, k->dtype, v->data, v->dtype,
+                                                             p, part, T, S, nh, nkv, hd, dv, scale, G);
     ATH_CHECK(ath_gpu_launched("attn_split"));
     attn_merge<<<(unsigned)(T * nh), ATTN_THREADS, 0, k_stream(d)>>>(part, p, out->data, out->dtype, T, S, nh, dv,
                                                                     pieces);

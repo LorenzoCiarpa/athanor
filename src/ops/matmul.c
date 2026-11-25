@@ -162,3 +162,17 @@ ath_status ath_matmul_n_gpu(const ath_device *d, const ath_tensor *x, int n, con
     }
     return ath_matmul_n_launch(d, x, n, w, out);
 }
+
+bool ath_matmul_fits_gemv(const ath_tensor *x, const ath_tensor *w)
+{
+    return x && w && x->data && w->data && x->ndim >= 1 && ath_gemv_fits(x, w);
+}
+
+ath_status ath_matmul_add_gpu(const ath_device *d, const ath_tensor *x, const ath_tensor *w, ath_tensor *out)
+{
+    int64_t N, M, K;
+    ATH_CHECK(check(x, w, out, OPS_GPU, &N, &M, &K));
+    if (!ath_gemv_fits(x, w))
+        return ops_fail(ATH_ERR_UNSUPPORTED, op, "matmul_add: shapes the GEMV kernel does not take");
+    return ath_matmul_add_launch(d, x, w, out);
+}

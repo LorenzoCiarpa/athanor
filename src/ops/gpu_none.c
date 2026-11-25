@@ -97,3 +97,15 @@ ath_status ath_matmul_n_launch(const ath_device *d, const ath_tensor *x, int n, 
     (void)d, (void)x, (void)n, (void)w, (void)out;
     return none("matmul");
 }
+
+bool ath_gemv_fits(const ath_tensor *x, const ath_tensor *w)
+{
+    (void)x, (void)w;
+    return false;
+}
+
+ath_status ath_matmul_add_launch(const ath_device *d, const ath_tensor *x, const ath_tensor *w, ath_tensor *out)
+{
+    (void)d, (void)x, (void)w, (void)out;
+    return none("matmul_add");
+}

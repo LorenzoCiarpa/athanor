@@ -102,6 +102,17 @@ ath_status ath_matmul_gpu(const ath_device *d, const ath_tensor *x, const ath_te
  * GEMV launch for all of them: the projections of one layer's input are
  * read in one pass. The CPU (in dispatch) runs ath_matmul_fast on each. */
 #define ATH_MATMUL_N_MAX 4
+
+/* GPU fusion of the decode step (step 9): out = out + x · wᵀ, the product
+ * rounded to out's dtype first, with the bits of ath_matmul into a
+ * temporary followed by ath_add; the residual stream takes each output
+ * projection this way. It takes what the GEMV kernel takes
+ * (ath_matmul_fits_gemv) and fails with ATH_ERR_UNSUPPORTED otherwise, where
+ * the caller uses the two ops. (Normalizing x in the same launch was
+ * measured and dropped: the blocks' prologue cost more than the norm
+ * kernel it saved.) */
+bool       ath_matmul_fits_gemv(const ath_tensor *x, const ath_tensor *w);
+ath_status ath_matmul_add_gpu(const ath_device *d, const ath_tensor *x, const ath_tensor *w, ath_tensor *out);
 ath_status ath_matmul_n_gpu(const ath_device *d, const ath_tensor *x, int n, const ath_tensor *const *w,
                             ath_tensor *const *out);
 

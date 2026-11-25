@@ -115,6 +115,30 @@ static ath_status copy_cols(const fwd *f, const ath_tensor *src, int64_t col, at
     return ATH_OK;
 }
 
+/* The matmuls of rmsnorm(x) (norm: the param of its weights, zero-centered):
+ * the norm into a temporary, then the projections that share it. */
+static ath_status norm_matmuls(fwd *f, const ath_tensor *x, const ath_param *norm, int n, const ath_tensor *const *w,
+                               ath_tensor *const *out)
+{
+    ath_tensor xn;
+    ATH_CHECK(tmp(f, &xn, f->act, 2, x->shape[0], x->shape[1], 0));
+    ATH_CHECK(ath_rmsnorm(f->dev, x, W(f, norm), 1.0f, f->eps, &xn));
+    return ath_matmul_n(f->dev, f->pool, &xn, n, w, out);
+}
+
+/* x += h · wᵀ, the output projection added to the residual stream (both
+ * roundings of the reference's two steps). On a GPU, where the GEMV kernel
+ * takes it, one launch (ath_matmul_add_gpu, step 9); otherwise the two ops. */
+static ath_status matmul_add(fwd *f, const ath_tensor *h, const ath_tensor *w, ath_tensor *x)
+{
+    if (f->dev && ath_matmul_fits_gemv(h, w))
+        return ath_matmul_add_gpu(f->dev, h, w, x);
+    ath_tensor y;
+    ATH_CHECK(tmp(f, &y, f->act, 2, x->shape[0], x->shape[1], 0));
+    ATH_CHECK(ath_matmul(f->dev, f->pool, h, w, &y));
+    return ath_add(f->dev, x, &y, x);
+}
+
 /* ---- mixers --------------------------------------------------------------------- */
 
 /* Full attention (contract, Full-attention layer): q_proj gives query and
@@ -126,7 +150,7 @@ static ath_status copy_cols(const fwd *f, const ath_tensor *src, int64_t col, at
  * reads and where the new rows go (step 9): no argument of any op depends
  * on the number of tokens already seen, so a decode step can be captured
  * once and replayed. */
-static ath_status attention(fwd *f, const ath_qwen35_layer *L, const ath_tensor *xn, ath_tensor *out)
+static ath_status attention(fwd *f, const ath_qwen35_layer *L, ath_tensor *x)
 {
     const ath_qwen35_config *c = f->c;
     const int64_t T = f->T, cap = f->s->capacity;
@@ -145,10 +169,11 @@ static ath_status attention(fwd *f, const ath_qwen35_layer *L, const ath_tensor 
     ATH_CHECK(tmp(f, &k, act, 2, T, nkv * hd, 0));
     ATH_CHECK(tmp(f, &v_new, act, 3, T, nkv, hd));
     ATH_CHECK(view(&v_new, &v_flat, 2, T, nkv * hd, 0));
-    /* the three projections of xn in one pass over their weights (step 9) */
+    /* the three projections of the normalized x in one pass over their
+     * weights (step 9) */
     const ath_tensor *pw[] = {W(f, L->q_proj), W(f, L->k_proj), W(f, L->v_proj)};
     ath_tensor *po[] = {&qg, &k, &v_flat};
-    ATH_CHECK(ath_matmul_n(f->dev, f->pool, xn, 3, pw, po));
+    ATH_CHECK(norm_matmuls(f, x, L->input_norm, 3, pw, po));
     ATH_CHECK(tmp(f, &q, act, 3, T, nh, hd));
     ATH_CHECK(tmp(f, &gate, act, 3, T, nh, hd));
     ATH_CHECK(view(&qg, &qg_rows, 2, T * nh, 2 * hd, 0));
@@ -182,14 +207,14 @@ static ath_status attention(fwd *f, const ath_qwen35_layer *L, const ath_tensor 
     ATH_CHECK(view(&gate, &gate_flat, 2, T, nh * hd, 0));
     ATH_CHECK(tmp(f, &og, act, 2, T, nh * hd, 0));
     ATH_CHECK(ath_sigmoid_mul(f->dev, &o_flat, &gate_flat, &og));
-    return ath_matmul(f->dev, f->pool, &og, W(f, L->o_proj), out);
+    return matmul_add(f, &og, W(f, L->o_proj), x);
 }
 
 /* Gated DeltaNet (contract, Gated DeltaNet layer): projections; causal conv
  * with SiLU over the q, k, v channels, continuing from the conv state; L2
  * norm of q and k; gates; the gated delta rule on the recurrent state; gated
  * RMSNorm with z per value head; out_proj. */
-static ath_status gated_deltanet(fwd *f, const ath_qwen35_layer *L, const ath_tensor *xn, ath_tensor *out)
+static ath_status gated_deltanet(fwd *f, const ath_qwen35_layer *L, ath_tensor *x)
 {
     const ath_qwen35_config *c = f->c;
     const int64_t T = f->T;
@@ -204,7 +229,7 @@ static ath_status gated_deltanet(fwd *f, const ath_qwen35_layer *L, const ath_te
     ATH_CHECK(tmp(f, &b, act, 2, T, nv, 0));
     const ath_tensor *pw[] = {W(f, L->qkv_proj), W(f, L->z_proj), W(f, L->a_proj), W(f, L->b_proj)};
     ath_tensor *po[] = {&qkv, &z, &a, &b};
-    ATH_CHECK(ath_matmul_n(f->dev, f->pool, xn, 4, pw, po));
+    ATH_CHECK(norm_matmuls(f, x, L->input_norm, 4, pw, po));
 
     /* convolution over all conv_dim channels, then the split into q, k, v */
     ath_tensor conv_state, mixed, q, k, v, q2, k2, v2;
@@ -256,11 +281,11 @@ static ath_status gated_deltanet(fwd *f, const ath_qwen35_layer *L, const ath_te
     ATH_CHECK(tmp(f, &on, act, 2, T * nv, dv, 0));
     ATH_CHECK(ath_rmsnorm_gated(f->dev, &o_rows, &z_rows, W(f, L->norm), f->eps, &on));
     ATH_CHECK(view(&on, &on_flat, 2, T, value_dim, 0));
-    return ath_matmul(f->dev, f->pool, &on_flat, W(f, L->out_proj), out);
+    return matmul_add(f, &on_flat, W(f, L->out_proj), x);
 }
 
 /* SwiGLU MLP (contract, MLP): down(silu(gate(x)) · up(x)). */
-static ath_status mlp(fwd *f, const ath_qwen35_layer *L, const ath_tensor *xn, ath_tensor *out)
+static ath_status mlp(fwd *f, const ath_qwen35_layer *L, ath_tensor *x)
 {
     const int64_t T = f->T, I = f->c->intermediate;
     ath_tensor gate, up, h;
@@ -269,31 +294,23 @@ static ath_status mlp(fwd *f, const ath_qwen35_layer *L, const ath_tensor *xn, a
     ATH_CHECK(tmp(f, &h, f->act, 2, T, I, 0));
     const ath_tensor *pw[] = {W(f, L->gate_proj), W(f, L->up_proj)};
     ath_tensor *po[] = {&gate, &up};
-    ATH_CHECK(ath_matmul_n(f->dev, f->pool, xn, 2, pw, po));
+    ATH_CHECK(norm_matmuls(f, x, L->post_norm, 2, pw, po));
     ATH_CHECK(ath_swiglu(f->dev, &gate, &up, &h));
-    return ath_matmul(f->dev, f->pool, &h, W(f, L->down_proj), out);
+    return matmul_add(f, &h, W(f, L->down_proj), x);
 }
 
-/* One decoder layer, in place on the residual stream x [T, hidden]. Both
- * residual additions round once to the activation dtype, as the reference's. */
+/* One decoder layer, in place on the residual stream x [T, hidden]: each
+ * half normalizes x into its first projections and adds its output
+ * projection back to x (norm_matmuls, matmul_add). Both residual additions
+ * round once to the activation dtype, as the reference's. */
 static ath_status layer(fwd *f, int32_t l, ath_tensor *x)
 {
     const ath_qwen35_layer *L = &((const ath_qwen35_model *)f->m->family_data)->layer[l];
-    const int64_t T = f->T, H = f->c->hidden;
-    ath_tensor xn, y;
-    ATH_CHECK(tmp(f, &xn, f->act, 2, T, H, 0));
-    ATH_CHECK(tmp(f, &y, f->act, 2, T, H, 0));
-
-    ATH_CHECK(ath_rmsnorm(f->dev, x, W(f, L->input_norm), 1.0f, f->eps, &xn));
     if (f->c->mixer[l] == ATH_QWEN35_ATTENTION)
-        ATH_CHECK(attention(f, L, &xn, &y));
+        ATH_CHECK(attention(f, L, x));
     else
-        ATH_CHECK(gated_deltanet(f, L, &xn, &y));
-    ATH_CHECK(ath_add(f->dev, x, &y, x));
-
-    ATH_CHECK(ath_rmsnorm(f->dev, x, W(f, L->post_norm), 1.0f, f->eps, &xn));
-    ATH_CHECK(mlp(f, L, &xn, &y));
-    return ath_add(f->dev, x, &y, x);
+        ATH_CHECK(gated_deltanet(f, L, x));
+    return mlp(f, L, x);
 }
 
 /* ---- entry point ------------------------------------------------------------------ */
@@ -362,14 +379,14 @@ ath_status ath_qwen35_forward(const ath_model *m, const ath_batch *b, ath_state 
     if (!b->logits)
         return ATH_OK;
     /* final norm and output projection on the rows that need logits */
-    ath_tensor rows = x, xn, logits = *b->logits;
+    ath_tensor rows = x, logits = *b->logits;
     if (b->logits->shape[0] == 1)
         ATH_CHECK(ath_tensor_slice(&x, 0, T - 1, 1, &rows));
-    ATH_CHECK(tmp(&f, &xn, f.act, 2, rows.shape[0], H, 0));
-    ATH_CHECK(ath_rmsnorm(f.dev, &rows, W(&f, q->norm), 1.0f, f.eps, &xn));
     if (f.dev && !on_dev)
         ATH_CHECK(tmp(&f, &logits, ATH_DTYPE_F32, 2, rows.shape[0], m->vocab_size, 0));
-    ATH_CHECK(ath_matmul(f.dev, f.pool, &xn, W(&f, q->head), &logits));
+    const ath_tensor *hw[] = {W(&f, q->head)};
+    ath_tensor *ho[] = {&logits};
+    ATH_CHECK(norm_matmuls(&f, &rows, q->norm, 1, hw, ho));
     if (!f.dev || on_dev)
         return ATH_OK;          /* a device batch: no copy and no wait */
     ATH_CHECK(ath_copy(f.dev, b->logits->data, logits.data, ath_tensor_nbytes(&logits), ATH_STREAM_COMPUTE));
