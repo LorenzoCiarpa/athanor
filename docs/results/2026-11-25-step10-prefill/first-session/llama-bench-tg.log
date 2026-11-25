@@ -1,0 +1,9 @@
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 15817 MiB):
+  Device 0: NVIDIA GeForce RTX 5080, compute capability 12.0, VMM: yes, VRAM: 15817 MiB
+| model                          |       size |     params | backend    | ngl |  fa |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | --: | --------------: | -------------------: |
+| qwen35 0.8B BF16               |   1.44 GiB |   772.85 M | CUDA       |  99 |   1 |           tg128 |        440.26 ± 0.32 |
+| qwen35 0.8B BF16               |   1.44 GiB |   772.85 M | CUDA       |  99 |   1 |   tg128 @ d4096 |        428.59 ± 0.58 |
+| qwen35 0.8B BF16               |   1.44 GiB |   772.85 M | CUDA       |  99 |   1 |  tg128 @ d32768 |        360.50 ± 0.63 |
+
+build: 5220a2d (1)

@@ -129,6 +129,8 @@ ATH_FORWARD_DETAIL=1 ./build/test_forward golden     # KL, margin and greedy cho
 
 A `DEBUG=1` build runs the first 4 positions of each prompt (three in one call, one alone) and checks the f32 tolerances; the gate needs every position.
 
+Step 10: the GPU forward records with the prompt kernels (attention on the tensor cores, the chunked Gated DeltaNet for the prose prompt's 83 tokens): pooled KL 4.399e-4 against the bf16 reference's 5.005e-4 (ratio 0.88; step 9 4.295e-4), 0 greedy differences above the noise; f32 KL 3e-12, logits within 8.8e-6, residual stream within 1.3e-5. The hooks of these tests watch the residual stream, so the forward pass adds each output projection in its own kernel here (the fused add waits for no hook).
+
 ## Engine
 
 Step 8 runs the forward pass on the GPU through the engine (`src/infer/engine.h`). Three checks hold it to the reference.
