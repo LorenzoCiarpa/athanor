@@ -226,7 +226,7 @@ y = (w · n) · silu(z)                 w plain (f32 in the checkpoint), silu(z)
 | Gates | `β = sigmoid(b)` (in bf16, then used in fp32); `g = −exp(A_log) · softplus(a + dt_bias)` in fp32; decay `α = exp(g)` ∈ (0, 1]. `A_log`, `dt_bias`, `in_proj_a` and `in_proj_b` are indexed by **value** head. |
 | Head grouping | when `nv > nk`, q/k head `i` serves value heads `[i·r, (i+1)·r)` with `r = nv / nk` (`repeat_interleave`). Here `r` = 1. |
 | Recurrence | per value head, state `S` [dk, dv] in fp32, zero at the start of a sequence: `S ← α_t·S`, `u = Sᵀk_t`, `S ← S + k_t·(β_t·(v_t − u))ᵀ`, `o_t = Sᵀq_t`. Equivalently `S_t = α_t·(I − β_t k_t k_tᵀ)·S_{t−1} + β_t·k_t v_tᵀ`; `docs/MODELS.md` writes the transposed state. |
-| Chunked form | `torch_chunk_gated_delta_rule` (chunk 64) computes the same recurrence for prefill; it is the reference for the step 10 kernels, not a different contract. |
+| Chunked form | `torch_chunk_gated_delta_rule` (chunk 64) computes the same recurrence for prefill; it is the reference for the step 10 kernels, not a different contract. Implemented in step 10 (`src/ops/cuda/gdn_chunk.cu`, fp32 as the reference's function): the same algebra reorganized (`docs/program/gdn-gpu-kernel.md`), checked against the recurrent reference on random inputs and on the golden records (`tests/README.md`, Prompt kernels). |
 | Output | `o` [T, nv, dv] cast to bf16, gated RMSNorm per value head with `z` (above), flattened to [T, value_dim], then `out_proj`. Resolves the output **verify** item. |
 | State per layer | recurrent `nv × dk × dv` fp32 (1 MiB here) plus conv `(K − 1) × conv_dim` values per sequence. `mamba_ssm_dtype: float32` in the config matches the fp32 recurrent state. |
 

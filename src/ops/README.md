@@ -28,7 +28,7 @@ tests/test_ops.c      ref vs golden data; GPU vs ref; fast vs ref
 | `act.c` | `ath_swiglu_ref`, `ath_sigmoid_mul_ref`, `ath_add_ref` |
 | `attn.c` | `ath_attn_ref`: causal softmax attention with grouped-query heads, the queries being the last T of S positions |
 | `conv.c` | `ath_conv_ref`: causal depthwise conv1d over time with a `[K − 1, C]` running state, optional SiLU |
-| `gdn.c` | `ath_gdn_gates_ref` (decay and write strength), `ath_gdn_ref` (gated delta rule, recurrent form, state `[nv, dk, dv]` in f32) |
+| `gdn.c` | `ath_gdn_gates_ref` (decay and write strength), `ath_gdn_ref` (gated delta rule, recurrent form, state `[nv, dk, dv]` in f32; from step 10 it L2-normalizes q and k itself, with `ath_l2norm_ref`'s expression, and takes q, k, v as rows any stride apart) |
 | `sample.c` (step 5) | `ath_sample_ref`: the next token from the logits, below |
 | `dispatch.c` (step 8) | `ath_<op>(d, ...)`: the op on device d, or on the CPU without one |
 
@@ -66,7 +66,8 @@ Every function is tested on hand-computed cases in `tests/test_ops.c` and agains
 | `<op>.c` | `ath_<op>_gpu` next to `ath_<op>_ref`: the same argument checks (one `args` function per op, called with `OPS_HOST` or `OPS_GPU`), then the launcher |
 | `cuda/<op>.cu` | the kernels and the launcher `ath_<op>_launch` (C linkage), which makes the device current and queues the kernels |
 | `launch.h` | private: the launchers' declarations, the boundary between the C and the kernels |
-| `cuda/kernel.cuh` | private, device code: `k_ld`/`k_st` (f32 and bf16, the host's rounding bit for bit), `k_warp_sum`, `k_block_sum`, `k_silu`, grid-stride loops |
+| `cuda/kernel.cuh` | private, device code: `k_ld`/`k_st` (f32 and bf16, the host's rounding bit for bit), `k_ld4`/`k_ld8` (4 or 8 elements in one load), `k_warp_sum`, `k_block_sum`, `k_silu`, grid-stride loops |
+| `cuda/mma.cuh` (step 10) | private, device code: NVIDIA's warp-level matrix instructions in PTX (`mma.sync` bf16, `ldmatrix`, `cp.async`), their fragment layouts, and bf16 packing; `ATH_HAVE_MMA` is unset under HIP, where the kernels that use them are not compiled |
 | `gpu_none.c` | the launchers in a build without a GPU (`make`): `ATH_ERR_UNSUPPORTED`, after the `_gpu` function has checked its arguments |
 | `check.h` | `ops_place` (`OPS_PLACE`): every tensor on the host for `_ref` and `_fast`, on the device for `_gpu` |
 
@@ -107,19 +108,35 @@ Decode reads every weight once per token, so its time is the time to read them p
 
 Tried and dropped, measured: programmatic dependent launch for the GEMV (no gain inside the graph), double-buffered weight loads and eight pieces in flight (no gain), normalizing x inside the GEMV (each block's prologue cost more than the norm kernel it saved), 256-key attention pieces (too few blocks for one query).
 
+## Prompt kernels (step 10)
+
+A prompt is matrix products: cuBLASLt's run near the GPU's bf16 rate, and step 10 made the rest follow. Before it, a prompt of 4096 tokens spent 60% of its time in attention (each query walking its keys alone) and 28% in the Gated DeltaNet (the recurrence, token by token); after it, 53% in cuBLASLt. The numbers are in `docs/results/2026-11-25-step10-prefill/`.
+
+| File, op | Kernel |
+| --- | --- |
+| `cuda/attn_mma.cu`, `attn` from `ATH_ATTN_MMA_MIN_T` (16) queries in bf16, d = dv up to 256 | FlashAttention's forward pass on the tensor cores: a block of 8 warps takes 128 queries of one head (16 per warp) and walks tiles of 32 keys; scores and the weighted sum with `mma.sync` (bf16 products, fp32 sums), the online softmax in fp32 and base 2, the probabilities rounded to bf16 before they multiply the values (as FlashAttention), and their sum taken over the rounded values, so the weights the output applies add up to one. The queries stay in shared memory (64 KiB), keys and values load by `cp.async` while the other half of the tile is computed, the 16-byte chunks of every row permuted by the row (swizzle) so that `ldmatrix` reads 8 rows from 8 banks. Key tiles start at multiples of 32 whatever the query rows, so a query's output depends on its own position only: pieces of a prompt give the bits of the prompt at once. Two warps per scheduler let one's softmax overlap the other's products |
+| `cuda/gdn_chunk.cu`, `gdn` from `ATH_GDN_CHUNK_MIN_T` (64) tokens with scratch, dk up to 128 | the chunked form of the reference (`torch_chunk_gated_delta_rule`, chunks of 64), fp32 throughout. `prep`, a block per chunk and value head: q and k normalized (L2) as they arrive, the in-chunk decays, A = β (k_i · k_j) Γ_ij and M = q_scale (q_i · k_j) Γ_ij, T = (I + A)⁻¹ by blocks of 16, W = T (β e^γ K), U = T (βV), Q'' = q_scale e^γ Q − M W, O_U = M U; matrix products of 8 × 8 tiles per lane, so that a load from shared memory feeds 16 multiply-adds. `scan`, a block per value head and 32 state columns, walks the chunks: O = Q'' S + O_U, Δ = U − W S, S ← e^γ_last S + Kᵀ(e^(γ_last − γ) Δ / \|k\|). The tokens go in rounds that fill the GPU four times with prep blocks and stay in L2; each launch runs the scan of one round (64 blocks) and the prep of the next on the multiprocessors the scan leaves free. A prompt fed in pieces of whole chunks gives the bits of the prompt at once |
+| `gdn` (both forms) | q and k are normalized inside the op (step 10): the normalized values are never written. q, k and v may be rows any stride apart, so the forward pass passes column ranges of the convolution's output without copying them |
+| `cuda/conv.cu`, a prompt | 8 tokens of 256 channels per block, a thread's inputs loaded at once, no index divided: the same bits |
+| `cuda/norm.cu`, `ath_add_rmsnorm_gpu` | the residual add fused into the next RMSNorm (x += y rounded and stored as `ath_add`, then the norm of what was stored), the bits of the two ops; rows of at most 16 pieces take 16 or 8 lanes, two or four rows to a warp |
+
+Every kernel of the table matches its reference within the tolerances of `tests/README.md`, Prompt kernels. The attention's bf16 probabilities move each weight by a relative 2^-8 at most; the chunked recurrence is fp32 with another order of operations; the rest keeps the bits.
+
+Measured and dropped: adding a prompt's output projection inside cuBLASLt (beta = 1, 1.2 ms of pp4096) rounds once where the reference rounds twice and moved one greedy token above the noise in step 8's gate; choosing cuBLASLt's algorithm by timing its candidates (0 to 9% per shape, about 1.3 ms of pp4096) would make the bits depend on the timings; a plan cache for cuBLASLt (prompts are GPU-bound: the host queues 10.2 ms of kernels in less time than they run); not inlining the triangular product (its 8 × 8 tile went through local memory, 8 times slower). Kernels are kept small on purpose: the chunked prep was 9.7k instructions, more than the instruction cache, and code that runs once per block (stores of 64 values, IEEE divisions) ran at the speed of fetching it from L2; written as loops it went from 145 to 130 µs.
+
 ## Op list
 
 | Op | Content | Step |
 | --- | --- | --- |
 | `embed` | token embedding lookup | 3, 7 (GPU) |
-| `norm` | RMSNorm (parameterization per contract), gated RMSNorm, L2 norm | 3, 7 (GPU) |
+| `norm` | RMSNorm (parameterization per contract), gated RMSNorm, L2 norm; the residual add fused into RMSNorm on the GPU | 3, 7 (GPU), 10 |
 | `rope` | rotary embedding, full or partial | 3, 7 (GPU) |
 | `act` | SwiGLU, sigmoid gates, residual add | 3, 7 (GPU) |
 | `matmul` | dense GEMM/GEMV for bf16 and f32 (cuBLASLt on the GPU); per-format GEMV/GEMM from phase 2 | 3 (ref), 4 (fast CPU), 7 (GPU), 9–10 (fast GPU) |
-| `attn` | causal attention with GQA: naive reference; tiled prefill and split-K decode on GPU | 3, 7, 9, 10 |
+| `attn` | causal attention with GQA: naive reference; split-K decode and tensor-core prefill on GPU | 3, 7, 9, 10 |
 | `conv` | short depthwise causal conv1d with state | 3, 7 (GPU) |
 | `scatter` | rows written at given rows (the KV cache by position) | 9 |
-| `gdn` | Gated DeltaNet: gates; recurrent reference (CPU and GPU decode), chunkwise-parallel GPU prefill | 3, 7, 10 |
+| `gdn` | Gated DeltaNet: gates; recurrent reference (CPU and GPU decode), chunkwise-parallel GPU prefill; L2 norm of q and k inside (step 10) | 3, 7, 10 |
 | `moe` | router top-k, expert dispatch, grouped GEMM, shared expert | 12 |
 | `sample` | greedy, temperature, top-k, top-p, min-p (step 5); GPU sampling, greedy and top-k up to 64 (step 9); presence and repetition penalties later | 5, 9 |
 | `quant` | (de)quantization per format | Q1 |

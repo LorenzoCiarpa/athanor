@@ -15,7 +15,7 @@ Within inference, the first five steps run on the CPU only. They produce a slow 
 | License | MIT | decided |
 | Model family | Qwen hybrid line (Qwen3.5 / 3.6 / 3.8) | decided |
 | First model | Qwen3.5-0.8B, directly (no classic Qwen3 bring-up) | default, revisit if blocked |
-| Dense GEMM | cuBLASLt / hipBLASLt behind `ops/matmul`; own kernels for GEMV, quantized and fused paths; replace vendor GEMM only where a benchmark shows a gain | default, revisit at step 10 |
+| Dense GEMM | cuBLASLt / hipBLASLt behind `ops/matmul`; own kernels for GEMV, quantized and fused paths; replace vendor GEMM only where a benchmark shows a gain | decided at step 10 (2026-11-25): cuBLASLt kept, with its heuristic's first algorithm. Measured: its prompt GEMMs run at 106 to 145 TFLOPS on the RTX 5080; timing its candidates would gain 0 to 9% per shape but make the bits depend on the timings; adding the residual in its epilogue changes the rounding (`src/ops/README.md`, Prompt kernels) |
 | Build system | plain Makefile | default |
 | Binary | one `athanor` binary with subcommands | decided |
 | Docs language | English | decided |

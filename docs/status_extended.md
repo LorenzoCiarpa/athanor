@@ -22,6 +22,7 @@ How to read it:
   - [Step 8: sequence state and engine](#step-8-sequence-state-and-engine)
   - [Before step 9: source layout](#before-step-9-source-layout)
   - [Step 9: fast decode and bench](#step-9-fast-decode-and-bench)
+  - [Step 10: fast prefill](#step-10-fast-prefill)
 - [Files by step](#files-by-step)
 
 ---
@@ -1159,6 +1160,49 @@ Commit `7d680de`.
 
 The report, `docs/results/2026-11-25-step9-decode/`; READMEs of `src/ops`, `src/backend`, `src/infer`, `src/model`, `src/models/qwen35`, `src/core`, `tools`, `tests`; `docs/ARCHITECTURE.md` (the device batch, positions); `docs/program/PROGRAM.md` rows 6 and 8; `STATUS.md` and this file.
 
+### Step 10: fast prefill
+
+Branch `step10-fast-prefill`, from `step9-fast-decode`. The gate of `docs/PLAN.md`: prefill tokens/s within 15% of vLLM's for a single request. Every change below was measured with `athanor bench` on the RTX 5080 and profiled with Nsight Systems; the report is `docs/results/2026-11-25-step10-prefill/`.
+
+#### 10.1 The vLLM baseline
+
+No file of the repository: vLLM 0.34.0 (torch 2.14.0 for CUDA 13.0) in a virtual environment in `~/opt/vllm-venv`, outside athanor (invariant 3 is about the engine, not the tools it is measured against), with the FlashInfer kernels it asks for (`vllm download-kernels`) and `CUDA_HOME` set to the CUDA 13.5 toolkit, as its own warnings recommend. Single requests with `vllm bench latency` (one output token, prefix caching off, the default for that tool) and the forward pass alone with `vllm bench forward`.
+
+#### 10.2 Tiled attention on the tensor cores
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `src/ops/cuda/mma.cuh` | New | NVIDIA's warp-level matrix instructions in PTX: `mma.sync` (bf16, fp32 sums), `ldmatrix` (plain and transposed), `cp.async` with zero fill, bf16 packing (`cvt.rn.bf16x2`); the fragment layouts in the header; `ATH_HAVE_MMA` unset under HIP |
+| `src/ops/cuda/attn_mma.cu` | New | FlashAttention's forward pass: 8 warps and 128 queries of one head per block, tiles of 32 keys at absolute positions, the online softmax in base 2, bf16 probabilities whose rounded values the sum adds up, swizzled shared memory, the next tile loading during the current one; rescaling skipped when no row's maximum moved; one reciprocal per output row; `ath_attn_mma_fits` |
+| `src/ops/attn.c`, `ops.h`, `launch.h`, `gpu_none.c` | Changed | `ath_attn_gpu` takes the tensor cores from `ATH_ATTN_MMA_MIN_T` (16) queries where the kernel fits; the declarations and stubs |
+
+#### 10.3 The chunked Gated DeltaNet
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `src/ops/cuda/gdn_chunk.cu` | New | The chunked form (`docs/program/gdn-gpu-kernel.md`): `prep` (normalize q and k, decays, A and M, T = (I + A)⁻¹ in blocks of 16, W, U, Q'', O_U, as 8 × 8 tiles per lane) and `scan` (the chunks in order with the state, three products per chunk), run as one launch per round (`gdn_round`: a round's scan and the next round's prep); rounds sized from the device's multiprocessors, two rounds' scratch |
+| `src/ops/gdn.c`, `ops.h`, `dispatch.c` | Changed | `ath_gdn` takes an L2 epsilon and normalizes q and k itself (the reference with `ath_l2norm_ref`'s expression: the CPU's bits as before), q, k, v as rows any stride apart, and a scratch arena; the chunked form from `ATH_GDN_CHUNK_MIN_T` (64) tokens |
+| `src/ops/cuda/gdn.cu` | Changed | The recurrence normalizes q and k per token (sums of squares over the warps, in warp order) and reads strided rows |
+| `src/ops/check.h` | Changed | `ops_float_rows`: rows any stride apart, each contiguous |
+| `src/ops/cuda/kernel.cuh` | Changed | `k_ld4` |
+
+#### 10.4 The rest of a prompt
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `src/ops/cuda/conv.cu` | Changed | A prompt in tiles of 8 tokens per thread, every input loaded before the sums, no index divided: the same bits |
+| `src/ops/cuda/norm.cu`, `norm.c`, `ops.h`, `launch.h`, `gpu_none.c` | Changed | Rows of up to 16 pieces take 16 or 8 lanes (two or four rows per warp), the same bits; `ath_add_rmsnorm_gpu`, the residual add in the norm's launch with the bits of the two ops |
+| `src/models/qwen35/forward.c` | Changed | q, k, v of the Gated DeltaNet as views of the convolution's output, normalized inside `ath_gdn`; a prompt's output projection waits for the next norm (`pend`), not when a hook watches the residual stream |
+| `src/ops/cuda/matmul.cu` | Unchanged | Adding a prompt's projection inside cuBLASLt (beta = 1) was written, measured and removed (log) |
+
+#### 10.5 Tests
+
+`tests/test_gpu_ops.c` (`gpu_attn_mma`: the error bound of bf16 probabilities on five shapes, pieces bit for bit, NaN rows; `gpu_gdn_chunk`: five shapes in f32 and bf16, pieces of whole chunks bit for bit; `gpu_add_rmsnorm`: bit for bit against the two ops; q and k of the Gated DeltaNet tests given not normalized; decode against the prompt's last row now with a prompt short enough to take the other attention kernels), `tests/test_golden.c` (the Gated DeltaNet record with q and k as given, through the chunked form on the GPU; the attention tolerance on the tensor cores), `tests/test_ops.c` (the new `ath_gdn_ref` argument: 0 for the hand-computed cases, whose unit vectors stay exact). `tests/README.md`, Prompt kernels.
+
+#### 10.6 Report and documentation
+
+The report, `docs/results/2026-11-25-step10-prefill/`; READMEs of `src/ops` (Prompt kernels), `src/models/qwen35`, `tests`; `docs/program/gdn-gpu-kernel.md` (the chunked form), `docs/program/PROGRAM.md` (rows 10 and 10b), `docs/PLAN.md` (Dense GEMM decided), `README.md`, this file and `STATUS.md`.
+
 ---
 
 ## Files by step
@@ -1233,3 +1277,5 @@ Every file of the repository and the steps that created or changed it (documenta
 | module READMEs | closing (`src/core`, `tests`, `tools`) | 2.2, 2.5, 2.6, 2.7 (`src/model`, `src/models/qwen35`, `tools`, `tests`) | 3.2, 3.3, 3.6, 3.7 (`src/core`, `src/ops`, `tests`, `tests/golden`, `src/backend`) | 4.6 (`src/model`, `src/models/qwen35`, `tests`, `tests/golden`); 4.7 (`src/core`, `src/ops`, `src/backend`, `src/model`, `src/models/qwen35`, `tests`); 4.8 (`src/model`, `src/models/qwen35`, `src/net`, `src/infer`, `src/text`, `tools`) | 5.9 (`src/core`, `src/text`, `src/ops`, `src/model`, `src/models/qwen35`, `tools`, `tests`) | 6.8 (`src/backend`, `src/core`, `tools`, `tests`) | 7.6 (`src/ops`, `src/backend`, `tests`, `src/core`) | 8.9 (`src/model`, `src/models/qwen35`, `src/infer`, `src/ops`, `src/backend`, `tools`, `tests`, `tests/golden`) |
 
 Before step 9 (source layout), `src/backend/{gpu.cu,gpu.h,compat.h}` moved to `src/backend/cuda/` and `src/ops/{kernel.cuh,*.cu}` to `src/ops/cuda/`. The rows above keep the paths the steps used.
+
+Steps 9 and 10 list their files in their own sections above. New in step 10: `src/ops/cuda/mma.cuh`, `attn_mma.cu`, `gdn_chunk.cu`.
