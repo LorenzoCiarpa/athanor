@@ -36,15 +36,13 @@
  */
 #include "ops/cuda/mma.cuh"
 
-#define FA_WARPS 4
+#define FA_WARPS 8
 #define FA_ROWS (16 * FA_WARPS)                         /* queries per block   */
-#define FA_KEYS 64                                       /* keys per tile       */
+#define FA_KEYS 32                                       /* keys per tile       */
 #define FA_DIM 256                                       /* largest head dim    */
 #define FA_ROW_BYTES (FA_DIM * 2)
 #define FA_SMEM ((FA_ROWS + 2 * FA_KEYS) * FA_ROW_BYTES) /* 96 KiB              */
-#if FA_ROWS != FA_KEYS
-#error "fa_load loads tiles of FA_KEYS rows, the queries' tile too"
-#endif
+#define FA_LOG2E 1.44269504088896340736f
 
 #ifdef ATH_HAVE_MMA
 
@@ -55,12 +53,13 @@ static __device__ __forceinline__ uint32_t fa_sw(int r, int ch)
     return (uint32_t)(r * FA_ROW_BYTES + ((ch ^ (r & 7)) << 4));
 }
 
-/* Rows r0 … r0 + 63 of a [rows, stride] bf16 matrix into a tile, d elements
- * each (d / 8 chunks); rows after last are zeros (never read from memory). */
-static __device__ __forceinline__ void fa_load(unsigned char *tile, const uint16_t *src, int64_t r0, int64_t last,
-                                               int64_t stride, int nch)
+/* Rows r0 … r0 + rows − 1 of a [rows, stride] bf16 matrix into a tile, d
+ * elements each (d / 8 chunks); rows after last are zeros (never read from
+ * memory). */
+static __device__ __forceinline__ void fa_load(unsigned char *tile, int rows, const uint16_t *src, int64_t r0,
+                                               int64_t last, int64_t stride, int nch)
 {
-    for (int e = threadIdx.x; e < FA_KEYS * nch; e += FA_WARPS * ATH_WARP) {
+    for (int e = threadIdx.x; e < rows * nch; e += FA_WARPS * ATH_WARP) {
         const int r = e / nch, ch = e % nch;
         const bool ok = r0 + r <= last;
         k_cp16(tile + fa_sw(r, ch), ok ? src + (r0 + r) * stride + ch * 8 : src, ok);
@@ -78,6 +77,7 @@ attn_mma(const uint16_t *q, const uint16_t *k, const uint16_t *v, const int32_t 
     const int g = lane / 4, c = 2 * (lane % 4), nch = d / 8;
     const int64_t t0 = (int64_t)(gridDim.x - 1 - blockIdx.x) * FA_ROWS;   /* longest rows first */
     const int64_t h = blockIdx.y, kh = h / (nh / nkv);
+    const float sl = scale * FA_LOG2E;                  /* scores in base 2: exp(x) = 2^(x log2 e) */
 
     /* positions of the block's queries (−1: none, or outside the keys) and
      * the last key any of them sees */
@@ -95,8 +95,8 @@ attn_mma(const uint16_t *q, const uint16_t *k, const uint16_t *v, const int32_t 
     const int ra = warp * 16 + g;                       /* this lane's rows: ra, ra + 8 */
     const int32_t pa = prow[ra], pb = prow[ra + 8];
 
-    fa_load(qs, q + h * d, t0, T - 1, nh * d, nch);
-    fa_load(ks, k + kh * d, 0, kmax, nkv * d, nch);
+    fa_load(qs, FA_ROWS, q + h * d, t0, T - 1, nh * d, nch);
+    fa_load(ks, FA_KEYS, k + kh * d, 0, kmax, nkv * d, nch);
     k_cp_commit();
 
     float o[FA_DIM / 8][4];
@@ -105,13 +105,13 @@ attn_mma(const uint16_t *q, const uint16_t *k, const uint16_t *v, const int32_t 
         o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.0f;
     float m[2] = {-INFINITY, -INFINITY}, l[2] = {0.0f, 0.0f};
 
-    for (int64_t j0 = 0; j0 <= kmax; j0 += FA_KEYS) {
+    for (int32_t j0 = 0; j0 <= kmax; j0 += FA_KEYS) {
         k_cp_wait_all();
         __syncthreads();                                /* keys in; the values' tile is free */
-        fa_load(vs, v + kh * d, j0, kmax, nkv * d, nch);
+        fa_load(vs, FA_KEYS, v + kh * d, j0, kmax, nkv * d, nch);
         k_cp_commit();
 
-        /* S = Q Kᵀ for the warp's 16 queries and the tile's 64 keys */
+        /* S = Q Kᵀ for the warp's 16 queries and the tile's keys */
         float s[FA_KEYS / 8][4];
 #pragma unroll
         for (int n = 0; n < FA_KEYS / 8; n++)
@@ -131,14 +131,14 @@ attn_mma(const uint16_t *q, const uint16_t *k, const uint16_t *v, const int32_t 
             }
         }
 
-        /* scale, mask, the rows' maxima over the quad that shares them */
+        /* scale (base 2), mask, the rows' maxima over the quad that shares them */
         float mx[2] = {-INFINITY, -INFINITY};
 #pragma unroll
         for (int n = 0; n < FA_KEYS / 8; n++)
 #pragma unroll
             for (int e = 0; e < 4; e++) {
-                const int64_t j = j0 + 8 * n + c + (e & 1);
-                const float x = j <= (e < 2 ? pa : pb) ? __fmul_rn(s[n][e], scale) : -INFINITY;
+                const int32_t j = j0 + 8 * n + c + (e & 1);
+                const float x = j <= (e < 2 ? pa : pb) ? __fmul_rn(s[n][e], sl) : -INFINITY;
                 s[n][e] = x;
                 mx[e >> 1] = fmaxf(mx[e >> 1], x);
             }
@@ -149,7 +149,7 @@ attn_mma(const uint16_t *q, const uint16_t *k, const uint16_t *v, const int32_t 
             mx[i] = fmaxf(mx[i], ath_shfl_xor(mx[i], 2));
             const float mn = fmaxf(m[i], mx[i]);
             base[i] = mn == -INFINITY ? 0.0f : mn;       /* a row that sees nothing yet: all exp give 0 */
-            corr[i] = expf(__fsub_rn(m[i], base[i]));    /* 0 on its first keys, 1 if the maximum stays */
+            corr[i] = exp2f(__fsub_rn(m[i], base[i]));   /* 0 on its first keys, 1 if the maximum stays */
             m[i] = mn;
         }
 
@@ -160,8 +160,8 @@ attn_mma(const uint16_t *q, const uint16_t *k, const uint16_t *v, const int32_t 
         for (int n = 0; n < FA_KEYS / 8; n++)
 #pragma unroll
             for (int i = 0; i < 2; i++) {
-                const uint32_t w = k_pack_bf16(expf(__fsub_rn(s[n][2 * i], base[i])),
-                                               expf(__fsub_rn(s[n][2 * i + 1], base[i])));
+                const uint32_t w = k_pack_bf16(exp2f(__fsub_rn(s[n][2 * i], base[i])),
+                                               exp2f(__fsub_rn(s[n][2 * i + 1], base[i])));
                 pf[n][i] = w;
                 ls[i] = __fadd_rn(ls[i], __fadd_rn(k_bf16_to_f32((uint16_t)w), k_bf16_to_f32((uint16_t)(w >> 16))));
             }
@@ -179,7 +179,7 @@ attn_mma(const uint16_t *q, const uint16_t *k, const uint16_t *v, const int32_t 
         k_cp_wait_all();
         __syncthreads();                                /* values in; the keys' tile is free */
         if (j0 + FA_KEYS <= kmax) {
-            fa_load(ks, k + kh * d, j0 + FA_KEYS, kmax, nkv * d, nch);
+            fa_load(ks, FA_KEYS, k + kh * d, j0 + FA_KEYS, kmax, nkv * d, nch);
             k_cp_commit();
         }
 
