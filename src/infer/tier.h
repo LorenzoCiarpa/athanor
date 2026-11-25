@@ -16,6 +16,10 @@
  * memory that the kernels read and the host flags the CPU reads; no pass
  * is running then, so a captured decode step simply sees the new places.
  *
+ * Only Q8_0 experts are split between the GPU and the CPU: their two paths
+ * share one arithmetic order (src/ops/q8_0.h). Experts in another dtype
+ * must all fit in device memory (ATH_ERR_UNSUPPORTED otherwise).
+ *
  * Pipeline code: devices, memory, copies through backend.h, computation
  * through ops.h (invariant 11). Which params are experts, and of which
  * layer, comes from the contract (roles, layer, expert), never from names.

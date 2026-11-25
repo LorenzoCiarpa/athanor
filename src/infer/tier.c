@@ -139,6 +139,15 @@ ath_status ath_place_open(ath_placement *t, const ath_model *m, const ath_device
     if (t->o.slots >= 0 && t->o.slots < slots)
         slots = t->o.slots;
     slots = slots > E ? E : slots;
+    /* Only Q8_0 experts have one arithmetic order on the CPU and the GPU
+     * (src/ops/q8_0.h): experts in another dtype go to the device whole,
+     * or not at all, so that placement never changes a result (invariant 7) */
+    if (slots < E && dt != ATH_DTYPE_Q8_0) {
+        ath_log(ATH_LOG_ERROR, "tier: %s experts must all be in device memory (%lld of %lld per layer fit); only "
+                "Q8_0 experts can be split between the GPU and the CPU", ath_dtype_name(dt), (long long)slots,
+                (long long)E);
+        return ATH_ERR_UNSUPPORTED;
+    }
     t->slots = (int32_t)slots;
     const bool all = slots == E;
 

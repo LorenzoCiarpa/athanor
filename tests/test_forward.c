@@ -819,7 +819,13 @@ ATH_TEST(forward_golden)
                "  token differs from the fp32 reference at %d of %d positions whose top-2 margin exceeds the bf16 noise\n",
                d ? "GPU" : "CPU", all_n[d], all_kl[d] / all_n[d], all_ref[d] / all_n[d], all_kl[d] / all_ref[d],
                all_bad[d], all_checked[d]);
-        if (full) {
+        /* ATH_FORWARD_NO_KL_GATE: a model of random weights (tests/golden/tiny_moe.py), where
+         * athanor's and the bf16 reference's errors are rounding noise of the same size and
+         * which is smaller is chance (ratios 0.14 to 1.65 over five seeds, step 12): reported,
+         * not gated */
+        if (full && getenv("ATH_FORWARD_NO_KL_GATE"))
+            printf("  (KL rule not gated: ATH_FORWARD_NO_KL_GATE)\n");
+        else if (full) {
             char msg[200];
             if (!(all_kl[d] <= all_ref[d])) {
                 snprintf(msg, sizeof msg, "bf16 %s: mean KL %.3g > bf16 reference %.3g", d ? "GPU" : "CPU",
