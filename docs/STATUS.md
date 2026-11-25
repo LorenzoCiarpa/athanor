@@ -6,11 +6,76 @@ This file is the overview. [`status_extended.md`](status_extended.md) goes one l
 
 ## Current step
 
-**Step 12: MoE and tiering** (see `docs/PLAN.md` §4). Started 2026-11-25 on branch `step12-moe-tiering`, from `main` (steps 1–10). Step 11 is postponed (log). **Done 2026-11-25** (pushed; merging into `main` is the maintainer's call).
+**Step 13: server and MTP** (see `docs/PLAN.md` §4). Started 2026-11-25 on branch `step13-server-mtp`, from `main` (steps 1–10 and 12), at the maintainer's request: the main functions first, optimizations later (the prefill of MoE prompts, among others, stays in Possible later work).
+
+Goal: athanor as a model server that coding agents drive.
+- **The server.** `athanor serve` speaks the three APIs the target harnesses use, verified 2026-11-25:
+  - Claude Code 2.1.332: Anthropic Messages, `/v1/messages`;
+  - Codex CLI 0.167.0: OpenAI Responses, `/v1/responses` (its `wire_api = "chat"` is no longer supported);
+  - OpenCode: OpenAI Chat Completions, `/v1/chat/completions`.
+  
+  Each with streaming and tool calls: the family renders the tools into the prompt and parses the calls out of the output (step 5), and the server converts its events to each API's format. The server never runs a tool (invariant 10).
+- **MTP.** Speculative decoding with the multi-token prediction head that steps 2 and 12 bound as `unused`. The head drafts the token after next; the main model verifies it in the same pass as the next token.
+
+The gate of `docs/PLAN.md`: works with Claude Code, Codex CLI and OpenCode; multi-turn sessions with tool calls succeed on a fixed task set; speculative-decoding speedup reported.
+
+### Tasks
+
+- [ ] **13.1 HTTP.** `src/net/http.{h,c}`: HTTP/1.1 on POSIX sockets, bound to 127.0.0.1 by default.
+  - Requests with a body of known length; responses with a length or as server-sent events.
+  - Keep-alive; several connections served in turn by one loop (the engine runs one sequence at a time).
+- [ ] **13.2 The APIs.** `src/net/api.{h,c}`: each API's request parsed into one request (messages, tool definitions, tool calls and their results, sampling, limits, streaming, thinking), and the generation's events written back in its format:
+  - Anthropic `/v1/messages`, its token count, and its streamed content blocks (`text`, `thinking`, `tool_use`);
+  - OpenAI `/v1/chat/completions`, with `tool_calls` deltas;
+  - OpenAI `/v1/responses`, with output items and function calls;
+  - `/v1/models`.
+  
+  Unknown fields are ignored; malformed requests get each API's error shape.
+- [ ] **13.3 Generation for the server.**
+  - The rendered prompt is tokenized. A state is reused when the new prompt extends a snapshot taken after a previous prompt, as `athanor chat` does: a recurrent state cannot be rolled back, so the snapshot is the way back.
+  - Decoding uses the decoder and the request's sampler, and stops at the model's end tokens, a stop string or the token limit.
+  - The family's parser turns the output into events as it streams.
+- [ ] **13.4 `athanor serve`.** `tools/serve.c`: model, host, port, context, experts, thinking default.
+- [ ] **13.5 Presence penalty** (open question of step 5): in the sampler, on the CPU and the GPU, from a request's `presence_penalty`.
+- [ ] **13.6 MTP.**
+  - **Contract.** The head's math from the reference (vLLM 0.34.0, `qwen3_5_mtp.py`), recorded in the contracts:
+    - logits of token t + 2 = head(norm(layer(fc([norm_e(embed(token t + 1)); norm_h(h_t)])))), with the main model's embedding and head;
+    - the GGUF's names and transforms checked on its values.
+  - **The family.** The forward pass of the head (a contract addition: a draft forward with the last hidden state).
+  - **`src/infer/spec.c`.** Draft one token, verify two in one pass. On a rejection the recurrent and convolution state are restored from a copy taken before the pass, and the next token is rerun.
+  - **Decoders.** The decoder and `athanor bench` / `chat` / `serve` take it.
+- [ ] **13.7 Conformance.** A fixed task set: multi-turn sessions in which the harness must call tools (read, write, edit a file, run a command, search) and reach a result that can be checked. Run through Claude Code, Codex CLI and OpenCode against `athanor serve` with Qwen3.6-35B-A3B; transcripts and outcomes recorded.
+- [ ] **13.8 Tests.**
+  - The HTTP parser on whole, split and malformed requests.
+  - Each API's request → messages, and events → wire format, on fixtures.
+  - A loopback server test (requests over a socket, streamed responses).
+  - Speculative greedy decoding gives the tokens of plain greedy decoding.
+  - compute-sanitizer on the new kernels.
+- [ ] **13.9 Report and documentation.**
+  - The speculative decoding speedup (Qwen3.5-0.8B and Qwen3.6-35B-A3B, draft acceptance) and the conformance results under `docs/results/`.
+  - READMEs, ARCHITECTURE, PROGRAM.md, the contracts, this file and `status_extended.md`.
+
+### Acceptance criteria
+
+1. **The harnesses.** `athanor serve` with Qwen3.6-35B-A3B answers Claude Code, Codex CLI and OpenCode, streaming text and tool calls in each one's API.
+2. **Tool-calling conformance.** On the fixed task set, multi-turn sessions with tool calls succeed with each of the three harnesses. Every task has a checked outcome; transcripts are kept.
+3. **Speculative decoding.**
+   - With MTP drafts, greedy decoding produces the same tokens as without them (Qwen3.5-0.8B and Qwen3.6-35B-A3B).
+   - Decode tokens/s with and without MTP, and the acceptance rate, are reported (`docs/BENCHMARKS.md`).
+4. **The server's own tests.** HTTP and API conversion on fixtures, a loopback session, presence penalty against its reference.
+5. **Nothing else changes.** Decode, prefill and numerics of steps 10 and 12 as before.
+6. **Build and tests.** `make test`, `make cuda test` (also `DEBUG=1`) green; compute-sanitizer clean on new kernels; no warnings; `ldd` as in step 12 (sockets are libc).
+7. **Documentation updated.**
+
+## Completed steps
+
+### Step 12
+
+**Step 12: MoE and tiering** (see `docs/PLAN.md` §4). Started 2026-11-25 on branch `step12-moe-tiering`, from `main` (steps 1–10). Step 11 is postponed (log). **Done 2026-11-25** (pushed; merging into `main` is the maintainer's call). Merged into `main` (fast-forward) on 2026-11-25, at the maintainer's request; step 13 next.
 
 Goal: a model larger than the GPU. Qwen3.6-35B-A3B has 35B parameters, of which 3B are active per token. Each of its 40 layers routes a token to 8 of 256 experts plus a shared expert. In Q8_0 it weighs 37.8 GB: 2.6 GB of attention, Gated DeltaNet, shared experts, embeddings and output head, and 34.2 GB of routed experts (3.34 MB each). The GPU has 16 GB and the machine has 59 GiB of RAM. So the experts live in RAM, the GPU keeps the most-used ones, and the CPU computes the others where they are, in parallel with the GPU. At batch 1 a token reads about 320 experts, about 1.07 GB. The gate of `docs/PLAN.md` is Qwen3.6-35B-A3B decode at least Strata's on the same machine and quantization.
 
-### Decisions (2026-11-25, at the maintainer's request)
+#### Decisions (2026-11-25, at the maintainer's request)
 
 - **Weights: Q8_0, from Unsloth's GGUF.** Strata reads GGUF only (UD-Q4_K_XL, UD-Q6_K_XL, Q8_0; no bf16), and the bf16 checkpoint (71.9 GB) does not fit on the disk beside it. Both engines read one file:
   - weights: `unsloth/Qwen3.6-35B-A3B-MTP-GGUF`, revision `5bc3e238d916f48a861bac2f8a1990a0e9b7e98d`, `Qwen3.6-35B-A3B-Q8_0.gguf`, 37,801,097,504 bytes, sha256 `c1283d8b80c3e38b2735ddbc9766d3b3126f44d6c484be419d4e101d09a76131`. It contains 753 tensors: 443 in Q8_0, 308 in f32 (norms, router, convolution, decay), 2 in bf16 (the MTP router), plus the MTP layer as `blk.40`.
@@ -25,7 +90,7 @@ Goal: a model larger than the GPU. Qwen3.6-35B-A3B has 35B parameters, of which 
   Where an expert sits, and what the cache holds, never changes a result.
 - **The gate's measure.** Strata at a recorded commit, built from source for `sm_120`, on the same GGUF, measured at batch 1. The gate compares against Strata with MTP off: athanor has no speculative decoding until step 13, so this compares the same algorithm. Strata with MTP on is reported beside it. llama.cpp is reported too, with its experts on the CPU and as many in VRAM as fit.
 
-### Tasks
+#### Tasks
 
 - [x] **12.1 The Strata baseline.**
   - Strata at a recorded commit, built in `~/opt` with CUDA 13.5 for `sm_120`, pointed at the same GGUF (no second copy: 44 GB of disk are free).
@@ -71,7 +136,7 @@ Goal: a model larger than the GPU. Qwen3.6-35B-A3B has 35B parameters, of which 
   - compute-sanitizer.
 - [x] **12.9 Report and documentation.** The report under `docs/results/` with the raw logs; READMEs, ARCHITECTURE, PROGRAM.md, the contract, this file and `status_extended.md`.
 
-### Acceptance criteria
+#### Acceptance criteria
 
 1. **The gate.** athanor decodes Qwen3.6-35B-A3B in Q8_0 at batch 1, context 0, at least as many tokens/s as Strata with MTP off, on the same GGUF, the RTX 5080 and the Ryzen 7 9800X3D with 59 GiB of RAM.
    - Context 4096 is reported for both.
@@ -102,8 +167,6 @@ Result (2026-11-25, RTX 5080 `sm_120`, Ryzen 7 9800X3D, 59 GiB; driver 580.178.0
 | 5 | Qwen3.5-0.8B unchanged | in the session: tg128 448.1 against llama.cpp's 438.8; pp512 49,665, pp4096 56,997. Run alternately with step 10's build (three rounds each): pp4096 56,660 to 56,981 (step 10) and 56,683 to 56,985 (step 12), tg128 448.1 to 450.1 and 447.3 to 449.4, the same. The step 8 gate and the forward records as before (`make cuda test`); the CPU numbers of `test_forward` and `test_text` as before |
 | 6 | build and tests | `make test` and `make cuda test` green, also with `DEBUG=1` (the tests of Qwen3.6-35B-A3B skipped there with `ATH_MOE_DIR` unset: their 32 GB of host copies under ASan take too long); compute-sanitizer memcheck (with leak check), racecheck and initcheck on `gpu_matmul_q8_0`, `gpu_moe`, `gpu_moe_split`, memcheck on the engine's tests and the tiny MoE model's forward pass on the GPU: 0 errors, 0 hazards, 0 bytes leaked. No warnings; `ldd` as in step 10 (the Makefile's libraries are unchanged) |
 | 7 | documentation | READMEs of `src/core` (GGUF, ckpt, Q8_0), `src/ops` (Q8_0, MoE), `src/infer` (placement), `src/backend` (host calls), `src/models/qwen35` (GGUF layout), `tests` (Q8_0, MoE, GGUF, the MoE records); `docs/ARCHITECTURE.md` (the checkpoint table, the experts in `ath_exec`); `docs/contract/qwen36-35b-a3b.md`; `docs/program/PROGRAM.md` rows 1 and 11; `docs/PLAN.md` (step 12 decisions); `README.md`; the report; this file and `status_extended.md` |
-
-## Completed steps
 
 ### Step 10
 
@@ -517,7 +580,7 @@ Result (2026-11-23, Qwen3.5-0.8B revision `2fc0636`, gcc 15.2, glibc 2.43):
 
 ## Next step (preview)
 
-**Step 13: server and MTP** (`docs/PLAN.md` §4), next after step 12. The OpenAI- and Anthropic-compatible server over localhost (`src/net/`), so that Claude Code, Codex CLI and OpenCode can drive athanor with tool calls; speculative decoding with the MTP head that steps 2 and 12 left bound as `unused` (Qwen3.6-35B-A3B's `blk.40`, where Strata gains 1.3 to 1.5 times with it). Gate (`docs/PLAN.md`): works with Claude Code, Codex CLI and OpenCode; speculative-decoding speedup reported; tool-calling conformance on a fixed task set.
+Superseded preview (written in step 12; step 13 is current): **Step 13: server and MTP** (`docs/PLAN.md` §4), next after step 12. The OpenAI- and Anthropic-compatible server over localhost (`src/net/`), so that Claude Code, Codex CLI and OpenCode can drive athanor with tool calls; speculative decoding with the MTP head that steps 2 and 12 left bound as `unused` (Qwen3.6-35B-A3B's `blk.40`, where Strata gains 1.3 to 1.5 times with it). Gate (`docs/PLAN.md`): works with Claude Code, Codex CLI and OpenCode; speculative-decoding speedup reported; tool-calling conformance on a fixed task set.
 
 Superseded preview (written in step 10; step 12 is current): **Step 12: MoE and tiering** (`docs/PLAN.md` §4), next after step 10: step 11 is postponed (log, 2026-11-25). Experts routed per token, the expert weights placed across VRAM, RAM and disk, a fast CPU path for the experts that stay in RAM. Gate (`docs/PLAN.md`): Qwen3.6-35B-A3B decode at least Strata's on the same machine and quantization.
 
@@ -712,3 +775,4 @@ From step 12 (Qwen3.6-35B-A3B on the RTX 5080; `docs/results/2026-11-25-step12-m
 - 2026-11-25: the tiny MoE model (`tests/golden/tiny_moe.py`: a Qwen3_5MoeForCausalLM of transformers 5.24.0 with random weights, written in the published layout with fused `gate_up_proj`, 2 value heads per key head; 3 prompts and 4 greedy steps, 114 positions) covers the safetensors way into the MoE path. f32: KL 3e-13, logits within 5.7e-6, residual stream within 5.1e-6, on the CPU and the GPU. bf16: greedy token equal to the fp32 reference's at every position above the noise (3 of 3), but the pooled KL is 1.65 (CPU) and 1.84 (GPU) times the bf16 reference's. Over four more seeds the ratio was 0.14, 0.94, 1.27 and 1.47: with random weights both errors are rounding noise of one size, and which is smaller is chance (on the real checkpoints athanor is at 0.6). Acceptance criterion 2 amended for the tiny model (KL reported, not gated: `ATH_FORWARD_NO_KL_GATE`); the real checkpoints keep the rule.
 - 2026-11-25: the gate's session (19:42 to 20:20; `docs/results/2026-11-25-step12-moe/`). The same prompt ids and 128 greedy tokens: athanor 94.1 and 80.3 tokens/s after 33 and 4096 tokens; Strata with MTP off 30.1 and 25.9 at best (3.1 times slower), with MTP on 38.8 and 33.9; llama.cpp 59.5 and 58.8 on pseudo-random ids (athanor 102.6 and 69.6). Strata leads prefill (3,198 against 209 tokens/s at 4096 tokens: it streams experts to the GPU). Qwen3.5-0.8B's pp4096 came out 2.1% under step 10's report; run alternately with step 10's build the two are the same (the machine's power capping that evening). The athanor reports' `"weights"` field was a fixed "bf16" string: `tools/bench.c` now writes the format and the dtypes of the params.
 - 2026-11-25: step 12 done (all acceptance criteria met, criterion 2 as amended for the tiny model; table above); pushed on `step12-moe-tiering`: merging into `main` is the maintainer's call.
+- 2026-11-25: `step12-moe-tiering` merged into `main` (fast-forward) at the maintainer's request; step 13 started on `step13-server-mtp`. The maintainer's direction: the main functions first, every optimization later. Checked before planning: Claude Code 2.1.332 speaks Anthropic Messages; Codex CLI 0.167.0 only OpenAI Responses (`wire_api = "chat"` is refused by the binary); OpenCode (not installed yet) OpenAI Chat Completions, so the server speaks all three. The MTP head's math is read from vLLM 0.34.0 (`qwen3_5_mtp.py`): the main model's last hidden state and the next token's embedding, each normalized, concatenated and projected (`fc`), one decoder layer with full attention (and the MoE block on MoE models), the final norm, the shared output head.
