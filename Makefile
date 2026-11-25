@@ -4,6 +4,7 @@
 #   make test       build and run the test suites
 #   make check-alloc  verify that inspect allocates only through arenas
 #   make golden     regenerate tests/golden/data from the reference implementation
+#   make golden-generate  the greedy generations of the step 8 gate (about 20 minutes)
 #   make DEBUG=1    -O0 -g, ATH_ASSERT enabled, address and UB sanitizers
 #   make cuda       the same with the CUDA backend, in build/cuda; `make cuda test`
 #                   runs every suite of that build (CUDA_HOME and CUDA_ARCH below)
@@ -101,9 +102,10 @@ LIB_OBJ   := $(LIB_SRC:%.c=$(BUILD)/obj/%.o) $(GPU_SRC:%.cu=$(BUILD)/obj/%.cu.o)
 TOOL_SRC := $(wildcard tools/*.c)
 TOOL_OBJ := $(TOOL_SRC:%.c=$(BUILD)/obj/%.o)
 TESTS    := $(BUILD)/test_core $(BUILD)/test_model $(BUILD)/test_ops $(BUILD)/test_golden \
-            $(BUILD)/test_forward $(BUILD)/test_text $(BUILD)/test_backend $(BUILD)/test_gpu_ops
+            $(BUILD)/test_forward $(BUILD)/test_text $(BUILD)/test_backend $(BUILD)/test_gpu_ops \
+            $(BUILD)/test_engine
 
-.PHONY: all cpu cuda cuda-check hip test check-alloc golden clean FORCE
+.PHONY: all cpu cuda cuda-check hip test check-alloc golden golden-generate clean FORCE
 .SECONDARY:
 .DEFAULT_GOAL := cpu
 
@@ -164,6 +166,11 @@ check-alloc: $(BUILD)/athanor
 golden:
 	$(GOLDEN_PYTHON) tests/golden/dump.py "$(ATH_MODEL_DIR)" --out "$(ATH_GOLDEN_DIR)"
 	$(GOLDEN_PYTHON) tests/golden/text.py "$(ATH_MODEL_DIR)" --out "$(ATH_GOLDEN_DIR)"
+
+# The greedy generations of the step 8 gate: 50 prompts of 256 tokens by the
+# fp32 reference on the CPU, about 20 minutes (tests/golden/README.md).
+golden-generate:
+	$(GOLDEN_PYTHON) tests/golden/generate.py "$(ATH_MODEL_DIR)" --out "$(ATH_GOLDEN_DIR)"
 
 # `make cuda` builds everything with the CUDA backend; with `test` it also
 # runs the suites of that build (GPU is set from the goals, above).
