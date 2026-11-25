@@ -34,417 +34,475 @@
  * above 1 (γ only decreases), so nothing overflows.
  *
  * Shapes: dk, dv up to GD (128), a multiple of 4. The tokens go in rounds of
- * at most GDN_ROUND chunks, so that the scratch memory (W, Q'', U, O_U and γ
- * for a round) stays bounded whatever the prompt's length.
+ * chunks (round_chunks: as many as fill the GPU GDN_WAVES times with prep
+ * blocks), so that the scratch memory (W, Q'', U, O_U and γ for a round)
+ * stays bounded whatever the prompt's length, and in L2 for the scan.
  */
 #include "ops/cuda/mma.cuh"
 
 #define GC 64                 /* tokens per chunk                         */
 #define GD 128                /* largest dk and dv                        */
-#define GDP (GD + 4)          /* padded row: rows 4 banks apart           */
-#define GT 256                /* threads per block                        */
 #define GV 32                 /* state columns per scan block             */
-#define GDN_ROUND 8           /* chunks per round                         */
+#define GDN_WAVES 4           /* prep blocks per round: this many per SM  */
 
 /* ---- prep: W, Q'', U, O_U and γ of one chunk and value head ----------------------- */
 
-/* out[i][c] = Σ_{j ≤ i} a[i][j] x[j][c], with a[i][i] taken as 1 when unit
- * (T, whose diagonal is not stored): rows ti + 16 r, columns 4 tj + 64 s of
- * a [GC][GC + 1] and x [GC][GDP] matrix in shared memory, into the thread's
- * 4 × 8 tile. */
-static __device__ __forceinline__ void lower_mul(const float (*a)[GC + 1], const float (*x)[GDP], bool unit,
-                                                 float out[4][8])
+/* Four warps. Every product is a matrix product on the CUDA cores, an 8 × 8
+ * tile per lane: each 16-byte load from shared memory (which costs the
+ * same four cycles whether the lanes share its address or not) feeds 16
+ * multiply-adds, so the loads keep up with the arithmetic.
+ *
+ * Shared memory: two [GC][XP] tiles (x0: the keys, then β e^γ K, W, βV,
+ * U; x1: the queries, then A and Mᵀ), Tᵀ, and γ, β, β e^γ. A triangular
+ * matrix is kept transposed (Tᵀ[j][i] = T_ij, zeros above its diagonal),
+ * so that a lane's 8 rows at one j are two loads. */
+#define PT 128                /* threads per prep block                   */
+#define XP (GD + 4)           /* row of an x tile: rows 4 banks apart     */
+#define AP (GC + 4)           /* row of a transposed triangular matrix    */
+#define PREP_FLOATS (2 * GC * XP + GC * AP + 3 * GC + 3 * 256)
+
+/* o[a][e] = Σ_j at[j][8 ti + a] x[j][c_e] over every j (at is zero above the
+ * diagonal), the lane's rows 8 ti + a and columns c_e = 4 tj + (e < 4 ?
+ * e : 60 + e) with ti from the warp and the half-warp, tj = lane % 16. */
+static __device__ __forceinline__ void tri_mul(const float (*at)[AP], const float (*x)[XP], float o[8][8])
 {
-    const int ti = threadIdx.x / 16, tj = threadIdx.x % 16;
+    const int lane = threadIdx.x % ATH_WARP, ti = lane / 16 + 2 * (threadIdx.x / ATH_WARP), c = 4 * (lane % 16);
 #pragma unroll
-    for (int r = 0; r < 4; r++)
+    for (int a = 0; a < 8; a++)
 #pragma unroll
         for (int e = 0; e < 8; e++)
-            out[r][e] = 0.0f;
-    #pragma unroll 4
+            o[a][e] = 0.0f;
+#pragma unroll 4
     for (int j = 0; j < GC; j++) {
-        const float4 x0 = *(const float4 *)&x[j][4 * tj], x1 = *(const float4 *)&x[j][4 * tj + 64];
+        const float4 a0 = *(const float4 *)&at[j][8 * ti], a1 = *(const float4 *)&at[j][8 * ti + 4];
+        const float4 x0 = *(const float4 *)&x[j][c], x1 = *(const float4 *)&x[j][c + 64];
+        const float av[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+        const float xv[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
 #pragma unroll
-        for (int r = 0; r < 4; r++) {
-            if (j >= 16 * (r + 1))
-                continue;                          /* past every row of this block: a[i][j] = 0 */
-            const int i = ti + 16 * r;
-            const float w = j < i ? a[i][j] : j > i ? 0.0f : unit ? 1.0f : a[i][i];
-            out[r][0] = __fmaf_rn(w, x0.x, out[r][0]);
-            out[r][1] = __fmaf_rn(w, x0.y, out[r][1]);
-            out[r][2] = __fmaf_rn(w, x0.z, out[r][2]);
-            out[r][3] = __fmaf_rn(w, x0.w, out[r][3]);
-            out[r][4] = __fmaf_rn(w, x1.x, out[r][4]);
-            out[r][5] = __fmaf_rn(w, x1.y, out[r][5]);
-            out[r][6] = __fmaf_rn(w, x1.z, out[r][6]);
-            out[r][7] = __fmaf_rn(w, x1.w, out[r][7]);
+        for (int r = 0; r < 8; r++)
+#pragma unroll
+            for (int e = 0; e < 8; e++)
+                o[r][e] = __fmaf_rn(av[r], xv[e], o[r][e]);
+    }
+}
+
+/* The lane's tile of a product into rows of n columns: dst[i][c] row-major
+ * (stride floats per row), or transposed, dst[c][i] with GC per row. */
+static __device__ __forceinline__ void tri_store(float *dst, int64_t stride, int n, const float o[8][8])
+{
+    const int lane = threadIdx.x % ATH_WARP, ti = lane / 16 + 2 * (threadIdx.x / ATH_WARP), c = 4 * (lane % 16);
+#pragma unroll
+    for (int a = 0; a < 8; a++)
+#pragma unroll
+        for (int h = 0; h < 2; h++)
+            if (c + 64 * h < n)
+                *(float4 *)&dst[(8 * ti + a) * stride + c + 64 * h] =
+                    make_float4(o[a][4 * h], o[a][4 * h + 1], o[a][4 * h + 2], o[a][4 * h + 3]);
+}
+
+static __device__ __forceinline__ void tri_store_t(float *dst, int n, const float o[8][8])
+{
+    const int lane = threadIdx.x % ATH_WARP, ti = lane / 16 + 2 * (threadIdx.x / ATH_WARP), c = 4 * (lane % 16);
+#pragma unroll
+    for (int e = 0; e < 8; e++) {
+        const int col = c + (e < 4 ? e : 60 + e);
+        if (col < n) {
+            *(float4 *)&dst[col * GC + 8 * ti] = make_float4(o[0][e], o[1][e], o[2][e], o[3][e]);
+            *(float4 *)&dst[col * GC + 8 * ti + 4] = make_float4(o[4][e], o[5][e], o[6][e], o[7][e]);
         }
     }
 }
 
-/* The thread's 4 × 8 tile into rows of n columns (columns past n dropped). */
-static __device__ __forceinline__ void tile_store(float *dst, int64_t stride, int n, const float t[4][8])
-{
-    const int ti = threadIdx.x / 16, tj = threadIdx.x % 16;
-#pragma unroll
-    for (int r = 0; r < 4; r++)
-#pragma unroll
-        for (int s = 0; s < 2; s++) {
-            const int c = 4 * tj + 64 * s;
-            if (c < n)
-                *(float4 *)&dst[(ti + 16 * r) * stride + c] =
-                    make_float4(t[r][4 * s], t[r][4 * s + 1], t[r][4 * s + 2], t[r][4 * s + 3]);
-        }
-}
-
-static __device__ __forceinline__ void tile_to_smem(float (*x)[GDP], const float t[4][8])
-{
-    tile_store(&x[0][0], GDP, GD, t);
-}
-
-static __global__ void __launch_bounds__(GT)
+static __global__ void __launch_bounds__(PT)
 gdn_prep(const float *q, const float *k, const void *v, int vdt, const float *g, const void *beta, int bdt,
          float q_scale, int64_t T, int64_t c0, int64_t nk, int dk, int64_t nv, int dv, float *Qp, float *W,
          float *U, float *OU, float *gam)
 {
-    extern __shared__ __align__(16) unsigned char prep_smem[];
-    float (*xs)[GDP] = (float (*)[GDP])prep_smem;                  /* k rows, then W, then βv, then U */
-    float (*ta)[GC + 1] = (float (*)[GC + 1])(prep_smem + sizeof(float[GC][GDP]));   /* A */
-    float (*tt)[GC + 1] = ta + GC;                                  /* T                               */
-    float (*ma)[GC + 1] = tt + GC;                                  /* M                               */
-    float *gm = &ma[GC][0], *bt = gm + GC, *be = bt + GC;           /* γ, β, β e^γ                     */
-    float (*xt)[16][16] = (float (*)[16][16])(be + GC);             /* blocks of T being built         */
-    const int tid = threadIdx.x, ti = tid / 16, tj = tid % 16;
+    extern __shared__ __align__(16) float pm[];
+    float (*x0)[XP] = (float (*)[XP])pm;
+    float (*x1)[XP] = (float (*)[XP])(pm + GC * XP);
+    float (*aa)[GC] = (float (*)[GC])(pm + GC * XP);                  /* A, where the queries were */
+    float (*mt)[AP] = (float (*)[AP])(pm + GC * XP + GC * GC);        /* Mᵀ, after A               */
+    float (*tt)[AP] = (float (*)[AP])(pm + 2 * GC * XP);              /* Tᵀ                        */
+    float *gm = pm + 2 * GC * XP + GC * AP, *bt = gm + GC, *be = bt + GC;   /* γ, β, β e^γ           */
+    float (*xt)[16][16] = (float (*)[16][16])(be + GC);               /* blocks of T being built   */
+    const int tid = threadIdx.x, lane = tid % ATH_WARP, w = tid / ATH_WARP;
     const int64_t c = c0 + blockIdx.x, h = blockIdx.y, kh = h / (nv / nk), t0 = c * GC;
     const int n = (int)(T - t0 < GC ? T - t0 : GC);
     const int64_t out = ((int64_t)blockIdx.x * nv + h) * GC;     /* this chunk's rows in the round's scratch */
 
-    /* γ (in token order, as the reference's cumsum), β; rows past n are padding: zeros, γ constant */
+    /* the keys into x0, the queries into x1; rows past n (padding) and
+     * columns past dk zeros */
+    for (int e = tid; e < GC * GD / 4; e += PT) {
+        const int i = e / (GD / 4), d = 4 * (e % (GD / 4));
+        const bool ok = i < n && d < dk;
+        const int64_t at = ((t0 + i) * nk + kh) * dk + d;
+        k_cp16(&x0[i][d], ok ? k + at : k, ok);
+        k_cp16(&x1[i][d], ok ? q + at : q, ok);
+    }
+    k_cp_commit();
+    /* γ (in token order, as the reference's cumsum), β; padding: zeros, γ constant */
     if (tid < GC) {
         bt[tid] = tid < n ? k_ld(beta, bdt, (t0 + tid) * nv + h) : 0.0f;
         gm[tid] = tid < n ? g[(t0 + tid) * nv + h] : 0.0f;
     }
+    for (int e = tid; e < GC * AP; e += PT)
+        (&tt[0][0])[e] = e / AP == e % AP ? 1.0f : 0.0f;
     __syncthreads();
     if (tid == 0)
         for (int i = 1; i < GC; i++)
             gm[i] = __fadd_rn(gm[i - 1], gm[i]);
-    /* the k rows in xs; the q rows, until the dot products are done, where
-     * A, T and M will go */
-    float (*qs)[GDP] = (float (*)[GDP])&ta[0][0];
-    for (int e = tid; e < GC * GD / 4; e += GT) {
-        const int i = e / (GD / 4), d = 4 * (e % (GD / 4));
-        const bool ok = i < n && d < dk;
-        const int64_t at = ((t0 + i) * nk + kh) * dk + d;
-        *(float4 *)&xs[i][d] = ok ? *(const float4 *)&k[at] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-        *(float4 *)&qs[i][d] = ok ? *(const float4 *)&q[at] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    }
+    k_cp_wait_all();
     __syncthreads();
     if (tid < GC) {
         gam[out + tid] = gm[tid];
         be[tid] = __fmul_rn(bt[tid], expf(gm[tid]));
     }
 
-    /* k_i · k_j and q_i · k_j: rows ti + 16 r, columns tj + 16 s */
-    float kk[4][4], qk[4][4];
+    /* k_i · k_j and q_i · k_j as one product: rows R = 8 ti + a of [K; Q]
+     * (warps 0, 1 the keys, 2, 3 the queries), columns j = tj + 8 b */
+    {
+        const int ti = lane / 8 + 4 * w, tj = lane % 8;
+        const float (*rx)[XP] = ti < 8 ? x0 + 8 * ti : x1 + 8 * (ti - 8);
+        float acc[8][8];
 #pragma unroll
-    for (int r = 0; r < 4; r++)
+        for (int a = 0; a < 8; a++)
 #pragma unroll
-        for (int s = 0; s < 4; s++)
-            kk[r][s] = qk[r][s] = 0.0f;
-    #pragma unroll 4
-    for (int d = 0; d < dk; d += 4) {
-        float4 ki[4], kj[4], qi[4];
+            for (int b = 0; b < 8; b++)
+                acc[a][b] = 0.0f;
+        for (int d = 0; d < dk; d += 4) {
+            float4 r[8], cl[8];
 #pragma unroll
-        for (int r = 0; r < 4; r++) {
-            const int i = ti + 16 * r;
-            ki[r] = *(const float4 *)&xs[i][d];
-            kj[r] = *(const float4 *)&xs[tj + 16 * r][d];
-            qi[r] = *(const float4 *)&qs[i][d];
+            for (int a = 0; a < 8; a++)
+                r[a] = *(const float4 *)&rx[a][d];
+#pragma unroll
+            for (int b = 0; b < 8; b++)
+                cl[b] = *(const float4 *)&x0[tj + 8 * b][d];
+#pragma unroll
+            for (int a = 0; a < 8; a++)
+#pragma unroll
+                for (int b = 0; b < 8; b++) {
+                    acc[a][b] = __fmaf_rn(r[a].x, cl[b].x, acc[a][b]);
+                    acc[a][b] = __fmaf_rn(r[a].y, cl[b].y, acc[a][b]);
+                    acc[a][b] = __fmaf_rn(r[a].z, cl[b].z, acc[a][b]);
+                    acc[a][b] = __fmaf_rn(r[a].w, cl[b].w, acc[a][b]);
+                }
         }
+        __syncthreads();                               /* the queries are read: A and Mᵀ replace them */
 #pragma unroll
-        for (int r = 0; r < 4; r++)
+        for (int a = 0; a < 8; a++)
 #pragma unroll
-            for (int s = 0; s <= r; s++) {          /* blocks on or below the diagonal only */
-                kk[r][s] = __fmaf_rn(ki[r].x, kj[s].x, kk[r][s]);
-                kk[r][s] = __fmaf_rn(ki[r].y, kj[s].y, kk[r][s]);
-                kk[r][s] = __fmaf_rn(ki[r].z, kj[s].z, kk[r][s]);
-                kk[r][s] = __fmaf_rn(ki[r].w, kj[s].w, kk[r][s]);
-                qk[r][s] = __fmaf_rn(qi[r].x, kj[s].x, qk[r][s]);
-                qk[r][s] = __fmaf_rn(qi[r].y, kj[s].y, qk[r][s]);
-                qk[r][s] = __fmaf_rn(qi[r].z, kj[s].z, qk[r][s]);
-                qk[r][s] = __fmaf_rn(qi[r].w, kj[s].w, qk[r][s]);
+            for (int b = 0; b < 8; b++) {
+                const int i = 8 * (ti & 7) + a, j = tj + 8 * b;
+                const float decay = j <= i ? expf(__fsub_rn(gm[i], gm[j])) : 0.0f;
+                if (ti < 8)
+                    aa[i][j] = j < i ? __fmul_rn(__fmul_rn(bt[i], acc[a][b]), decay) : 0.0f;
+                else
+                    mt[j][i] = j <= i ? __fmul_rn(__fmul_rn(q_scale, acc[a][b]), decay) : 0.0f;
             }
     }
-    __syncthreads();                                   /* the q rows are read: A and M replace them */
-#pragma unroll
-    for (int r = 0; r < 4; r++)
-#pragma unroll
-        for (int s = 0; s < 4; s++) {
-            const int i = ti + 16 * r, j = tj + 16 * s;
-            const float decay = j <= i ? expf(__fsub_rn(gm[i], gm[j])) : 0.0f;
-            ta[i][j] = j < i ? __fmul_rn(__fmul_rn(bt[i], kk[r][s]), decay) : 0.0f;
-            ma[i][j] = j <= i ? __fmul_rn(__fmul_rn(q_scale, qk[r][s]), decay) : 0.0f;
-        }
     __syncthreads();
 
     /* T = (I + A)⁻¹ in blocks of 16 (FLA's solve_tril does the same). The
      * diagonal blocks D_b = (I + A_bb)⁻¹ by forward substitution, a column
      * per thread: for j < i, T_ij = −A_ij − Σ_{j<m<i} A_im T_mj, which needs
-     * only the column's own entries above. Then the blocks below, nearest
-     * the diagonal first: T_bc = −D_b Σ_{c≤e<b} A_be T_ec. T is stored with
-     * its diagonal (1) and zeros above it. */
-    for (int e = tid; e < GC * GC; e += GT)
-        tt[e / GC][e % GC] = e / GC == e % GC ? 1.0f : 0.0f;
-    __syncthreads();
+     * only the column's own entries above (its row of Tᵀ). Then the blocks
+     * below, nearest the diagonal first: T_bc = −D_b Σ_{c≤e<b} A_be T_ec. */
     if (tid < GC) {
-        const int b0 = tid & ~15, j = tid;
+        const int j = tid, b0 = j & ~15;
         for (int i = j + 1; i < b0 + 16; i++) {
-            float s = -ta[i][j];
+            float s = -aa[i][j];
             for (int m = j + 1; m < i; m++)
-                s = __fmaf_rn(-ta[i][m], tt[m][j], s);
-            tt[i][j] = s;
+                s = __fmaf_rn(-aa[i][m], tt[j][m], s);
+            tt[j][i] = s;
         }
     }
     __syncthreads();
     for (int dist = 1; dist < GC / 16; dist++) {
-        /* X_bc = Σ_{c≤e<b} A_be T_ec for the blocks at this distance, one
-         * element per thread and block */
-        const int nb = GC / 16 - dist, r = tid / 16, cc = tid % 16;
-        for (int bi = 0; bi < nb; bi++) {
-            const int b = bi + dist, c = bi, row = 16 * b + r, col = 16 * c + cc;
+        const int nb = GC / 16 - dist;
+        for (int e = tid; e < nb * 256; e += PT) {
+            const int bi = e / 256, r = (e / 16) % 16, cc = e % 16, b = bi + dist, row = 16 * b + r;
+            const int col = 16 * bi + cc;
             float x = 0.0f;
-            for (int m = 16 * c; m < 16 * b; m++)
-                x = __fmaf_rn(ta[row][m], tt[m][col], x);
+            for (int m = 16 * bi; m < 16 * b; m++)
+                x = __fmaf_rn(aa[row][m], tt[col][m], x);
             xt[bi][r][cc] = x;
         }
         __syncthreads();
-        for (int bi = 0; bi < nb; bi++) {
-            const int b = bi + dist, c = bi, row = 16 * b + r, col = 16 * c + cc;
+        for (int e = tid; e < nb * 256; e += PT) {
+            const int bi = e / 256, r = (e / 16) % 16, cc = e % 16, b = bi + dist;
             float x = 0.0f;
             for (int m = 0; m <= r; m++)
-                x = __fmaf_rn(tt[16 * b + r][16 * b + m], xt[bi][m][cc], x);
-            tt[row][col] = -x;
+                x = __fmaf_rn(tt[16 * b + m][16 * b + r], xt[bi][m][cc], x);
+            tt[16 * bi + cc][16 * b + r] = -x;
         }
         __syncthreads();
     }
 
-    /* W = T (β e^γ K): scale the k rows in place, then the product */
-    for (int e = tid; e < GC * GD; e += GT) {
-        const int i = e / GD, d = e % GD;
-        xs[i][d] = __fmul_rn(xs[i][d], be[i]);
+    /* the values: a bf16 chunk is 16 KiB, A's place now that T is built;
+     * they load while W and Q'' are computed */
+    const bool vstage = vdt == ATH_DTYPE_BF16 && dv % 8 == 0;
+    uint16_t *vs = (uint16_t *)&aa[0][0];
+    if (vstage) {
+        for (int e = tid; e < GC * GD / 8; e += PT) {
+            const int i = e / (GD / 8), d = 8 * (e % (GD / 8));
+            const bool ok = i < n && d < dv;
+            const uint16_t *src = (const uint16_t *)v + ((t0 + i) * nv + h) * dv + d;
+            k_cp16(&vs[i * GD + d], ok ? src : (const uint16_t *)v, ok);
+        }
+        k_cp_commit();
+    }
+
+    /* W = T (β e^γ K): scale the key rows in place, then the product; W goes
+     * out transposed and stays in x0 for Q'' */
+    for (int e = tid; e < GC * GD / 4; e += PT) {
+        const int i = e / (GD / 4), d = 4 * (e % (GD / 4));
+        float4 *p = (float4 *)&x0[i][d];
+        const float f = be[i];
+        *p = make_float4(__fmul_rn(p->x, f), __fmul_rn(p->y, f), __fmul_rn(p->z, f), __fmul_rn(p->w, f));
     }
     __syncthreads();
-    float acc[4][8];
-    lower_mul(tt, xs, true, acc);
-    tile_store(W + out * dk, dk, dk, acc);
-    __syncthreads();                                   /* every thread has read the k rows */
-    tile_to_smem(xs, acc);
+    float o[8][8];
+    tri_mul(tt, x0, o);
+    tri_store_t(W + out * dk, dk, o);
+    __syncthreads();                                   /* every lane has read the scaled keys */
+    tri_store(&x0[0][0], XP, GD, o);
     __syncthreads();
 
     /* Q'' = q_scale e^γ Q − M W */
-    lower_mul(ma, xs, false, acc);
+    tri_mul(mt, x0, o);
+    {
+        const int ti = lane / 16 + 2 * w, cq = 4 * (lane % 16);
 #pragma unroll
-    for (int r = 0; r < 4; r++) {
-        const int i = ti + 16 * r;
-        const float f = __fmul_rn(q_scale, expf(gm[i]));
+        for (int a = 0; a < 8; a++) {
+            const int i = 8 * ti + a;
+            const float f = __fmul_rn(q_scale, expf(gm[i]));
 #pragma unroll
-        for (int s = 0; s < 2; s++) {
-            const int d = 4 * tj + 64 * s;
-            const float4 qv = i < n && d < dk ? *(const float4 *)&q[((t0 + i) * nk + kh) * dk + d]
-                                              : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-            acc[r][4 * s] = __fsub_rn(__fmul_rn(f, qv.x), acc[r][4 * s]);
-            acc[r][4 * s + 1] = __fsub_rn(__fmul_rn(f, qv.y), acc[r][4 * s + 1]);
-            acc[r][4 * s + 2] = __fsub_rn(__fmul_rn(f, qv.z), acc[r][4 * s + 2]);
-            acc[r][4 * s + 3] = __fsub_rn(__fmul_rn(f, qv.w), acc[r][4 * s + 3]);
+            for (int hh = 0; hh < 2; hh++) {
+                const int d = cq + 64 * hh;
+                const float4 qv = i < n && d < dk ? *(const float4 *)&q[((t0 + i) * nk + kh) * dk + d]
+                                                  : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                o[a][4 * hh] = __fsub_rn(__fmul_rn(f, qv.x), o[a][4 * hh]);
+                o[a][4 * hh + 1] = __fsub_rn(__fmul_rn(f, qv.y), o[a][4 * hh + 1]);
+                o[a][4 * hh + 2] = __fsub_rn(__fmul_rn(f, qv.z), o[a][4 * hh + 2]);
+                o[a][4 * hh + 3] = __fsub_rn(__fmul_rn(f, qv.w), o[a][4 * hh + 3]);
+            }
         }
     }
-    tile_store(Qp + out * dk, dk, dk, acc);
-    __syncthreads();                                   /* every thread has read W */
+    tri_store_t(Qp + out * dk, dk, o);
+    __syncthreads();                                   /* every lane has read W */
 
     /* U = T (βV), then O_U = M U */
-    for (int e = tid; e < GC * GD; e += GT) {
-        const int i = e / GD, d = e % GD;
-        xs[i][d] = i < n && d < dv ? __fmul_rn(bt[i], k_ld(v, vdt, ((t0 + i) * nv + h) * dv + d)) : 0.0f;
+    if (vstage) {
+        k_cp_wait_all();
+        __syncthreads();
+    }
+    for (int e = tid; e < GC * GD / 4; e += PT) {
+        const int i = e / (GD / 4), d = 4 * (e % (GD / 4));
+        float4 x = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        const float f = bt[i];
+        if (vstage) {
+            const uint2 r = *(const uint2 *)&vs[i * GD + d];             /* zeros where padding */
+            x = make_float4(__fmul_rn(f, __uint_as_float(r.x << 16)), __fmul_rn(f, __uint_as_float(r.x & 0xffff0000u)),
+                            __fmul_rn(f, __uint_as_float(r.y << 16)), __fmul_rn(f, __uint_as_float(r.y & 0xffff0000u)));
+        } else if (i < n && d < dv) {
+            const int64_t at = ((t0 + i) * nv + h) * dv + d;
+            x = make_float4(__fmul_rn(f, k_ld(v, vdt, at)), __fmul_rn(f, k_ld(v, vdt, at + 1)),
+                            __fmul_rn(f, k_ld(v, vdt, at + 2)), __fmul_rn(f, k_ld(v, vdt, at + 3)));
+        }
+        *(float4 *)&x0[i][d] = x;
     }
     __syncthreads();
-    lower_mul(tt, xs, true, acc);
-    tile_store(U + out * dv, dv, dv, acc);
+    tri_mul(tt, x0, o);
+    tri_store(U + out * dv, dv, dv, o);
     __syncthreads();
-    tile_to_smem(xs, acc);
+    tri_store(&x0[0][0], XP, GD, o);
     __syncthreads();
-    lower_mul(ma, xs, false, acc);
-    tile_store(OU + out * dv, dv, dv, acc);
+    tri_mul(mt, x0, o);
+    tri_store(OU + out * dv, dv, dv, o);
 }
 
 /* ---- scan: the chunks in order, with the state ------------------------------------- */
 
-/* Rows of a [GC][n] matrix into a padded shared tile, asynchronously; rows
- * at or past `rows` zeros. */
-static __device__ __forceinline__ void scan_load(float (*x)[GDP], const float *src, int64_t stride, int n, int rows)
+/* Four warps. The 64 × 32 products Q'' S and W S: warp w takes rows
+ * 16 w … 16 w + 15, a lane a 4 × 4 tile of them, over every d. The state:
+ * warp w keeps rows 32 w … 32 w + 31 of the block's 128 × 32 part in
+ * registers, 8 × 4 per lane, and updates them. W and Q'' come transposed
+ * from prep, [dk][GC], so that a lane's 4 rows at one d are one load. */
+#define ST 128                /* threads per scan block                   */
+#define TILE (GC * GD)        /* floats in an operand tile                */
+
+/* acc[a][b] = Σ_d x[d][16 w + 4 pr + a] S[d][4 pc + b], pr = lane / 8,
+ * pc = lane % 8: rows 16 w + 4 pr + a and columns 4 pc + b of the product. */
+static __device__ __forceinline__ void scan_rows(const float *xt, const float (*sm)[GV], int dk, float acc[4][4])
 {
-    for (int e = threadIdx.x; e < GC * (GD / 4); e += GT) {
-        const int i = e / (GD / 4), d = 4 * (e % (GD / 4));
-        if (d < n) {
-            const bool ok = i < rows;
-            k_cp16(&x[i][d], ok ? src + i * stride + d : src, ok);
-        }
+    const int lane = threadIdx.x % ATH_WARP, w = threadIdx.x / ATH_WARP, r0 = 16 * w + 4 * (lane / 8);
+    const int c0 = 4 * (lane % 8);
+#pragma unroll
+    for (int a = 0; a < 4; a++)
+#pragma unroll
+        for (int b = 0; b < 4; b++)
+            acc[a][b] = 0.0f;
+#pragma unroll 8
+    for (int d = 0; d < dk; d++) {
+        const float4 x = *(const float4 *)&xt[d * GC + r0], y = *(const float4 *)&sm[d][c0];
+        const float av[4] = {x.x, x.y, x.z, x.w}, bv[4] = {y.x, y.y, y.z, y.w};
+#pragma unroll
+        for (int a = 0; a < 4; a++)
+#pragma unroll
+            for (int b = 0; b < 4; b++)
+                acc[a][b] = __fmaf_rn(av[a], bv[b], acc[a][b]);
     }
 }
 
-/* o[r][e] = Σ_d x[ti + 16 r][d] S[d][2 tj + e] over d < dk: a 64 × dk tile
- * times the state's 32 columns, the thread's 4 × 2 outputs. */
-static __device__ __forceinline__ void scan_mul(const float (*x)[GDP], const float (*sm)[GV], int dk, float o[4][2])
+/* A contiguous [rows][n] block of global memory into a tile, asynchronously. */
+static __device__ __forceinline__ void scan_copy(float *x, const float *src, int floats)
 {
-    const int ti = threadIdx.x / 16, tj = threadIdx.x % 16;
-#pragma unroll
-    for (int r = 0; r < 4; r++)
-        o[r][0] = o[r][1] = 0.0f;
-    #pragma unroll 4
-    for (int d = 0; d < dk; d += 4) {
-        float4 a[4];
-        float2 b[4];
-#pragma unroll
-        for (int r = 0; r < 4; r++)
-            a[r] = *(const float4 *)&x[ti + 16 * r][d];
-#pragma unroll
-        for (int u = 0; u < 4; u++)
-            b[u] = *(const float2 *)&sm[d + u][2 * tj];
-#pragma unroll
-        for (int r = 0; r < 4; r++) {
-            const float av[4] = {a[r].x, a[r].y, a[r].z, a[r].w};
-#pragma unroll
-            for (int u = 0; u < 4; u++) {
-                o[r][0] = __fmaf_rn(av[u], b[u].x, o[r][0]);
-                o[r][1] = __fmaf_rn(av[u], b[u].y, o[r][1]);
-            }
-        }
+    for (int e = threadIdx.x; e < floats / 4; e += ST)
+        k_cp16(&x[4 * e], src + 4 * e, true);
+}
+
+/* The chunk's keys, [GC][dk], from rows of `stride` floats starting at k;
+ * rows at or past n zeros. */
+static __device__ __forceinline__ void scan_keys(float *x, const float *k, int64_t stride, int dk, int n)
+{
+    for (int e = threadIdx.x; e < GC * dk / 4; e += ST) {
+        const int i = (4 * e) / dk, d = (4 * e) % dk;
+        const bool ok = i < n;
+        k_cp16(&x[i * dk + d], ok ? k + i * stride + d : k, ok);
     }
 }
 
-static __global__ void __launch_bounds__(GT)
+static __global__ void __launch_bounds__(ST)
 gdn_scan(const float *k, const float *Qp, const float *W, const float *U, const float *OU, const float *gam,
          float *state, void *out, int odt, int64_t T, int64_t c0, int64_t nc, int64_t nk, int dk, int64_t nv, int dv)
 {
     extern __shared__ __align__(16) unsigned char scan_smem[];
-    float (*xb)[GC][GDP] = (float (*)[GC][GDP])scan_smem;              /* two operand tiles */
-    float (*sm)[GV] = (float (*)[GV])(scan_smem + 2 * sizeof(float[GC][GDP]));   /* S [GD][GV]        */
-    float (*dl)[GV] = sm + GD;                                          /* e^(γ_last − γ) Δ [GC][GV] */
-    const int tid = threadIdx.x, ti = tid / 16, tj = tid % 16;
+    float *const xb0 = (float *)scan_smem;                              /* two operand tiles, */
+#define XB(i) (xb0 + (i) * TILE)                                        /* so the compiler sees shared memory */
+    float (*sm)[GV] = (float (*)[GV])(xb0 + 2 * TILE);                   /* S [GD][GV]        */
+    float (*dl)[GV] = sm + GD;                                           /* e^(γ_last − γ) Δ [GC][GV] */
+    const int lane = threadIdx.x % ATH_WARP, w = threadIdx.x / ATH_WARP, lr = lane / 8, lc = lane % 8;
     const int64_t h = blockIdx.x, kh = h / (nv / nk), j0 = (int64_t)blockIdx.y * GV;
     const int jn = (int)(dv - j0 < GV ? dv - j0 : GV);            /* live columns of this block */
     float *S = state + h * dk * dv;
 
-    /* this thread's part of the state for the update: rows 8 ti … 8 ti + 7, columns 2 tj, 2 tj + 1 */
-    float st[8][2];
+    /* the state: rows 32 w + 8 lr + a, columns 4 lc + b of this lane */
+    float st[8][4];
 #pragma unroll
-    for (int r = 0; r < 8; r++)
+    for (int a = 0; a < 8; a++) {
+        const int row = 32 * w + 8 * lr + a;
 #pragma unroll
-        for (int e = 0; e < 2; e++) {
-            const int row = 8 * ti + r, col = 2 * tj + e;
-            st[r][e] = row < dk && col < jn ? S[row * dv + j0 + col] : 0.0f;
-            sm[row][col] = st[r][e];
+        for (int b = 0; b < 4; b++) {
+            const int col = 4 * lc + b;
+            st[a][b] = row < dk && col < jn ? S[row * dv + j0 + col] : 0.0f;
         }
+        *(float4 *)&sm[row][4 * lc] = make_float4(st[a][0], st[a][1], st[a][2], st[a][3]);
+    }
 
     /* operands in order Q''_c, W_c, K_c, Q''_c+1, ...: two tiles in turn, so
      * that each loads while the one before is used; chunk c has Q'' and K
-     * in tile c % 2, W in the other */
-    scan_load(xb[0], Qp + h * GC * dk, dk, dk, GC);
+     * in tile c % 2, W in the other. A consumed tile takes the partial
+     * products before the next load. */
+    scan_copy(XB(0), Qp + h * GC * dk, GC * dk);
     k_cp_commit();
     for (int64_t ci = 0; ci < nc; ci++) {
         const int b = (int)(ci & 1);
         const int64_t c = c0 + ci, t0 = c * GC, rows = (ci * nv + h) * GC;
         const int n = (int)(T - t0 < GC ? T - t0 : GC);
         const float glast = gam[rows + GC - 1];
+        const int r0 = 16 * w + 4 * (lane / 8), cc = 4 * (lane % 8);   /* this lane's rows and columns */
+        float acc[4][4], pre[4][4];
 
         /* O = Q'' S + O_U */
         k_cp_wait_all();
         __syncthreads();
-        scan_load(xb[b ^ 1], W + rows * dk, dk, dk, GC);
+        scan_copy(XB(b ^ 1), W + rows * dk, GC * dk);
         k_cp_commit();
-        {
-            float o[4][2];
-            scan_mul(xb[b], sm, dk, o);
 #pragma unroll
-            for (int r = 0; r < 4; r++) {
-                const int i = ti + 16 * r;
+        for (int a = 0; a < 4; a++)
 #pragma unroll
-                for (int e = 0; e < 2; e++) {
-                    const int col = 2 * tj + e;
-                    if (i < n && col < jn)
-                        k_st(out, odt, ((t0 + i) * nv + h) * dv + j0 + col,
-                             __fadd_rn(o[r][e], OU[(rows + i) * dv + j0 + col]));
-                }
-            }
-        }
+            for (int q = 0; q < 4; q++)
+                pre[a][q] = cc + q < jn ? OU[(rows + r0 + a) * dv + j0 + cc + q] : 0.0f;
+        scan_rows(XB(b), sm, dk, acc);
+#pragma unroll
+        for (int a = 0; a < 4; a++)
+#pragma unroll
+            for (int q = 0; q < 4; q++)
+                if (r0 + a < n && cc + q < jn)
+                    k_st(out, odt, ((t0 + r0 + a) * nv + h) * dv + j0 + cc + q, __fadd_rn(acc[a][q], pre[a][q]));
 
         /* Δ = U − W S, kept as e^(γ_last − γ_i) Δ_i for the update */
         k_cp_wait_all();
         __syncthreads();
-        scan_load(xb[b], k + (t0 * nk + kh) * dk, nk * dk, dk, n);
+        scan_keys(XB(b), k + (t0 * nk + kh) * dk, nk * dk, dk, n);
         k_cp_commit();
-        {
-            float o[4][2];
-            scan_mul(xb[b ^ 1], sm, dk, o);
 #pragma unroll
-            for (int r = 0; r < 4; r++) {
-                const int i = ti + 16 * r;
-                const float f = expf(__fsub_rn(glast, gam[rows + i]));
+        for (int a = 0; a < 4; a++)
 #pragma unroll
-                for (int e = 0; e < 2; e++) {
-                    const int col = 2 * tj + e;
-                    const float u = col < jn ? U[(rows + i) * dv + j0 + col] : 0.0f;
-                    dl[i][col] = __fmul_rn(f, __fsub_rn(u, o[r][e]));
-                }
-            }
+            for (int q = 0; q < 4; q++)
+                pre[a][q] = cc + q < jn ? U[(rows + r0 + a) * dv + j0 + cc + q] : 0.0f;
+        scan_rows(XB(b ^ 1), sm, dk, acc);
+#pragma unroll
+        for (int a = 0; a < 4; a++) {
+            const float f = expf(__fsub_rn(glast, gam[rows + r0 + a]));
+            *(float4 *)&dl[r0 + a][cc] =
+                make_float4(__fmul_rn(f, __fsub_rn(pre[a][0], acc[a][0])), __fmul_rn(f, __fsub_rn(pre[a][1], acc[a][1])),
+                            __fmul_rn(f, __fsub_rn(pre[a][2], acc[a][2])), __fmul_rn(f, __fsub_rn(pre[a][3], acc[a][3])));
         }
 
         /* S = e^γ_last S + Kᵀ (e^(γ_last − γ) Δ) */
         k_cp_wait_all();
         __syncthreads();
         if (ci + 1 < nc) {
-            scan_load(xb[b ^ 1], Qp + ((ci + 1) * nv + h) * GC * dk, dk, dk, GC);
+            scan_copy(XB(b ^ 1), Qp + ((ci + 1) * nv + h) * GC * dk, GC * dk);
             k_cp_commit();
         }
         {
-            const float (*x)[GDP] = xb[b];
+            const float *x = XB(b);
             const float decay = expf(glast);
 #pragma unroll
-            for (int r = 0; r < 8; r++) {
-                st[r][0] = __fmul_rn(st[r][0], decay);
-                st[r][1] = __fmul_rn(st[r][1], decay);
-            }
-            #pragma unroll 4
-            for (int i = 0; i < GC; i++) {
-                const float4 a0 = *(const float4 *)&x[i][8 * ti], a1 = *(const float4 *)&x[i][8 * ti + 4];
-                const float2 bb = *(const float2 *)&dl[i][2 * tj];
-                const float av[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+            for (int a = 0; a < 8; a++)
 #pragma unroll
-                for (int r = 0; r < 8; r++) {
-                    st[r][0] = __fmaf_rn(av[r], bb.x, st[r][0]);
-                    st[r][1] = __fmaf_rn(av[r], bb.y, st[r][1]);
+                for (int bb = 0; bb < 4; bb++)
+                    st[a][bb] = __fmul_rn(st[a][bb], decay);
+            const int r0 = 32 * w + 8 * lr;
+            if (r0 < dk) {
+#pragma unroll 4
+                for (int i = 0; i < GC; i++) {
+                    const float4 k0 = *(const float4 *)&x[i * dk + r0], k1 = *(const float4 *)&x[i * dk + r0 + 4];
+                    const float4 dd = *(const float4 *)&dl[i][4 * lc];
+                    const float kv[8] = {k0.x, k0.y, k0.z, k0.w, k1.x, k1.y, k1.z, k1.w};
+                    const float dv4[4] = {dd.x, dd.y, dd.z, dd.w};
+#pragma unroll
+                    for (int a = 0; a < 8; a++)
+#pragma unroll
+                        for (int bb = 0; bb < 4; bb++)
+                            st[a][bb] = __fmaf_rn(kv[a], dv4[bb], st[a][bb]);
                 }
             }
         }
-        __syncthreads();                               /* every thread has read S and Δ */
+        __syncthreads();                               /* every lane has read S and Δ */
 #pragma unroll
-        for (int r = 0; r < 8; r++) {
-            sm[8 * ti + r][2 * tj] = st[r][0];
-            sm[8 * ti + r][2 * tj + 1] = st[r][1];
-        }
+        for (int a = 0; a < 8; a++)
+            *(float4 *)&sm[32 * w + 8 * lr + a][4 * lc] = make_float4(st[a][0], st[a][1], st[a][2], st[a][3]);
     }
 #pragma unroll
-    for (int r = 0; r < 8; r++)
+    for (int a = 0; a < 8; a++) {
+        const int row = 32 * w + 8 * lr + a;
 #pragma unroll
-        for (int e = 0; e < 2; e++) {
-            const int row = 8 * ti + r, col = 2 * tj + e;
+        for (int b = 0; b < 4; b++) {
+            const int col = 4 * lc + b;
             if (row < dk && col < jn)
-                S[row * dv + j0 + col] = st[r][e];
+                S[row * dv + j0 + col] = st[a][b];
         }
+    }
 }
 
-#define PREP_SMEM (sizeof(float[GC][GDP]) + sizeof(float[3 * GC][GC + 1]) + 3 * GC * sizeof(float) + \
-                   sizeof(float[GC / 16 - 1][16][16]))
-#define SCAN_SMEM (2 * sizeof(float[GC][GDP]) + sizeof(float[GD + GC][GV]))
+#undef XB
+
+#define PREP_SMEM (PREP_FLOATS * sizeof(float))
+#define SCAN_SMEM (2 * TILE * sizeof(float) + sizeof(float[GD + GC][GV]))
 
 /* Scratch for one round: W and Q'' [chunks, nv, GC, dk], U and O_U
  * [chunks, nv, GC, dv], γ [chunks, nv, GC]. */
@@ -462,10 +520,19 @@ extern "C" bool ath_gdn_chunk_fits(const ath_device *d, const ath_tensor *q, con
            dv % 4 == 0 && dk > 0 && dv > 0 && (uintptr_t)q->data % 16 == 0 && (uintptr_t)k->data % 16 == 0;
 }
 
-extern "C" size_t ath_gdn_chunk_bytes(const ath_tensor *q, const ath_tensor *v)
+/* Chunks per round: enough prep blocks for GDN_WAVES full waves over the
+ * device's multiprocessors, all of the call's chunks at most. */
+static int64_t round_chunks(const ath_device *d, int64_t nc, int64_t nv)
 {
-    const int64_t T = q->shape[0], nc = (T + GC - 1) / GC;
-    return round_floats(nc < GDN_ROUND ? nc : GDN_ROUND, v->shape[1], q->shape[2], v->shape[2]) * sizeof(float);
+    int64_t r = ((int64_t)GDN_WAVES * d->n_sm + nv - 1) / nv;
+    r = r < 1 ? 1 : r;
+    return nc < r ? nc : r;
+}
+
+extern "C" size_t ath_gdn_chunk_bytes(const ath_device *d, const ath_tensor *q, const ath_tensor *v)
+{
+    const int64_t nc = (q->shape[0] + GC - 1) / GC, nv = v->shape[1];
+    return round_floats(round_chunks(d, nc, nv), nv, q->shape[2], v->shape[2]) * sizeof(float);
 }
 
 extern "C" ath_status ath_gdn_chunk_launch(const ath_device *d, const ath_tensor *q, const ath_tensor *k,
@@ -484,16 +551,16 @@ extern "C" ath_status ath_gdn_chunk_launch(const ath_device *d, const ath_tensor
     if (cudaFuncSetAttribute(gdn_prep, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)PREP_SMEM) != cudaSuccess ||
         cudaFuncSetAttribute(gdn_scan, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SCAN_SMEM) != cudaSuccess)
         return ath_gpu_launched("gdn chunks (shared memory)");
-    const int64_t rc = nc < GDN_ROUND ? nc : GDN_ROUND;
+    const int64_t rc = round_chunks(d, nc, nv);
     float *Wb = (float *)work, *Qb = Wb + rc * nv * GC * dk, *Ub = Qb + rc * nv * GC * dk;
     float *Ob = Ub + rc * nv * GC * dv, *gb = Ob + rc * nv * GC * dv;
-    for (int64_t c0 = 0; c0 < nc; c0 += GDN_ROUND) {
-        const int64_t n = nc - c0 < GDN_ROUND ? nc - c0 : GDN_ROUND;
-        gdn_prep<<<dim3((unsigned)n, (unsigned)nv), GT, PREP_SMEM, k_stream(d)>>>(
+    for (int64_t c0 = 0; c0 < nc; c0 += rc) {
+        const int64_t n = nc - c0 < rc ? nc - c0 : rc;
+        gdn_prep<<<dim3((unsigned)n, (unsigned)nv), PT, PREP_SMEM, k_stream(d)>>>(
             (const float *)q->data, (const float *)k->data, v->data, v->dtype, (const float *)g->data, beta->data,
             beta->dtype, q_scale, T, c0, nk, (int)dk, nv, (int)dv, Qb, Wb, Ub, Ob, gb);
         ATH_CHECK(ath_gpu_launched("gdn_prep"));
-        gdn_scan<<<dim3((unsigned)nv, (unsigned)((dv + GV - 1) / GV)), GT, SCAN_SMEM, k_stream(d)>>>(
+        gdn_scan<<<dim3((unsigned)nv, (unsigned)((dv + GV - 1) / GV)), ST, SCAN_SMEM, k_stream(d)>>>(
             (const float *)k->data, Qb, Wb, Ub, Ob, gb, (float *)state->data, out->data, out->dtype, T, c0, n, nk,
             (int)dk, nv, (int)dv);
         ATH_CHECK(ath_gpu_launched("gdn_scan"));

@@ -136,7 +136,7 @@ ath_status ath_gdn_gpu(const ath_device *d, const ath_tensor *q, const ath_tenso
     /* prompts: the chunked form, with its working memory from scratch (step 10) */
     if (scratch && q->shape[0] >= ATH_GDN_CHUNK_MIN_T && ath_gdn_chunk_fits(d, q, k, v, g)) {
         const ath_dev_arena_pos mark = ath_dev_arena_mark(scratch);
-        void *work = ath_dev_arena_alloc(scratch, ath_gdn_chunk_bytes(q, v), 0);
+        void *work = ath_dev_arena_alloc(scratch, ath_gdn_chunk_bytes(d, q, v), 0);
         if (!work)
             return ATH_ERR_NOMEM;
         ath_status st = ath_gdn_chunk_launch(d, q, k, v, g, beta, q_scale, state, work, out);

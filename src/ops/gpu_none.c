@@ -144,9 +144,9 @@ bool ath_gdn_chunk_fits(const ath_device *d, const ath_tensor *q, const ath_tens
     return false;
 }
 
-size_t ath_gdn_chunk_bytes(const ath_tensor *q, const ath_tensor *v)
+size_t ath_gdn_chunk_bytes(const ath_device *d, const ath_tensor *q, const ath_tensor *v)
 {
-    (void)q, (void)v;
+    (void)d, (void)q, (void)v;
     return 0;
 }
 

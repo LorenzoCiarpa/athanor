@@ -76,7 +76,7 @@ ath_status ath_gdn_launch(const ath_device *d, const ath_tensor *q, const ath_te
  * on d, the bytes of device memory it needs as work, and the launch. */
 bool       ath_gdn_chunk_fits(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
                               const ath_tensor *g);
-size_t     ath_gdn_chunk_bytes(const ath_tensor *q, const ath_tensor *v);
+size_t     ath_gdn_chunk_bytes(const ath_device *d, const ath_tensor *q, const ath_tensor *v);
 ath_status ath_gdn_chunk_launch(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
                                 const ath_tensor *g, const ath_tensor *beta, float q_scale, ath_tensor *state,
                                 void *work, ath_tensor *out);
