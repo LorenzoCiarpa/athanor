@@ -497,6 +497,32 @@ ATH_TEST(gpu_matmul_swiglu)
 
 /* ---- norms ----------------------------------------------------------------------- */
 
+/* The residual add fused into the next norm (step 10): x and out with the
+ * bits of ath_add_gpu followed by ath_rmsnorm_gpu, in bf16 and f32, rows of
+ * 1024 and of 128 (two rows to a warp), and a row count that leaves a warp
+ * half empty. */
+ATH_TEST(gpu_add_rmsnorm)
+{
+    gpu g;
+    GPU_OR_SKIP(g);
+    static const struct { ath_dtype dt; int64_t rows, D; } cases[] = {
+        {ATH_DTYPE_BF16, 37, 1024}, {ATH_DTYPE_F32, 37, 1024}, {ATH_DTYPE_BF16, 33, 128}, {ATH_DTYPE_BF16, 5, 64}};
+    for (size_t i = 0; i < ATH_ARRAY_LEN(cases); i++) {
+        const ath_dtype dt = cases[i].dt;
+        const int64_t R = cases[i].rows, D = cases[i].D;
+        ath_tensor x = rand_t(&g, dt, -2, 2, SHAPE(R, D)), y = rand_t(&g, dt, -2, 2, SHAPE(R, D));
+        ath_tensor w = rand_t(&g, ATH_DTYPE_BF16, -1, 1, SHAPE(D)), o = host(&g, dt, SHAPE(R, D));
+        ath_tensor x1 = up(&g, &x), x2 = up(&g, &x), yd = up(&g, &y), wd = up(&g, &w), o1 = up(&g, &o), o2 = up(&g, &o);
+        ATH_EXPECT(ath_add_rmsnorm_fits(&x1, &yd, &wd));
+        ATH_EXPECT_OK(ath_add_gpu(&g.d, &x1, &yd, &x1));
+        ATH_EXPECT_OK(ath_rmsnorm_gpu(&g.d, &x1, &wd, 1.0f, 1e-6f, &o1));
+        ATH_EXPECT_OK(ath_add_rmsnorm_gpu(&g.d, &x2, &yd, &wd, 1.0f, 1e-6f, &o2));
+        ATH_EXPECT(same_bits(&g, &x1, &x2));
+        ATH_EXPECT(same_bits(&g, &o1, &o2));
+    }
+    gpu_close(&g);
+}
+
 ATH_TEST(gpu_norms)
 {
     gpu g;
@@ -1005,7 +1031,7 @@ ATH_TEST(gpu_gdn_chunk)
 
 static const ath_test_case tests[] = {
     ATH_TEST_ENTRY(gpu_argument_checks), ATH_TEST_ENTRY(gpu_embed),       ATH_TEST_ENTRY(gpu_matmul),      ATH_TEST_ENTRY(gpu_gemv), ATH_TEST_ENTRY(gpu_matmul_n), ATH_TEST_ENTRY(gpu_matmul_swiglu), ATH_TEST_ENTRY(gpu_scatter_rows), ATH_TEST_ENTRY(gpu_sample),
-    ATH_TEST_ENTRY(gpu_norms),           ATH_TEST_ENTRY(gpu_rope),        ATH_TEST_ENTRY(gpu_elementwise),
+    ATH_TEST_ENTRY(gpu_norms),           ATH_TEST_ENTRY(gpu_add_rmsnorm),           ATH_TEST_ENTRY(gpu_rope),        ATH_TEST_ENTRY(gpu_elementwise),
     ATH_TEST_ENTRY(gpu_attn),            ATH_TEST_ENTRY(gpu_attn_mma),    ATH_TEST_ENTRY(gpu_conv),        ATH_TEST_ENTRY(gpu_gdn_gates),
     ATH_TEST_ENTRY(gpu_gdn),             ATH_TEST_ENTRY(gpu_gdn_chunk),
 };

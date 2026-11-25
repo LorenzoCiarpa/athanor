@@ -134,6 +134,14 @@ ath_status ath_matmul_n_gpu(const ath_device *d, const ath_tensor *x, int n, con
  * stored weight is w and the scale is 1 + w). x, out [..., D]; w [D]. */
 ath_status ath_rmsnorm_ref(const ath_tensor *x, const ath_tensor *w, float w_offset, float eps,
                            ath_tensor *out);
+/* GPU fusion of the residual add and the next norm (step 10): x ← x + y,
+ * rounded to x's dtype, then out = rmsnorm(x); the bits of ath_add followed
+ * by ath_rmsnorm, x read once. y like x. Rows of up to 1024 elements, a
+ * multiple of 8, 16-byte aligned buffers (ath_add_rmsnorm_fits says);
+ * ATH_ERR_UNSUPPORTED otherwise, where the caller uses the two ops. */
+bool       ath_add_rmsnorm_fits(const ath_tensor *x, const ath_tensor *y, const ath_tensor *w);
+ath_status ath_add_rmsnorm_gpu(const ath_device *d, ath_tensor *x, const ath_tensor *y, const ath_tensor *w,
+                               float w_offset, float eps, ath_tensor *out);
 ath_status ath_rmsnorm_gpu(const ath_device *d, const ath_tensor *x, const ath_tensor *w, float w_offset,
                            float eps, ath_tensor *out);
 

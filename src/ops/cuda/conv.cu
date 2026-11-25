@@ -41,7 +41,7 @@ static __global__ void conv_kernel(const void *x, int xdt, const void *w, int wd
     }
 }
 
-#define CONV_TOKENS 16
+#define CONV_TOKENS 8
 #define CONV_MAX_K 8
 
 static __global__ void __launch_bounds__(256)

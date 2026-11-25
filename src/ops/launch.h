@@ -34,6 +34,9 @@ ath_status ath_matmul_n_launch(const ath_device *d, const ath_tensor *x, int n, 
 
 /* The three norms share one kernel (norm.cu). */
 typedef enum { ATH_NORM_RMS, ATH_NORM_RMS_GATED, ATH_NORM_L2 } ath_norm_kind;
+bool       ath_add_rmsnorm_fits(const ath_tensor *x, const ath_tensor *y, const ath_tensor *w);
+ath_status ath_add_rmsnorm_launch(const ath_device *d, ath_tensor *x, const ath_tensor *y, const ath_tensor *w,
+                                  float w_offset, float eps, ath_tensor *out);
 ath_status ath_norm_launch(const ath_device *d, ath_norm_kind kind, const ath_tensor *x, const ath_tensor *z,
                            const ath_tensor *w, float w_offset, float eps, ath_tensor *out);
 

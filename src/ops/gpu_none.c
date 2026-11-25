@@ -158,3 +158,16 @@ ath_status ath_gdn_chunk_launch(const ath_device *d, const ath_tensor *q, const 
         (void)out;
     return none("gdn");
 }
+
+bool ath_add_rmsnorm_fits(const ath_tensor *x, const ath_tensor *y, const ath_tensor *w)
+{
+    (void)x, (void)y, (void)w;
+    return false;
+}
+
+ath_status ath_add_rmsnorm_launch(const ath_device *d, ath_tensor *x, const ath_tensor *y, const ath_tensor *w,
+                                  float w_offset, float eps, ath_tensor *out)
+{
+    (void)d, (void)x, (void)y, (void)w, (void)w_offset, (void)eps, (void)out;
+    return none("add_rmsnorm");
+}

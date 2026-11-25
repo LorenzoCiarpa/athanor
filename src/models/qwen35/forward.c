@@ -58,6 +58,10 @@ typedef struct {
     int64_t                  P;     /* tokens before them (n_past)    */
     float                    eps;   /* rms_norm_eps                   */
     ath_tensor               pos;   /* i32 [T]: P, P + 1, ...         */
+    /* GPU, a prompt (step 10): an output projection waits in pend until
+     * the next norm adds it to the residual stream in the same launch */
+    bool                     defer, pending;
+    ath_tensor               pend;  /* [T, hidden]                    */
 } fwd;
 
 /* ---- tensors ------------------------------------------------------------------- */
@@ -116,13 +120,24 @@ static ath_status copy_cols(const fwd *f, const ath_tensor *src, int64_t col, at
 }
 
 /* The matmuls of rmsnorm(x) (norm: the param of its weights, zero-centered):
- * the norm into a temporary, then the projections that share it. */
-static ath_status norm_matmuls(fwd *f, const ath_tensor *x, const ath_param *norm, int n, const ath_tensor *const *w,
+ * the norm into a temporary, then the projections that share it. A
+ * projection waiting to join x (matmul_add) is added in the norm's launch
+ * (ath_add_rmsnorm_gpu, step 10): the bits of the add and then the norm. x
+ * may be the last rows of the residual stream (the logits of the last
+ * token), the same rows of the waiting projection. */
+static ath_status norm_matmuls(fwd *f, ath_tensor *x, const ath_param *norm, int n, const ath_tensor *const *w,
                                ath_tensor *const *out)
 {
     ath_tensor xn;
     ATH_CHECK(tmp(f, &xn, f->act, 2, x->shape[0], x->shape[1], 0));
-    ATH_CHECK(ath_rmsnorm(f->dev, x, W(f, norm), 1.0f, f->eps, &xn));
+    if (f->pending) {
+        ath_tensor y;
+        ATH_CHECK(ath_tensor_slice(&f->pend, 0, f->T - x->shape[0], x->shape[0], &y));
+        ATH_CHECK(ath_add_rmsnorm_gpu(f->dev, x, &y, W(f, norm), 1.0f, f->eps, &xn));
+        f->pending = false;
+    } else {
+        ATH_CHECK(ath_rmsnorm(f->dev, x, W(f, norm), 1.0f, f->eps, &xn));
+    }
     return ath_matmul_n(f->dev, f->pool, &xn, n, w, out);
 }
 
@@ -133,6 +148,12 @@ static ath_status matmul_add(fwd *f, const ath_tensor *h, const ath_tensor *w, a
 {
     if (f->dev && ath_matmul_fits_gemv(h, w))
         return ath_matmul_add_gpu(f->dev, h, w, x);
+    if (f->defer) {
+        /* a prompt on a GPU: the next norm adds it (norm_matmuls) */
+        ATH_CHECK(ath_matmul(f->dev, f->pool, h, w, &f->pend));
+        f->pending = true;
+        return ATH_OK;
+    }
     ath_tensor y;
     ATH_CHECK(tmp(f, &y, f->act, 2, x->shape[0], x->shape[1], 0));
     ATH_CHECK(ath_matmul(f->dev, f->pool, h, w, &y));
@@ -367,6 +388,12 @@ ath_status ath_qwen35_forward(const ath_model *m, const ath_batch *b, ath_state 
     }
     ATH_CHECK(tmp(&f, &x, f.act, 2, T, H, 0));
     ATH_CHECK(ath_embed(f.dev, W(&f, q->embed), &ids, &x));
+    /* output projections wait for the next norm (step 10), on a GPU and
+     * when no hook looks at the residual stream between layers */
+    if (f.dev && !(h && h->on_residual)) {
+        ATH_CHECK(tmp(&f, &f.pend, f.act, 2, T, H, 0));
+        f.defer = ath_add_rmsnorm_fits(&x, &f.pend, W(&f, q->norm));
+    }
 
     for (int32_t l = 0; l < c->n_layers; l++) {
         if (h && h->on_residual)

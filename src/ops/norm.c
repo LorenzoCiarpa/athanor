@@ -112,6 +112,20 @@ ath_status ath_rmsnorm_gpu(const ath_device *d, const ath_tensor *x, const ath_t
     return ath_norm_launch(d, ATH_NORM_RMS, x, NULL, w, w_offset, eps, out);
 }
 
+ath_status ath_add_rmsnorm_gpu(const ath_device *d, ath_tensor *x, const ath_tensor *y, const ath_tensor *w,
+                               float w_offset, float eps, ath_tensor *out)
+{
+    ATH_CHECK(need("add_rmsnorm", w, "w"));
+    ATH_CHECK(need("add_rmsnorm", y, "y"));
+    ATH_CHECK(check_rows("add_rmsnorm", x, out, w, NULL, OPS_GPU));
+    if (y->dtype != x->dtype || !ath_tensor_same_shape(x, y) || !ath_tensor_is_contiguous(y) ||
+        y->tier != ATH_TIER_VRAM)
+        return ops_fail(ATH_ERR_INVALID_ARG, "add_rmsnorm", "y must be a device tensor like x");
+    if (!ath_add_rmsnorm_fits(x, y, w))
+        return ops_fail(ATH_ERR_UNSUPPORTED, "add_rmsnorm", "rows the warp kernel does not take");
+    return ath_add_rmsnorm_launch(d, x, y, w, w_offset, eps, out);
+}
+
 ath_status ath_rmsnorm_gated_gpu(const ath_device *d, const ath_tensor *x, const ath_tensor *z,
                                  const ath_tensor *w, float eps, ath_tensor *out)
 {
