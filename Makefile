@@ -100,7 +100,7 @@ LIB_OBJ   := $(LIB_SRC:%.c=$(BUILD)/obj/%.o) $(GPU_SRC:%.cu=$(BUILD)/obj/%.cu.o)
 TOOL_SRC := $(wildcard tools/*.c)
 TOOL_OBJ := $(TOOL_SRC:%.c=$(BUILD)/obj/%.o)
 TESTS    := $(BUILD)/test_core $(BUILD)/test_model $(BUILD)/test_ops $(BUILD)/test_golden \
-            $(BUILD)/test_forward $(BUILD)/test_text $(BUILD)/test_backend
+            $(BUILD)/test_forward $(BUILD)/test_text $(BUILD)/test_backend $(BUILD)/test_gpu_ops
 
 .PHONY: all cpu cuda cuda-check hip test check-alloc golden clean FORCE
 .SECONDARY:
