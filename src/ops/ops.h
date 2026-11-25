@@ -2,9 +2,9 @@
  *
  * Every op has a CPU reference, <op>_ref, written to be obviously correct and
  * never optimized: scalar loops, arithmetic and accumulation in fp32 (float),
- * one rounding to the output dtype at the end. GPU kernels (step 7) and
- * optional fast CPU paths are tested against these functions, which in turn
- * are tested against the reference implementation on real weights
+ * one rounding to the output dtype at the end. GPU kernels (<op>_gpu, step 7)
+ * and optional fast CPU paths are tested against these functions, which in
+ * turn are tested against the reference implementation on real weights
  * (tests/test_golden.c). The math of each op follows docs/MODELS.md and
  * docs/contract/<model>.md; nothing here knows which model calls it.
  *
@@ -25,16 +25,40 @@
  *     that are not in host memory or limits stated below, ATH_ERR_RANGE for
  *     token ids outside the table. The message is logged at error level.
  *
- * The device-dispatching entry points (one per op, choosing _ref, a fast CPU
- * path or a GPU kernel from where the tensors live) join this header with the
- * second implementation of an op, in step 7.
+ * GPU kernels (step 7). ath_<op>_gpu takes the device first, then the
+ * arguments of ath_<op>_ref, with the same shapes, dtypes and math, and every
+ * tensor in that device's memory (tier VRAM; ATH_ERR_UNSUPPORTED otherwise).
+ *
+ *   - Asynchronous: the work is queued on the device's compute stream
+ *     (ATH_STREAM_COMPUTE) and the function returns. Ops queued one after
+ *     the other run in that order; the host must synchronize the stream, or
+ *     copy on it, before it reads an output.
+ *   - The errors above are checked on the host before anything is queued.
+ *     A fault while a kernel runs is reported by the next call that waits
+ *     for the stream (src/backend/backend.h).
+ *   - Results match the reference within tolerances, not to the bit: the
+ *     kernels sum in another order, fuse multiply-adds, and the device's
+ *     exp, log, sin and cos round differently from libm. tests/README.md,
+ *     GPU kernels, has the tolerances and what was measured.
+ *   - Limits beyond the reference's are stated per function.
+ *   - In a build without a GPU backend (make) every _gpu function checks its
+ *     arguments, then fails with ATH_ERR_UNSUPPORTED.
+ *
+ * The entry point per op that chooses _ref, a fast CPU path or the GPU
+ * kernel from where the tensors live joins this header with its first
+ * caller, the GPU forward pass (step 8).
  */
 #ifndef ATH_OPS_H
 #define ATH_OPS_H
 
+#include "backend/backend.h"
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "core/threads.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 /* Activation fused into an op. */
 typedef enum {
@@ -47,6 +71,10 @@ typedef enum {
 /* out[i, :] = table[ids[i], :].
  * table [V, H]; ids [n] i32, each in [0, V); out [n, H]. */
 ath_status ath_embed_ref(const ath_tensor *table, const ath_tensor *ids, ath_tensor *out);
+/* The ids are on the device, so they are not checked against the table: an
+ * id outside [0, V) gives a row of NaN, and nothing is read outside the
+ * table. ath_model_forward checks token ids before they reach the op. */
+ath_status ath_embed_gpu(const ath_device *d, const ath_tensor *table, const ath_tensor *ids, ath_tensor *out);
 
 /* ---- matmul.c -------------------------------------------------------------- */
 
@@ -61,6 +89,11 @@ ath_status ath_matmul_ref(const ath_tensor *x, const ath_tensor *w, ath_tensor *
  * Fast CPU paths. */
 ath_status ath_matmul_fast(const ath_tensor *x, const ath_tensor *w, ath_tensor *out, ath_pool *pool);
 
+/* The GPU matmul: cuBLASLt when it has the dtypes (x and w bf16 with out bf16
+ * or f32, or all three f32), accumulating in fp32 (never TF32); athanor's
+ * own kernel, slower, for the other combinations (src/ops/matmul.cu). */
+ath_status ath_matmul_gpu(const ath_device *d, const ath_tensor *x, const ath_tensor *w, ath_tensor *out);
+
 /* ---- norm.c ---------------------------------------------------------------- */
 
 /* RMSNorm over the last dimension:
@@ -69,6 +102,8 @@ ath_status ath_matmul_fast(const ath_tensor *x, const ath_tensor *w, ath_tensor 
  * stored weight is w and the scale is 1 + w). x, out [..., D]; w [D]. */
 ath_status ath_rmsnorm_ref(const ath_tensor *x, const ath_tensor *w, float w_offset, float eps,
                            ath_tensor *out);
+ath_status ath_rmsnorm_gpu(const ath_device *d, const ath_tensor *x, const ath_tensor *w, float w_offset,
+                           float eps, ath_tensor *out);
 
 /* Gated RMSNorm over the last dimension, SiLU gate, plain weight:
  *   n   = x / sqrt(mean(x²) + eps), rounded to the dtype of x
@@ -77,10 +112,13 @@ ath_status ath_rmsnorm_ref(const ath_tensor *x, const ath_tensor *w, float w_off
  * x, z, out [..., D]; w [D]. */
 ath_status ath_rmsnorm_gated_ref(const ath_tensor *x, const ath_tensor *z, const ath_tensor *w,
                                  float eps, ath_tensor *out);
+ath_status ath_rmsnorm_gated_gpu(const ath_device *d, const ath_tensor *x, const ath_tensor *z,
+                                 const ath_tensor *w, float eps, ath_tensor *out);
 
 /* L2 normalization over the last dimension: out = x / sqrt(Σ x² + eps).
  * x, out [..., D]. */
 ath_status ath_l2norm_ref(const ath_tensor *x, float eps, ath_tensor *out);
+ath_status ath_l2norm_gpu(const ath_device *d, const ath_tensor *x, float eps, ath_tensor *out);
 
 /* ---- rope.c ---------------------------------------------------------------- */
 
@@ -95,17 +133,24 @@ ath_status ath_l2norm_ref(const ath_tensor *x, float eps, ath_tensor *out);
  * x, out [T, heads, head_dim]; pos [T] i32; rope_dim even, <= head_dim. */
 ath_status ath_rope_ref(const ath_tensor *x, const ath_tensor *pos, int32_t rope_dim, float theta,
                         ath_tensor *out);
+/* GPU: rope_dim <= ATH_ROPE_MAX_DIM. */
+#define ATH_ROPE_MAX_DIM 512
+ath_status ath_rope_gpu(const ath_device *d, const ath_tensor *x, const ath_tensor *pos, int32_t rope_dim,
+                        float theta, ath_tensor *out);
 
 /* ---- act.c ----------------------------------------------------------------- */
 
 /* out = silu(gate) · up, elementwise. gate, up, out of the same shape. */
 ath_status ath_swiglu_ref(const ath_tensor *gate, const ath_tensor *up, ath_tensor *out);
+ath_status ath_swiglu_gpu(const ath_device *d, const ath_tensor *gate, const ath_tensor *up, ath_tensor *out);
 
 /* out = x · sigmoid(gate), elementwise. x, gate, out of the same shape. */
 ath_status ath_sigmoid_mul_ref(const ath_tensor *x, const ath_tensor *gate, ath_tensor *out);
+ath_status ath_sigmoid_mul_gpu(const ath_device *d, const ath_tensor *x, const ath_tensor *gate, ath_tensor *out);
 
 /* out = a + b, elementwise. a, b, out of the same shape; out may alias a or b. */
 ath_status ath_add_ref(const ath_tensor *a, const ath_tensor *b, ath_tensor *out);
+ath_status ath_add_gpu(const ath_device *d, const ath_tensor *a, const ath_tensor *b, ath_tensor *out);
 
 /* ---- attn.c ---------------------------------------------------------------- */
 
@@ -119,6 +164,9 @@ ath_status ath_add_ref(const ath_tensor *a, const ath_tensor *b, ath_tensor *out
 #define ATH_ATTN_MAX_DV 1024
 ath_status ath_attn_ref(const ath_tensor *q, const ath_tensor *k, const ath_tensor *v, float scale,
                         ath_tensor *out);
+/* GPU: the query/key head dim d is also at most ATH_ATTN_MAX_DV. */
+ath_status ath_attn_gpu(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
+                        float scale, ath_tensor *out);
 
 /* ---- conv.c ---------------------------------------------------------------- */
 
@@ -131,6 +179,8 @@ ath_status ath_attn_ref(const ath_tensor *q, const ath_tensor *k, const ath_tens
  * [K − 1, C], read and overwritten (zero it at the start of a sequence). */
 ath_status ath_conv_ref(const ath_tensor *x, const ath_tensor *w, ath_tensor *state, ath_act act,
                         ath_tensor *out);
+ath_status ath_conv_gpu(const ath_device *d, const ath_tensor *x, const ath_tensor *w, ath_tensor *state,
+                        ath_act act, ath_tensor *out);
 
 /* ---- gdn.c ----------------------------------------------------------------- */
 
@@ -141,6 +191,8 @@ ath_status ath_conv_ref(const ath_tensor *x, const ath_tensor *w, ath_tensor *st
  * a, b, g, beta [T, nv]; a_log, dt_bias [nv]. */
 ath_status ath_gdn_gates_ref(const ath_tensor *a, const ath_tensor *b, const ath_tensor *a_log,
                              const ath_tensor *dt_bias, ath_tensor *g, ath_tensor *beta);
+ath_status ath_gdn_gates_gpu(const ath_device *d, const ath_tensor *a, const ath_tensor *b,
+                             const ath_tensor *a_log, const ath_tensor *dt_bias, ath_tensor *g, ath_tensor *beta);
 
 /* Gated delta rule, recurrent form. For every token t and value head h, with
  * the state S [dk, dv] of that head:
@@ -154,6 +206,12 @@ ath_status ath_gdn_gates_ref(const ath_tensor *a, const ath_tensor *b, const ath
 ath_status ath_gdn_ref(const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
                        const ath_tensor *g, const ath_tensor *beta, float q_scale,
                        ath_tensor *state, ath_tensor *out);
+/* GPU: dk <= ATH_GDN_MAX_DK. The recurrent form, as the reference: one step
+ * per token (the chunked form for long prompts is step 10). */
+#define ATH_GDN_MAX_DK 256
+ath_status ath_gdn_gpu(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
+                       const ath_tensor *g, const ath_tensor *beta, float q_scale, ath_tensor *state,
+                       ath_tensor *out);
 
 /* ---- sample.c (step 5) ----------------------------------------------------- */
 
@@ -178,5 +236,9 @@ typedef struct {
  * or min_p outside [0, 1]. */
 ath_status ath_sample_ref(const ath_tensor *logits, const ath_sampler *p, double u, ath_arena *scratch,
                           int32_t *out);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* ATH_OPS_H */

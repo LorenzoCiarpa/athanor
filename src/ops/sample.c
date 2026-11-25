@@ -71,6 +71,7 @@ ath_status ath_sample_ref(const ath_tensor *logits, const ath_sampler *p, double
         !(p->min_p >= 0 && p->min_p <= 1) || !(u >= 0 && u < 1))
         return ops_fail(ATH_ERR_INVALID_ARG, op, "temperature %g, top_k %d, top_p %g, min_p %g, u %g",
                         (double)p->temperature, p->top_k, (double)p->top_p, (double)p->min_p, u);
+    ATH_CHECK(OPS_PLACE(op, OPS_HOST, logits));
     const int64_t V = ops_last(logits);
 
     if (p->temperature == 0 || p->top_k == 1) {

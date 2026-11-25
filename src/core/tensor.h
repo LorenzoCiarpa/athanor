@@ -15,6 +15,10 @@
 
 #include <string.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define ATH_MAX_DIMS 8
 
 typedef enum {
@@ -135,5 +139,9 @@ static inline float ath_round_to(ath_dtype dt, float v)
 {
     return dt == ATH_DTYPE_BF16 ? ath_bf16_to_f32(ath_f32_to_bf16(v)) : v;
 }
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* ATH_TENSOR_H */

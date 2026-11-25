@@ -54,8 +54,12 @@ LDLIBS := -lm -lpthread
 # itself. cuBLASLt (the dense matmul) is linked as a shared library found
 # through the toolkit's path recorded in the binary: statically it would add
 # about 560 MB to every binary (src/backend/README.md, Linking).
+# -fno-threadsafe-statics: the launch stub nvcc writes for each kernel keeps
+# the kernel's address in a function-local static, which C++ guards with
+# a lock from libstdc++; the binary is linked as C, without it. The value is
+# a constant, so two threads that set it at once set the same thing.
 NVCCFLAGS := -std=c++17 -gencode arch=compute_$(CUDA_ARCH),code=sm_$(CUDA_ARCH) -Werror all-warnings \
-             -Xcompiler -Wall,-Wextra,-Werror,-fno-exceptions,-fno-rtti -Isrc -MMD -MP
+             -Xcompiler -Wall,-Wextra,-Werror,-fno-exceptions,-fno-rtti,-fno-threadsafe-statics -Isrc -MMD -MP
 ifeq ($(DEBUG),1)
 NVCCFLAGS += -O0 -g -lineinfo -DATH_DEBUG -Xcompiler -fsanitize=address,-fsanitize=undefined,-fno-omit-frame-pointer
 else
@@ -78,16 +82,20 @@ CORE_SRC  := $(wildcard src/core/*.c)
 OPS_SRC   := $(wildcard src/ops/*.c)
 TEXT_SRC  := $(wildcard src/text/*.c)
 MODEL_SRC := $(wildcard src/model/*.c)
-# The backend: gpu.cu with a GPU, gpu_none.c without (src/backend/README.md).
+# GPU code: the backend's gpu.cu and the kernels of src/ops/*.cu with a GPU;
+# without one, the stubs gpu_none.c of both (src/backend/README.md).
 BACKEND_SRC := $(filter-out src/backend/gpu_none.c,$(wildcard src/backend/*.c))
+OPS_SRC     := $(filter-out src/ops/gpu_none.c,$(OPS_SRC))
 ifeq ($(GPU),cuda)
-GPU_SRC   := src/backend/gpu.cu
+GPU_SRC   := src/backend/gpu.cu $(wildcard src/ops/*.cu)
 else
 BACKEND_SRC += src/backend/gpu_none.c
+OPS_SRC     += src/ops/gpu_none.c
 GPU_SRC   :=
 endif
 LIB_SRC   := $(CORE_SRC) $(OPS_SRC) $(TEXT_SRC) $(MODEL_SRC) $(FAMILY_SRC) $(BACKEND_SRC)
-LIB_OBJ   := $(LIB_SRC:%.c=$(BUILD)/obj/%.o) $(GPU_SRC:%.cu=$(BUILD)/obj/%.o)
+# A kernel file shares its op's name (matmul.c, matmul.cu): .cu objects end in .cu.o.
+LIB_OBJ   := $(LIB_SRC:%.c=$(BUILD)/obj/%.o) $(GPU_SRC:%.cu=$(BUILD)/obj/%.cu.o)
 
 TOOL_SRC := $(wildcard tools/*.c)
 TOOL_OBJ := $(TOOL_SRC:%.c=$(BUILD)/obj/%.o)
@@ -111,7 +119,7 @@ $(BUILD)/obj/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-$(BUILD)/obj/%.o: %.cu | cuda-check
+$(BUILD)/obj/%.cu.o: %.cu | cuda-check
 	@mkdir -p $(dir $@)
 	$(NVCC) $(NVCCFLAGS) -c -o $@ $<
 

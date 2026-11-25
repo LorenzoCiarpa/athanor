@@ -9,14 +9,16 @@
  * softmax is an fp32 island).
  */
 #include "ops/check.h"
+#include "ops/launch.h"
 #include "ops/ops.h"
 
 #include <math.h>
 
-ath_status ath_attn_ref(const ath_tensor *q, const ath_tensor *k, const ath_tensor *v, float scale,
-                        ath_tensor *out)
+static const char op[] = "attn";
+
+static ath_status args(const ath_tensor *q, const ath_tensor *k, const ath_tensor *v, const ath_tensor *out,
+                       ops_where where)
 {
-    static const char op[] = "attn";
     ATH_CHECK(ops_float(q, op, "q"));
     ATH_CHECK(ops_float(k, op, "k"));
     ATH_CHECK(ops_float(v, op, "v"));
@@ -33,7 +35,15 @@ ath_status ath_attn_ref(const ath_tensor *q, const ath_tensor *k, const ath_tens
     if (dv > ATH_ATTN_MAX_DV)
         return ops_fail(ATH_ERR_UNSUPPORTED, op, "value head dim %lld > %d", (long long)dv,
                         ATH_ATTN_MAX_DV);
+    return OPS_PLACE(op, where, q, k, v, out);
+}
 
+ath_status ath_attn_ref(const ath_tensor *q, const ath_tensor *k, const ath_tensor *v, float scale,
+                        ath_tensor *out)
+{
+    ATH_CHECK(args(q, k, v, out, OPS_HOST));
+    const int64_t T = q->shape[0], nh = q->shape[1], d = q->shape[2];
+    const int64_t S = k->shape[0], nkv = k->shape[1], dv = v->shape[2];
     const int64_t group = nh / nkv;
     float acc[ATH_ATTN_MAX_DV];
     for (int64_t t = 0; t < T; t++) {
@@ -67,4 +77,14 @@ ath_status ath_attn_ref(const ath_tensor *q, const ath_tensor *k, const ath_tens
         }
     }
     return ATH_OK;
+}
+
+ath_status ath_attn_gpu(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
+                        float scale, ath_tensor *out)
+{
+    ATH_CHECK(args(q, k, v, out, OPS_GPU));
+    if (q->shape[2] > ATH_ATTN_MAX_DV)
+        return ops_fail(ATH_ERR_UNSUPPORTED, op, "head dim %lld > %d on the GPU", (long long)q->shape[2],
+                        ATH_ATTN_MAX_DV);
+    return ath_attn_launch(d, q, k, v, scale, out);
 }

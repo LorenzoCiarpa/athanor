@@ -9,6 +9,7 @@
  *   l2norm         x · rsqrt(Σ x² + eps)
  */
 #include "ops/check.h"
+#include "ops/launch.h"
 #include "ops/ops.h"
 
 #include <math.h>
@@ -24,26 +25,44 @@ static float inv_rms(const ath_tensor *x, int64_t base, int64_t D, float div, fl
     return 1.0f / sqrtf(ss / div + eps);
 }
 
-/* x and out of the same shape; w (if with_weight) a vector over the last dimension. */
-static ath_status check_rows(const char *op, const ath_tensor *x, const ath_tensor *out,
-                             bool with_weight, const ath_tensor *w)
+/* x and out of the same shape; w (if present) a vector over the last
+ * dimension; z (if present) of the shape of x. */
+static ath_status check_rows(const char *op, const ath_tensor *x, const ath_tensor *out, const ath_tensor *w,
+                             const ath_tensor *z, ops_where where)
 {
     ATH_CHECK(ops_float(x, op, "x"));
     ATH_CHECK(ops_float(out, op, "out"));
     if (!ath_tensor_same_shape(x, out) || x->ndim < 1)
         return ops_fail(ATH_ERR_INVALID_ARG, op, "x and out must have the same shape");
-    if (with_weight) {
+    if (w) {
         ATH_CHECK(ops_float(w, op, "w"));
         if (w->ndim != 1 || w->shape[0] != ops_last(x))
             return ops_fail(ATH_ERR_INVALID_ARG, op, "w must be [%lld]", (long long)ops_last(x));
     }
+    if (z) {
+        ATH_CHECK(ops_float(z, op, "z"));
+        if (!ath_tensor_same_shape(x, z))
+            return ops_fail(ATH_ERR_INVALID_ARG, op, "x and z must have the same shape");
+    }
+    ATH_CHECK(OPS_PLACE(op, where, x, out));
+    if (w)
+        ATH_CHECK(OPS_PLACE(op, where, w));
+    if (z)
+        ATH_CHECK(OPS_PLACE(op, where, z));
     return ATH_OK;
+}
+
+/* The weight and the gate are required where the op has them. */
+static ath_status need(const char *op, const ath_tensor *t, const char *name)
+{
+    return t ? ATH_OK : ops_fail(ATH_ERR_INVALID_ARG, op, "%s: missing", name);
 }
 
 ath_status ath_rmsnorm_ref(const ath_tensor *x, const ath_tensor *w, float w_offset, float eps,
                            ath_tensor *out)
 {
-    ATH_CHECK(check_rows("rmsnorm", x, out, true, w));
+    ATH_CHECK(need("rmsnorm", w, "w"));
+    ATH_CHECK(check_rows("rmsnorm", x, out, w, NULL, OPS_HOST));
     const int64_t D = ops_last(x), rows = ops_rows(x);
     for (int64_t r = 0; r < rows; r++) {
         float inv = inv_rms(x, r * D, D, (float)D, eps);
@@ -57,10 +76,9 @@ ath_status ath_rmsnorm_gated_ref(const ath_tensor *x, const ath_tensor *z, const
                                  float eps, ath_tensor *out)
 {
     static const char op[] = "rmsnorm_gated";
-    ATH_CHECK(check_rows(op, x, out, true, w));
-    ATH_CHECK(ops_float(z, op, "z"));
-    if (!ath_tensor_same_shape(x, z))
-        return ops_fail(ATH_ERR_INVALID_ARG, op, "x and z must have the same shape");
+    ATH_CHECK(need(op, w, "w"));
+    ATH_CHECK(need(op, z, "z"));
+    ATH_CHECK(check_rows(op, x, out, w, z, OPS_HOST));
     const int64_t D = ops_last(x), rows = ops_rows(x);
     for (int64_t r = 0; r < rows; r++) {
         float inv = inv_rms(x, r * D, D, (float)D, eps);
@@ -76,7 +94,7 @@ ath_status ath_rmsnorm_gated_ref(const ath_tensor *x, const ath_tensor *z, const
 
 ath_status ath_l2norm_ref(const ath_tensor *x, float eps, ath_tensor *out)
 {
-    ATH_CHECK(check_rows("l2norm", x, out, false, NULL));
+    ATH_CHECK(check_rows("l2norm", x, out, NULL, NULL, OPS_HOST));
     const int64_t D = ops_last(x), rows = ops_rows(x);
     for (int64_t r = 0; r < rows; r++) {
         float inv = inv_rms(x, r * D, D, 1.0f, eps);
@@ -84,4 +102,27 @@ ath_status ath_l2norm_ref(const ath_tensor *x, float eps, ath_tensor *out)
             st(out, r * D + i, ld(x, r * D + i) * inv);
     }
     return ATH_OK;
+}
+
+ath_status ath_rmsnorm_gpu(const ath_device *d, const ath_tensor *x, const ath_tensor *w, float w_offset,
+                           float eps, ath_tensor *out)
+{
+    ATH_CHECK(need("rmsnorm", w, "w"));
+    ATH_CHECK(check_rows("rmsnorm", x, out, w, NULL, OPS_GPU));
+    return ath_norm_launch(d, ATH_NORM_RMS, x, NULL, w, w_offset, eps, out);
+}
+
+ath_status ath_rmsnorm_gated_gpu(const ath_device *d, const ath_tensor *x, const ath_tensor *z,
+                                 const ath_tensor *w, float eps, ath_tensor *out)
+{
+    ATH_CHECK(need("rmsnorm_gated", w, "w"));
+    ATH_CHECK(need("rmsnorm_gated", z, "z"));
+    ATH_CHECK(check_rows("rmsnorm_gated", x, out, w, z, OPS_GPU));
+    return ath_norm_launch(d, ATH_NORM_RMS_GATED, x, z, w, 0.0f, eps, out);
+}
+
+ath_status ath_l2norm_gpu(const ath_device *d, const ath_tensor *x, float eps, ath_tensor *out)
+{
+    ATH_CHECK(check_rows("l2norm", x, out, NULL, NULL, OPS_GPU));
+    return ath_norm_launch(d, ATH_NORM_L2, x, NULL, NULL, 0.0f, eps, out);
 }

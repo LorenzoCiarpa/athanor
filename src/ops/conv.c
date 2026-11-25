@@ -8,9 +8,12 @@
  * DeltaNet layer).
  */
 #include "ops/check.h"
+#include "ops/launch.h"
 #include "ops/ops.h"
 
 #include <math.h>
+
+static const char op[] = "conv";
 
 /* Element (r, c) of xx = [state; x], the inputs seen by the filter. */
 static float xx(const ath_tensor *state, const ath_tensor *x, int64_t r, int64_t c)
@@ -19,17 +22,16 @@ static float xx(const ath_tensor *state, const ath_tensor *x, int64_t r, int64_t
     return r < past ? ld(state, r * C + c) : ld(x, (r - past) * C + c);
 }
 
-ath_status ath_conv_ref(const ath_tensor *x, const ath_tensor *w, ath_tensor *state, ath_act act,
-                        ath_tensor *out)
+static ath_status args(const ath_tensor *x, const ath_tensor *w, const ath_tensor *state, ath_act act,
+                       const ath_tensor *out, ops_where where)
 {
-    static const char op[] = "conv";
     ATH_CHECK(ops_float(x, op, "x"));
     ATH_CHECK(ops_float(w, op, "w"));
     ATH_CHECK(ops_float(state, op, "state"));
     ATH_CHECK(ops_float(out, op, "out"));
     if (x->ndim != 2 || !ath_tensor_same_shape(x, out))
         return ops_fail(ATH_ERR_INVALID_ARG, op, "x and out must be [T, C]");
-    const int64_t T = x->shape[0], C = x->shape[1];
+    const int64_t C = x->shape[1];
     const bool w2 = w->ndim == 2, w3 = w->ndim == 3 && w->shape[1] == 1;
     if (!(w2 || w3) || w->shape[0] != C)
         return ops_fail(ATH_ERR_INVALID_ARG, op, "w must be [%lld, K] or [%lld, 1, K]", (long long)C,
@@ -40,7 +42,14 @@ ath_status ath_conv_ref(const ath_tensor *x, const ath_tensor *w, ath_tensor *st
                         (long long)(K - 1), (long long)C);
     if (act != ATH_ACT_NONE && act != ATH_ACT_SILU)
         return ops_fail(ATH_ERR_INVALID_ARG, op, "unknown activation %d", (int)act);
+    return OPS_PLACE(op, where, x, w, state, out);
+}
 
+ath_status ath_conv_ref(const ath_tensor *x, const ath_tensor *w, ath_tensor *state, ath_act act,
+                        ath_tensor *out)
+{
+    ATH_CHECK(args(x, w, state, act, out, OPS_HOST));
+    const int64_t T = x->shape[0], C = x->shape[1], K = w->shape[w->ndim - 1];
     for (int64_t t = 0; t < T; t++)
         for (int64_t c = 0; c < C; c++) {
             float acc = 0.0f;
@@ -57,4 +66,11 @@ ath_status ath_conv_ref(const ath_tensor *x, const ath_tensor *w, ath_tensor *st
         for (int64_t c = 0; c < C; c++)
             st(state, i * C + c, xx(state, x, T + i, c));
     return ATH_OK;
+}
+
+ath_status ath_conv_gpu(const ath_device *d, const ath_tensor *x, const ath_tensor *w, ath_tensor *state,
+                        ath_act act, ath_tensor *out)
+{
+    ATH_CHECK(args(x, w, state, act, out, OPS_GPU));
+    return ath_conv_launch(d, x, w, state, act, out);
 }

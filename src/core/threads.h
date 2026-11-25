@@ -23,6 +23,10 @@
 
 #include <pthread.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* One task of a run: task in [0, n_tasks). */
 typedef void (*ath_pool_fn)(void *ctx, int32_t task, int32_t n_tasks);
 
@@ -62,5 +66,9 @@ int32_t ath_pool_threads(const ath_pool *p);
 /* fn(ctx, task, n_tasks) for every task in [0, n_tasks), spread over the
  * threads of the pool; returns when all have returned. */
 void ath_pool_run(ath_pool *p, int32_t n_tasks, ath_pool_fn fn, void *ctx);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* ATH_THREADS_H */

@@ -10,6 +10,7 @@
  * computes the same recurrence (contract, Gated DeltaNet layer).
  */
 #include "ops/check.h"
+#include "ops/launch.h"
 #include "ops/ops.h"
 
 #include <math.h>
@@ -20,8 +21,9 @@ static float softplus(float x)
     return x > 20.0f ? x : log1pf(expf(x));
 }
 
-ath_status ath_gdn_gates_ref(const ath_tensor *a, const ath_tensor *b, const ath_tensor *a_log,
-                             const ath_tensor *dt_bias, ath_tensor *g, ath_tensor *beta)
+static ath_status gates_args(const ath_tensor *a, const ath_tensor *b, const ath_tensor *a_log,
+                             const ath_tensor *dt_bias, const ath_tensor *g, const ath_tensor *beta,
+                             ops_where where)
 {
     static const char op[] = "gdn_gates";
     ATH_CHECK(ops_float(a, op, "a"));
@@ -34,7 +36,13 @@ ath_status ath_gdn_gates_ref(const ath_tensor *a, const ath_tensor *b, const ath
         !ath_tensor_same_shape(a, beta) || a_log->ndim != 1 || a_log->shape[0] != a->shape[1] ||
         !ath_tensor_same_shape(a_log, dt_bias))
         return ops_fail(ATH_ERR_INVALID_ARG, op, "shapes must be a, b, g, beta [T, nv], a_log, dt_bias [nv]");
+    return OPS_PLACE(op, where, a, b, a_log, dt_bias, g, beta);
+}
 
+ath_status ath_gdn_gates_ref(const ath_tensor *a, const ath_tensor *b, const ath_tensor *a_log,
+                             const ath_tensor *dt_bias, ath_tensor *g, ath_tensor *beta)
+{
+    ATH_CHECK(gates_args(a, b, a_log, dt_bias, g, beta, OPS_HOST));
     const int64_t T = a->shape[0], nv = a->shape[1];
     for (int64_t t = 0; t < T; t++)
         for (int64_t h = 0; h < nv; h++) {
@@ -45,11 +53,13 @@ ath_status ath_gdn_gates_ref(const ath_tensor *a, const ath_tensor *b, const ath
     return ATH_OK;
 }
 
-ath_status ath_gdn_ref(const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
-                       const ath_tensor *g, const ath_tensor *beta, float q_scale,
-                       ath_tensor *state, ath_tensor *out)
+static const char gdn_op[] = "gdn";
+
+static ath_status gdn_args(const ath_tensor *q, const ath_tensor *k, const ath_tensor *v, const ath_tensor *g,
+                           const ath_tensor *beta, const ath_tensor *state, const ath_tensor *out,
+                           ops_where where)
 {
-    static const char op[] = "gdn";
+    const char *op = gdn_op;
     ATH_CHECK(ops_float(q, op, "q"));
     ATH_CHECK(ops_float(k, op, "k"));
     ATH_CHECK(ops_float(v, op, "v"));
@@ -71,7 +81,16 @@ ath_status ath_gdn_ref(const ath_tensor *q, const ath_tensor *k, const ath_tenso
                         "state [nv, dk, dv], nv a multiple of nk",
                         (long long)T, (long long)nk, (long long)dk, (long long)v->shape[0],
                         (long long)nv, (long long)dv);
+    return OPS_PLACE(op, where, q, k, v, g, beta, state, out);
+}
 
+ath_status ath_gdn_ref(const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
+                       const ath_tensor *g, const ath_tensor *beta, float q_scale,
+                       ath_tensor *state, ath_tensor *out)
+{
+    ATH_CHECK(gdn_args(q, k, v, g, beta, state, out, OPS_HOST));
+    const int64_t T = q->shape[0], nk = q->shape[1], dk = q->shape[2];
+    const int64_t nv = v->shape[1], dv = v->shape[2];
     const int64_t group = nv / nk;
     float *S0 = state->data;
     for (int64_t t = 0; t < T; t++)
@@ -97,4 +116,22 @@ ath_status ath_gdn_ref(const ath_tensor *q, const ath_tensor *k, const ath_tenso
             }
         }
     return ATH_OK;
+}
+
+ath_status ath_gdn_gates_gpu(const ath_device *d, const ath_tensor *a, const ath_tensor *b,
+                             const ath_tensor *a_log, const ath_tensor *dt_bias, ath_tensor *g, ath_tensor *beta)
+{
+    ATH_CHECK(gates_args(a, b, a_log, dt_bias, g, beta, OPS_GPU));
+    return ath_gdn_gates_launch(d, a, b, a_log, dt_bias, g, beta);
+}
+
+ath_status ath_gdn_gpu(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
+                       const ath_tensor *g, const ath_tensor *beta, float q_scale, ath_tensor *state,
+                       ath_tensor *out)
+{
+    ATH_CHECK(gdn_args(q, k, v, g, beta, state, out, OPS_GPU));
+    if (q->shape[2] > ATH_GDN_MAX_DK)
+        return ops_fail(ATH_ERR_UNSUPPORTED, gdn_op, "key head dim %lld > %d on the GPU", (long long)q->shape[2],
+                        ATH_GDN_MAX_DK);
+    return ath_gdn_launch(d, q, k, v, g, beta, q_scale, state, out);
 }

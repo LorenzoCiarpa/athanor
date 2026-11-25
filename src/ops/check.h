@@ -1,5 +1,7 @@
-/* check.h: argument checks and element access shared by the _ref functions.
- * Private to src/ops/ (the public interface is ops.h).
+/* check.h: argument checks and element access shared by the ops: their
+ * _ref, _fast and _gpu functions check the same shapes and dtypes, and
+ * differ in where the tensors must be (ops_place). Private to src/ops/ (the
+ * public interface is ops.h).
  */
 #ifndef ATH_OPS_CHECK_H
 #define ATH_OPS_CHECK_H
@@ -25,7 +27,7 @@ static inline ath_status ops_fail(ath_status s, const char *op, const char *fmt,
 }
 
 /* A tensor of dtype `dtype` (or, with dtype ATH_DTYPE_COUNT, f32 or bf16),
- * present, contiguous and in host memory. */
+ * present and contiguous. Where it lives is checked by ops_place. */
 static inline ath_status ops_tensor(const ath_tensor *t, ath_dtype dtype, const char *op,
                                     const char *name)
 {
@@ -35,13 +37,36 @@ static inline ath_status ops_tensor(const ath_tensor *t, ath_dtype dtype, const 
                                  : t->dtype != dtype)
         return ops_fail(ATH_ERR_TYPE, op, "%s: dtype %s not supported", name,
                         ath_dtype_name(t->dtype));
-    if (t->tier != ATH_TIER_RAM && t->tier != ATH_TIER_PINNED)
-        return ops_fail(ATH_ERR_UNSUPPORTED, op, "%s: tensor in %s, the reference needs host memory",
-                        name, ath_tier_name(t->tier));
     if (!ath_tensor_is_contiguous(t))
         return ops_fail(ATH_ERR_INVALID_ARG, op, "%s: not contiguous", name);
     return ATH_OK;
 }
+
+/* Where an implementation needs its tensors: _ref and _fast read and write
+ * them on the host (tier RAM or PINNED), _gpu on the device (tier VRAM). */
+typedef enum { OPS_HOST, OPS_GPU } ops_where;
+
+/* Every one of the n tensors where `where` needs it; ATH_ERR_UNSUPPORTED
+ * otherwise. Checked after the shapes and dtypes. */
+static inline ath_status ops_place(const char *op, ops_where where, const ath_tensor *const *t, int n)
+{
+    for (int i = 0; i < n; i++) {
+        const ath_tier tier = t[i]->tier;
+        const bool host = tier == ATH_TIER_RAM || tier == ATH_TIER_PINNED;
+        if (where == OPS_HOST && !host)
+            return ops_fail(ATH_ERR_UNSUPPORTED, op, "a tensor in %s: the reference needs host memory",
+                            ath_tier_name(tier));
+        if (where == OPS_GPU && tier != ATH_TIER_VRAM)
+            return ops_fail(ATH_ERR_UNSUPPORTED, op, "a tensor in %s: the GPU kernel needs device memory",
+                            ath_tier_name(tier));
+    }
+    return ATH_OK;
+}
+
+/* OPS_PLACE(op, where, x, w, out): ops_place over the tensors listed. */
+#define OPS_PLACE(op, where, ...)                                                          \
+    ops_place((op), (where), (const ath_tensor *const[]){__VA_ARGS__},                     \
+              (int)(sizeof((const ath_tensor *const[]){__VA_ARGS__}) / sizeof(const ath_tensor *)))
 
 /* An f32 or bf16 tensor (activations and weights). */
 static inline ath_status ops_float(const ath_tensor *t, const char *op, const char *name)

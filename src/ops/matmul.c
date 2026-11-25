@@ -6,16 +6,18 @@
  * significant bits), so the only rounding is in the running sum.
  *
  * Two versions compute the same sums with the same bits: the reference, one
- * output at a time, and ath_matmul_fast below.
+ * output at a time, and ath_matmul_fast below. The GPU version is in
+ * matmul.cu.
  */
 #include "ops/check.h"
+#include "ops/launch.h"
 #include "ops/ops.h"
 
 static const char op[] = "matmul";
 
-/* Arguments of both versions: N rows of x, M outputs, K terms per sum. */
-static ath_status check(const ath_tensor *x, const ath_tensor *w, const ath_tensor *out, int64_t *N, int64_t *M,
-                        int64_t *K)
+/* Arguments of every version: N rows of x, M outputs, K terms per sum. */
+static ath_status check(const ath_tensor *x, const ath_tensor *w, const ath_tensor *out, ops_where where,
+                        int64_t *N, int64_t *M, int64_t *K)
 {
     ATH_CHECK(ops_float(x, op, "x"));
     ATH_CHECK(ops_float(w, op, "w"));
@@ -32,13 +34,13 @@ static ath_status check(const ath_tensor *x, const ath_tensor *w, const ath_tens
     for (int32_t i = 0; i + 1 < x->ndim; i++)
         if (out->shape[i] != x->shape[i])
             return ops_fail(ATH_ERR_INVALID_ARG, op, "out must have the leading dimensions of x");
-    return ATH_OK;
+    return OPS_PLACE(op, where, x, w, out);
 }
 
 ath_status ath_matmul_ref(const ath_tensor *x, const ath_tensor *w, ath_tensor *out)
 {
     int64_t N, M, K;
-    ATH_CHECK(check(x, w, out, &N, &M, &K));
+    ATH_CHECK(check(x, w, out, OPS_HOST, &N, &M, &K));
 
     for (int64_t r = 0; r < N; r++)
         for (int64_t m = 0; m < M; m++) {
@@ -131,7 +133,7 @@ static void task(void *ctx, int32_t t, int32_t n)
 ath_status ath_matmul_fast(const ath_tensor *x, const ath_tensor *w, ath_tensor *out, ath_pool *pool)
 {
     job j = {.x = x, .w = w, .out = out};
-    ATH_CHECK(check(x, w, out, &j.N, &j.M, &j.K));
+    ATH_CHECK(check(x, w, out, OPS_HOST, &j.N, &j.M, &j.K));
     j.blocks = (j.M + CHAINS - 1) / CHAINS;
     int64_t n = ath_pool_threads(pool);
     if (n > j.blocks)
@@ -140,4 +142,11 @@ ath_status ath_matmul_fast(const ath_tensor *x, const ath_tensor *w, ath_tensor 
         n = 1;
     ath_pool_run(pool, (int32_t)n, task, &j);
     return ATH_OK;
+}
+
+ath_status ath_matmul_gpu(const ath_device *d, const ath_tensor *x, const ath_tensor *w, ath_tensor *out)
+{
+    int64_t N, M, K;
+    ATH_CHECK(check(x, w, out, OPS_GPU, &N, &M, &K));
+    return ath_matmul_launch(d, x, w, out);
 }

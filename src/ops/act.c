@@ -4,24 +4,25 @@
  * written the way torch's CPU kernels compute them.
  */
 #include "ops/check.h"
+#include "ops/launch.h"
 #include "ops/ops.h"
 
 #include <math.h>
 
 static ath_status check_same(const char *op, const ath_tensor *a, const char *an,
-                             const ath_tensor *b, const char *bn, const ath_tensor *out)
+                             const ath_tensor *b, const char *bn, const ath_tensor *out, ops_where where)
 {
     ATH_CHECK(ops_float(a, op, an));
     ATH_CHECK(ops_float(b, op, bn));
     ATH_CHECK(ops_float(out, op, "out"));
     if (!ath_tensor_same_shape(a, b) || !ath_tensor_same_shape(a, out))
         return ops_fail(ATH_ERR_INVALID_ARG, op, "%s, %s and out must have the same shape", an, bn);
-    return ATH_OK;
+    return OPS_PLACE(op, where, a, b, out);
 }
 
 ath_status ath_swiglu_ref(const ath_tensor *gate, const ath_tensor *up, ath_tensor *out)
 {
-    ATH_CHECK(check_same("swiglu", gate, "gate", up, "up", out));
+    ATH_CHECK(check_same("swiglu", gate, "gate", up, "up", out, OPS_HOST));
     const int64_t n = ath_tensor_numel(out);
     for (int64_t i = 0; i < n; i++) {
         float g = ld(gate, i);
@@ -32,7 +33,7 @@ ath_status ath_swiglu_ref(const ath_tensor *gate, const ath_tensor *up, ath_tens
 
 ath_status ath_sigmoid_mul_ref(const ath_tensor *x, const ath_tensor *gate, ath_tensor *out)
 {
-    ATH_CHECK(check_same("sigmoid_mul", x, "x", gate, "gate", out));
+    ATH_CHECK(check_same("sigmoid_mul", x, "x", gate, "gate", out, OPS_HOST));
     const int64_t n = ath_tensor_numel(out);
     for (int64_t i = 0; i < n; i++)
         st(out, i, ld(x, i) * (1.0f / (1.0f + expf(-ld(gate, i)))));
@@ -41,9 +42,27 @@ ath_status ath_sigmoid_mul_ref(const ath_tensor *x, const ath_tensor *gate, ath_
 
 ath_status ath_add_ref(const ath_tensor *a, const ath_tensor *b, ath_tensor *out)
 {
-    ATH_CHECK(check_same("add", a, "a", b, "b", out));
+    ATH_CHECK(check_same("add", a, "a", b, "b", out, OPS_HOST));
     const int64_t n = ath_tensor_numel(out);
     for (int64_t i = 0; i < n; i++)
         st(out, i, ld(a, i) + ld(b, i));
     return ATH_OK;
+}
+
+ath_status ath_swiglu_gpu(const ath_device *d, const ath_tensor *gate, const ath_tensor *up, ath_tensor *out)
+{
+    ATH_CHECK(check_same("swiglu", gate, "gate", up, "up", out, OPS_GPU));
+    return ath_elem_launch(d, ATH_ELEM_SWIGLU, gate, up, out);
+}
+
+ath_status ath_sigmoid_mul_gpu(const ath_device *d, const ath_tensor *x, const ath_tensor *gate, ath_tensor *out)
+{
+    ATH_CHECK(check_same("sigmoid_mul", x, "x", gate, "gate", out, OPS_GPU));
+    return ath_elem_launch(d, ATH_ELEM_SIGMOID_MUL, x, gate, out);
+}
+
+ath_status ath_add_gpu(const ath_device *d, const ath_tensor *a, const ath_tensor *b, ath_tensor *out)
+{
+    ATH_CHECK(check_same("add", a, "a", b, "b", out, OPS_GPU));
+    return ath_elem_launch(d, ATH_ELEM_ADD, a, b, out);
 }
