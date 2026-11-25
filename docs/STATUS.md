@@ -6,7 +6,7 @@ This file is the overview. [`status_extended.md`](status_extended.md) goes one l
 
 ## Current step
 
-**Step 10: fast prefill** (see `docs/PLAN.md` §4). Started 2026-11-25 on branch `step10-fast-prefill`, from `step9-fast-decode` (not merged into `main` yet: the maintainer's call). **Done 2026-11-25** (pushed; merging into `main` is the maintainer's call); step 11 is next.
+**Step 10: fast prefill** (see `docs/PLAN.md` §4). Started 2026-11-25 on branch `step10-fast-prefill`, from `step9-fast-decode` (not merged into `main` yet: the maintainer's call). **Done 2026-11-25** (pushed; merging into `main` is the maintainer's call); step 11 is next. Merged into `main` (fast-forward) on 2026-11-25, at the maintainer's request; step 11 postponed, step 12 next.
 
 Goal: a prompt as matrix products. Step 9 left prefill slower than step 8: pp4096 at 8.6k tokens/s against llama.cpp's 45.4k. A profile of pp4096 (477 ms) gave attention 60% (each query walks its keys alone, on the CUDA cores), the Gated DeltaNet 28% (the recurrence, token by token), cuBLASLt's matrix products 8% (37 ms, about 110 TFLOPS, near the GPU's bf16 peak with fp32 accumulation) and the rest 3%. The gate of `docs/PLAN.md`: prefill tokens/s within 15% of vLLM's for a single request.
 
@@ -45,7 +45,7 @@ Result (2026-11-25, RTX 5080 `sm_120`, driver 580.178.04 (CUDA 13.0), CUDA toolk
 
 ### Step 9
 
-**Step 9: fast decode and bench** (see `docs/PLAN.md` §4). Started 2026-11-25 on branch `step9-fast-decode`, after the source layout change and the pipeline rule (log). **Done 2026-11-25** (pushed; merging into `main` is the maintainer's call); step 10 is next, started on a branch of its own from this one.
+**Step 9: fast decode and bench** (see `docs/PLAN.md` §4). Started 2026-11-25 on branch `step9-fast-decode`, after the source layout change and the pipeline rule (log). **Done 2026-11-25** (pushed; merging into `main` is the maintainer's call); step 10 is next, started on a branch of its own from this one. Merged into `main` (fast-forward, with step 10) on 2026-11-25, at the maintainer's request.
 
 Goal: decode at the speed of the memory. At batch 1 a token reads every weight once (1.5 GB for Qwen3.5-0.8B), about 1.6 ms at the RTX 5080's 960 GB/s; step 8 takes about 3.4 ms, the rest being fixed costs: some 520 kernel launches per token, a cuBLASLt plan and heuristic query rebuilt for each of 187 matmuls, and the logits copied to the host with a wait at every token. The gate of `docs/PLAN.md`: decode tokens/s at least llama.cpp's at batch 1, same model, precision and GPU.
 
@@ -592,4 +592,5 @@ The numbers: `docs/results/2026-11-25-step10-prefill/` and the vLLM profile in t
 - 2026-11-25: step 10 done (all acceptance criteria met, table above); pushed on `step10-fast-prefill`, which also carries step 9 (`step9-fast-decode`, not merged): merging either into `main` is the maintainer's call.
 - 2026-11-25: vLLM profiled on the 4096-token request (Nsight Systems, `--cuda-graph-trace=node`, `VLLM_ENABLE_V1_MULTIPROCESSING=0`), one forward pass: 57.3 ms of kernels in 60.2. Matrix products 39.0 ms (athanor 38.5), Gated DeltaNet 5.6 ms (FlashInfer `CPDeltaRule*Sm120`: T and MN precompute, prefill, fixup; athanor 16.9), attention 5.0 ms (FlashAttention split-KV; athanor 6.2), convolution 2.0 + fused post-convolution 1.9 ms (athanor 3.1), SwiGLU 1.3 ms, norms 1.4 ms (`fused_add_rmsnorm` 12 µs per call against athanor's 48: vectorized stores). The distance and what would close it: Possible later work.
 - 2026-11-25: step 11 (HIP build) postponed at the maintainer's request: there is no AMD GPU to run it on (`docs/PLAN.md` §2, AMD GPU: none yet). Step 12 comes next; step 11 returns when AMD hardware is available. Until then the HIP half of `compat.h` stays uncompiled, and the tensor-core kernels of step 10 have no AMD form (`docs/PLAN.md`, step table).
+- 2026-11-25: `step10-fast-prefill`, which carries step 9, merged into `main` (fast-forward) at the maintainer's request; step 12 starts on `step12-moe-tiering` from there.
 
