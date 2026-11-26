@@ -22,6 +22,8 @@ Within inference, the first five steps run on the CPU only. They produce a slow 
 | Scope | engine + server; no agent harness (no tool execution, agent loop, conversation memory or UI; tool rendering and parsing are in scope). CHANGE-001, 2026-11-24 | decided |
 | Step 12 weights | Q8_0, read from a GGUF file (Unsloth's `Qwen3.6-35B-A3B-Q8_0.gguf` with the MTP layer, the file Strata uses): a GGUF reader for F32, F16, BF16 and Q8_0 in `src/core`, and Q8_0 as the first quantized block format. The other formats (Q1) and GGUF import and export (Q6) stay in phase 2 | decided 2026-11-25, at the start of step 12, at the maintainer's request (`docs/STATUS.md`, step 12 decisions) |
 | Invariant 7 across devices | the CPU and GPU expert paths give the same bits: one canonical arithmetic order for routed experts (AGENTS.md invariant 7, option (b) of the step 7 open question) | decided 2026-11-25, at the start of step 12, at the maintainer's request |
+| Step 14 weights and KV | Qwen3.5-9B from Unsloth's Q8_0 GGUF (its bf16 weights do not fit 16 GB); an int8 KV cache with a scale per token and head, beside bf16 (`docs/STATUS.md`, step 14 decisions) | decided 2026-11-26, at the start of step 14, at the maintainer's request |
+| Order after phase 1 | after step 14, before phase 2: a phase of analysis and optimization of everything built, measured against the other engines on this machine (vLLM, Strata, Bonsai and others) until athanor is as fast or faster; then larger models; then streaming weights from disk, with the larger models. Phase 2 (quantization) and the later phases follow | decided 2026-11-26, at the maintainer's request |
 
 ## 2. Assumptions
 

@@ -6,7 +6,44 @@ This file is the overview. [`status_extended.md`](status_extended.md) goes one l
 
 ## Current step
 
-**Step 13: server and MTP** (see `docs/PLAN.md` §4). Started 2026-11-25 on branch `step13-server-mtp`, from `main` (steps 1–10 and 12), at the maintainer's request: the main functions first, optimizations later (the prefill of MoE prompts, among others, stays in Possible later work). **Done 2026-11-26** (pushed; merging into `main` is the maintainer's call).
+**Step 14: long context** (see `docs/PLAN.md` §4), the last step of phase 0–1. Started 2026-11-26 on branch `step14-long-context`, from `main` (steps 1–10, 12 and 13). After it, at the maintainer's request (2026-11-26), comes a phase of analysis and optimization before phase 2: everything built so far measured against the other engines on this machine (vLLM, Strata, Bonsai and others), until athanor is as fast or faster; then larger models; then streaming weights from disk, with the larger models (`docs/PLAN.md`, Order after phase 1).
+
+Goal: a long context on a model that only just fits the GPU. The gate of `docs/PLAN.md`: 128k context on Qwen3.5-9B in 16 GB; resume after restart; snapshot size reported per context length. Qwen3.5-9B (32 layers: 8 full attention with 4 KV heads of 256, 24 Gated DeltaNet with 16 key and 32 value heads; hidden 4096; native context 262,144): its KV cache takes 32 KiB per token in bf16, 4 GiB at 128k; its Gated DeltaNet state is fixed (about 50 MB).
+
+#### Decisions (2026-11-26, at the maintainer's request)
+
+- **Weights: Q8_0, from Unsloth's GGUF.** The bf16 weights (17.9 GB) do not fit the 16 GB GPU. `unsloth/Qwen3.5-9B-GGUF` revision `3885219b6810b007914f3a7950a8d1b469d598a5`, `Qwen3.5-9B-Q8_0.gguf`, 9,527,502,048 bytes, sha256 `809626574d0cb43d4becfa56169980da2bb448f2299270f7be443cb89d0a6ae4`; `config.json` and the tokenizer from `Qwen/Qwen3.5-9B` revision `c202236235762e1c871ad0ccb60c8ee5ba337b9a`. The reference for numerics is built from the GGUF dequantized exactly, as for Qwen3.6-35B-A3B (step 12).
+- **KV cache in 8 bits: int8 per token and head.** Each row of keys or values (one token, one KV head: 256 values) in int8 with a scale of its own, read back by the attention kernels; 2 GiB at 128k instead of 4. An option beside bf16, which stays the default.
+
+#### Tasks
+
+- [ ] **14.1 Qwen3.5-9B.** The Q8_0 GGUF binds and runs (dense layers in Q8_0, value heads in tiled order); a contract file; forward records from the GGUF dequantized (`tests/golden/`); the GPU against them as in step 12.
+- [ ] **14.2 Long positions.** Attention (decode and prompt kernels, CPU reference) and RoPE at positions up to 128k and beyond: the ops against their references at long key lengths; a 128k prompt in chunks against shorter chunkings; a retrieval check (a fact placed early in a 120k-token prompt, asked at the end).
+- [ ] **14.3 KV cache in int8.** The format (int8 rows, a scale per token and head) in the state specs; the cache written quantized; the attention kernels (decode, prompt, CPU reference) reading it; `--kv q8` in chat, bench and serve.
+- [ ] **14.4 Prefix snapshots.** Snapshots of a sequence trimmed to the tokens it holds (KV rows and the fixed-size state), in host memory under a size budget, LRU, keyed by a hash of the token prefix; the server and chat find the longest stored prefix of a prompt.
+- [ ] **14.5 Snapshots on disk.** Persistent prefix snapshots: one file per snapshot, named by the prefix's hash, with the model's identity, dtypes and length in a header, written atomically; read back after a restart; a size budget with LRU eviction.
+- [ ] **14.6 128k in 16 GB.** Qwen3.5-9B at `--ctx 131072` in chat, bench and serve, with bf16 and int8 KV: prefill and decode at depth reported, peak device memory from the driver.
+- [ ] **14.7 Tests.** The format and kernels against references; snapshots (round trip, eviction, a corrupt or foreign file refused, resume after restart giving the same tokens); compute-sanitizer on the new kernels.
+- [ ] **14.8 Report and documentation.**
+
+#### Acceptance criteria
+
+1. **128k on Qwen3.5-9B in 16 GB.** A 131,072-token context runs on the RTX 5080 with Q8_0 weights, with bf16 and with int8 KV: the retrieval check passes at about 120k tokens; prefill time, decode tokens/s at depth and peak device memory reported.
+2. **Numerics.**
+   - Qwen3.5-9B against its reference (the GGUF dequantized): pooled KL no larger than the bf16 reference's, greedy agreement above the noise, f32 within step 4's tolerances.
+   - int8 KV against bf16 KV: KL and greedy agreement reported on short and long prompts, within a bound settled from the measured bf16 noise.
+   - New kernels against their references within tolerances justified in `tests/README.md`.
+3. **Resume after restart.** A server or chat restarted with the same snapshot folder starts a known prefix from disk: the cached tokens reported, the same tokens as without the snapshot.
+4. **Snapshot size per context length** reported (bf16 and int8 KV), with the time to save and load.
+5. **Nothing else changes.** Qwen3.5-0.8B and Qwen3.6-35B-A3B decode, prefill and numerics as in steps 10, 12 and 13.
+6. **Build and tests.** `make test`, `make cuda test` (also `DEBUG=1`) green; compute-sanitizer clean on new kernels; no warnings.
+7. **Documentation updated.**
+
+## Completed steps
+
+### Step 13
+
+**Step 13: server and MTP** (see `docs/PLAN.md` §4). Started 2026-11-25 on branch `step13-server-mtp`, from `main` (steps 1–10 and 12), at the maintainer's request: the main functions first, optimizations later (the prefill of MoE prompts, among others, stays in Possible later work). **Done 2026-11-26** (pushed; merging into `main` is the maintainer's call). Merged into `main` (fast-forward) on 2026-11-26, at the maintainer's request; step 14 next.
 
 Goal: athanor as a model server that coding agents drive.
 - **The server.** `athanor serve` speaks the three APIs the target harnesses use, verified 2026-11-25:
@@ -28,7 +65,7 @@ The gate of `docs/PLAN.md`: works with Claude Code, Codex CLI and OpenCode; mult
 - **Speculative decoding: host-driven first.** Each pass is forward calls from the host and the choice is on the host; recording the verifying and drafting passes in graphs is an optimization, left for later at the maintainer's request (main functions first). The draft head goes on the GPU only when asked (`ath_place_opts.draft`), so runs without it are as before.
 - **OpenCode** 1.19.6 installed for the conformance runs with npm in the user's nvm prefix (`npm install -g opencode-ai@1.19.6`); each harness runs with configuration folders of its own (`tests/conformance/run.sh`).
 
-### Tasks
+#### Tasks
 
 - [x] **13.1 HTTP.** `src/net/http.{h,c}`: HTTP/1.1 on POSIX sockets, bound to 127.0.0.1 by default.
   - Requests with a body of known length; responses with a length or as server-sent events.
@@ -64,7 +101,7 @@ The gate of `docs/PLAN.md`: works with Claude Code, Codex CLI and OpenCode; mult
   - The speculative decoding speedup (Qwen3.5-0.8B and Qwen3.6-35B-A3B, draft acceptance) and the conformance results under `docs/results/`.
   - READMEs, ARCHITECTURE, PROGRAM.md, the contracts, this file and `status_extended.md`.
 
-### Acceptance criteria
+#### Acceptance criteria
 
 1. **The harnesses.** `athanor serve` with Qwen3.6-35B-A3B answers Claude Code, Codex CLI and OpenCode, streaming text and tool calls in each one's API.
 2. **Tool-calling conformance.** On the fixed task set, multi-turn sessions with tool calls succeed with each of the three harnesses. Every task has a checked outcome; transcripts are kept.
@@ -87,8 +124,6 @@ Result (2026-11-25, RTX 5080 `sm_120`, Ryzen 7 9800X3D, 59 GiB; driver 580.178.0
 | 5 | nothing else changes | Qwen3.5-0.8B: pp512 49,722, pp4096 57,004, tg128 446.4 (step 12's report: 49,665, 56,997, 448.1). Qwen3.6-35B-A3B: tg128 92.7 after 33 tokens (94.1); after 4096 tokens 77.7 (80.3) and prefill 194.8 (209.4), where step 12's build run alternately with step 13's gives the same (77.5 and 77.6 against 76.9 and 78.0; 202.9 and 209.7 against 207.7 and 209.1): the machine that evening. The step 8 gate, the forward records, `test_forward` and `test_text` as before (`make test`, `make cuda test`) |
 | 6 | build and tests | `make test` and `make cuda test` green, also with `DEBUG=1` (ASan and UBSan; the Qwen3.6-35B-A3B tests skipped there with `ATH_MOE_DIR` unset, as in step 12). The first `DEBUG=1` run found a fault in the server test: under ASan a request outlasted the client's 60 s wait, a failed check returned while the server's thread still used the test's stack (a use after return). The server test now stops its server whatever happens, waits up to 10 minutes, and runs its prompts in chunks of 64 tokens (the stream's pings keep the client reading); `test_spec` decodes 24 tokens instead of 96 under `DEBUG=1`. compute-sanitizer memcheck (with leak check), racecheck and initcheck on `gpu_presence`, memcheck on `engine_decoder_presence`, `test_spec` (GPU) and the server tests on the GPU: 0 errors, 0 hazards, 0 bytes leaked. No warnings; `ldd` as in step 12 (libm, cuBLASLt, libc, librt, libpthread, libdl) |
 | 7 | documentation | `src/net/README.md` (new content), `src/infer/README.md` (speculative decoding), `tools/README.md` (`serve`, `--mtp`), `docs/contract/qwen35-0.8b.md` (the draft head), `docs/contract/qwen36-35b-a3b.md` (`blk.40`), `docs/ARCHITECTURE.md` (step 13's contract additions), `docs/BENCHMARKS.md` (the speculative metric), `docs/program/PROGRAM.md` rows 6b and 12, `README.md`, the report, this file and `status_extended.md` |
-
-## Completed steps
 
 ### Step 12
 
@@ -809,4 +844,5 @@ From step 13 (`docs/results/2026-11-25-step13-server/`):
 - 2026-11-25: task 13.6 done: the MTP head as the draft head. Its GGUF norms checked on the values of Qwen3.5-0.8B's two files: llama.cpp's converter stores `enorm`, `hnorm` and `shared_head_norm` as 1 + w like every other norm. The head's input is the main model's output after the final norm (vLLM's `get_drafter_hidden_states` hands the target model's output to the drafter). Speculative decoding gives plain decoding's tokens bit for bit (96 of 96, CPU and GPU, greedy, sampled and with a presence penalty; the 35B too); on a coding prompt 86% (0.8B) and 98% (35B) of the guesses are kept, on a story 58% and 75%.
 - 2026-11-25: the step's measurements (`docs/results/2026-11-25-step13-server/`): Qwen3.5-0.8B and Qwen3.6-35B-A3B as in step 12 (the 35B after 4096 tokens 3% under step 12's report, and step 12's build run alternately gives the same: the machine that evening); speculative decoding 1.20 and 1.25 times host-driven plain decoding on code, slower than the recorded decoder.
 - 2026-11-26: the `DEBUG=1` suites green after a fix to the server test (a use after return when a check failed under ASan's slowness); compute-sanitizer clean. Step 13 done (all acceptance criteria met; table above); pushed on `step13-server-mtp`: merging into `main` is the maintainer's call.
+- 2026-11-26: `step13-server-mtp` merged into `main` (fast-forward) at the maintainer's request; step 14 (long context), the last of phase 0–1, started on `step14-long-context`. The maintainer's direction for what follows: before phase 2, analyse everything built and optimize it until athanor is as fast as the other engines on this machine (vLLM, Strata, Bonsai and others) or faster; then larger models; then streaming weights from disk, with the larger models. Decisions for step 14 at the maintainer's request: Qwen3.5-9B's Q8_0 GGUF (the bf16 weights do not fit the GPU), and an int8 KV cache with a scale per token and head beside bf16. Checked before planning: Qwen3.5-9B's KV cache is 32 KiB per token in bf16 (8 attention layers, 4 KV heads of 256), 4 GiB at 128k, so with 8.9 GiB of Q8_0 weights a 128k context fits a 16 GB GPU even in bf16, with little to spare; the int8 cache halves it.
 
