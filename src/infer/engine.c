@@ -27,7 +27,18 @@ ath_status ath_engine_open_tier(ath_engine *e, const ath_model *m, int32_t devic
     memset(e, 0, sizeof *e);
     e->m = m;
     ATH_CHECK(ath_device_open(&e->dev, device));
-    ath_dev_arena_init(&e->weights_mem, &e->dev, a, 0);
+    /* the weights in one allocation of their size: in blocks of 256 MiB the
+     * end of each block went unused, 0.8 GiB for Qwen3.5-9B (step 14) */
+    size_t total = 0;
+    for (uint32_t i = 0; i < m->n_params; i++) {
+        const ath_param *p = &m->params[i];
+        if ((p->flags & ATH_P_UNUSED) || ((p->flags & ATH_P_DRAFT) && !(tier && tier->draft)) ||
+            (m->n_experts > 0 && (p->role == ATH_ROLE_EXPERT_IN || p->role == ATH_ROLE_EXPERT_OUT)))
+            continue;
+        const size_t b = ath_tensor_nbytes(&p->t);
+        total += (b ? b : 1) + ATH_DEV_ALIGN;
+    }
+    ath_dev_arena_init(&e->weights_mem, &e->dev, a, total ? total : 1);
     ath_dev_arena_init(&e->state_mem, &e->dev, a, 0);
     ath_dev_arena_init(&e->scratch, &e->dev, a, 0);
     ath_status st = ATH_OK;

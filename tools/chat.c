@@ -59,6 +59,8 @@ void ath_cmd_chat_usage(FILE *out)
             "  --seed <n>           random seed (default: from the clock)\n"
             "  --max-tokens <n>     tokens per answer (default 2048)\n"
             "  --ctx <n>            context length in tokens (default 8192)\n"
+            "  --chunk <n>          prompt tokens per forward call (default 4096; less device\n"
+            "                       memory with fewer, at about the same speed)\n"
             "  --device <cpu|gpu>   where the model runs (default: gpu if there is one)\n"
             "  --threads <n>        CPU threads (default: all)\n"
             "  --experts <n>        MoE: routed experts per layer kept in device memory\n"
@@ -85,7 +87,7 @@ typedef struct {
     bool         temp_set, top_p_set;
     uint64_t     seed;
     bool         seed_set;
-    int32_t      max_tokens, ctx, threads;
+    int32_t      max_tokens, ctx, threads, chunk;
     int32_t      experts;     /* routed experts per layer in device memory, -1: as many as fit */
 } options;
 
@@ -183,17 +185,23 @@ static double now_s(void)
     return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
 }
 
-/* Run ids[from .. to) through the model; logits for the last one if want. */
+/* Run ids[from .. to) through the model in pieces of --chunk tokens;
+ * logits for the last one if want. */
 static ath_status feed(session *s, const int32_t *ids, size_t from, size_t to, bool want)
 {
     for (size_t i = from; i < to; i++)
         ATH_CHECK(ath_tokens_push(&s->seen, ids[i]));
-    if (from == to)
-        return ATH_OK;
-    ath_batch b = {.tokens = ids + from, .n_tokens = (int32_t)(to - from), .logits = want ? &s->logits : NULL};
-    if (s->spec)   /* the draft head runs over the tokens too */
-        return ath_spec_feed(s->spec, b.tokens, b.n_tokens, want ? s->logits.data : NULL);
-    return ath_model_forward(&s->m, &b, &s->state, NULL, s->scratch, &s->exec);
+    while (from < to) {
+        const size_t end = to - from > (size_t)s->opt->chunk ? from + (size_t)s->opt->chunk : to;
+        const bool last = want && end == to;
+        ath_batch b = {.tokens = ids + from, .n_tokens = (int32_t)(end - from), .logits = last ? &s->logits : NULL};
+        if (s->spec)   /* the draft head runs over the tokens too */
+            ATH_CHECK(ath_spec_feed(s->spec, b.tokens, b.n_tokens, last ? s->logits.data : NULL));
+        else
+            ATH_CHECK(ath_model_forward(&s->m, &b, &s->state, NULL, s->scratch, &s->exec));
+        from = end;
+    }
+    return ATH_OK;
 }
 
 static size_t common_prefix(const ath_tokens *a, const ath_tokens *b)
@@ -493,7 +501,7 @@ static bool num(const char *s, double lo, double hi, double *out)
 
 static int parse_options(options *o, int argc, char **argv)
 {
-    *o = (options){.max_tokens = 2048, .ctx = 8192, .sampler = {0.7f, 20, 0.8f, 0}, .experts = -1};
+    *o = (options){.max_tokens = 2048, .ctx = 8192, .chunk = 4096, .sampler = {0.7f, 20, 0.8f, 0}, .experts = -1};
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         const char *v = i + 1 < argc ? argv[i + 1] : NULL;
@@ -518,6 +526,7 @@ static int parse_options(options *o, int argc, char **argv)
         else if (!strcmp(a, "--seed") && num(v, 0, 1.8e19, &x)) o->seed = (uint64_t)x, o->seed_set = true;
         else if (!strcmp(a, "--max-tokens") && num(v, 1, 1e9, &x)) o->max_tokens = (int32_t)x;
         else if (!strcmp(a, "--ctx") && num(v, 16, 1 << 24, &x)) o->ctx = (int32_t)x;
+        else if (!strcmp(a, "--chunk") && num(v, 1, 1 << 20, &x)) o->chunk = (int32_t)x;
         else if (!strcmp(a, "--threads") && num(v, 1, 4096, &x)) o->threads = (int32_t)x;
         else if (!strcmp(a, "--experts") && num(v, 0, 1e6, &x)) o->experts = (int32_t)x;
         else if (!strcmp(a, "--device") && (!strcmp(v, "cpu") || !strcmp(v, "gpu"))) o->device = v;
@@ -659,6 +668,11 @@ int ath_cmd_chat(ath_arena *a, int argc, char **argv)
         if (st == ATH_OK && o.stats)
             fprintf(stderr, "athanor chat: on %s, %.2f GiB of weights\n", s->engine->dev.name,
                     (double)s->engine->weight_bytes / 1073741824.0);
+        uint64_t fr = 0, tot = 0;
+        if (st == ATH_OK && ath_device_mem(&s->engine->dev, &fr, &tot) == ATH_OK && fr < (1ull << 30))
+            fprintf(stderr, "athanor chat: %.2f GiB of device memory left for prompt pieces of %d tokens; if a long "
+                            "prompt runs out of memory, use a smaller --chunk\n",
+                    (double)fr / 1073741824.0, o.chunk);
     } else if (st == ATH_OK) {
         st = ath_state_init_kv(&s->state, &s->m, act, kv, o.ctx, a);
         if (st == ATH_OK && !o.prompt)
@@ -677,7 +691,7 @@ int ath_cmd_chat(ath_arena *a, int argc, char **argv)
         s->exec = (ath_exec){.pool = &s->pool};
     if (st == ATH_OK && o.mtp) {
         ath_spec *sp = ath_arena_zalloc(a, sizeof *sp, _Alignof(ath_spec));
-        st = sp ? ath_spec_open(sp, &s->m, &s->state, &s->exec, &o.sampler, 4096, a) : ATH_ERR_NOMEM;
+        st = sp ? ath_spec_open(sp, &s->m, &s->state, &s->exec, &o.sampler, o.chunk, a) : ATH_ERR_NOMEM;
         if (st == ATH_OK)
             s->spec = sp;
         else if (st == ATH_ERR_UNSUPPORTED)

@@ -44,8 +44,8 @@ ath_status ath_gen_open(ath_gen *g, const char *dir, const ath_gen_opts *o, ath_
         ath_state_bytes_kv(&g->m, ATH_DTYPE_BF16, o->kv8 ? ATH_DTYPE_I8 : ATH_DTYPE_BF16, g->ctx, &sb);
         const ath_place_opts po = {.slots = o->experts, .vram_reserve = ATH_PLACE_RESERVE + 2 * (uint64_t)sb,
                                    .draft = o->mtp};
-        ath_log(ATH_LOG_INFO, "serve: a state of %d tokens takes %.2f GiB; two are kept", g->ctx,
-                (double)sb / 1073741824.0);
+        ath_log(ATH_LOG_INFO, "serve: a state of %d tokens takes %.2f GiB; a second one, when it fits, holds the "
+                              "snapshot", g->ctx, (double)sb / 1073741824.0);
         st = g->engine ? ath_engine_open_tier(g->engine, &g->m, 0, &po, a) : ATH_ERR_NOMEM;
         if (st != ATH_OK) {
             ath_log(ATH_LOG_WARN, "serve: no GPU (%s); running on the CPU", ath_status_str(st));
@@ -69,6 +69,12 @@ ath_status ath_gen_open(ath_gen *g, const char *dir, const ath_gen_opts *o, ath_
                 : g->has_snap     ? "state and snapshot allocated"
                                   : "state allocated; no room for a snapshot on the device (snapshots in host memory)",
                 (double)fr / 1073741824.0);
+        /* a prompt piece's working memory grows with its tokens (about a
+         * quarter of a GiB per 1024 on Qwen3.5-9B) */
+        if (st == ATH_OK && fr < (1ull << 30))
+            ath_log(ATH_LOG_WARN, "serve: %.2f GiB of device memory left for prompt pieces of %d tokens; if a long "
+                                  "prompt runs out of memory, use a smaller --chunk (about the same speed)",
+                    (double)fr / 1073741824.0, g->chunk);
     } else if (st == ATH_OK) {
         g->exec = (ath_exec){.pool = &g->pool};
         st = ath_state_init_kv(&g->state, &g->m, ATH_DTYPE_BF16, kv, g->ctx, a);
@@ -159,6 +165,9 @@ static ath_status feed(ath_gen *g, const int32_t *ids, size_t from, size_t to, b
         ath_status st = g->mtp ? ath_spec_feed(&g->spec, b.tokens, b.n_tokens, b.logits ? g->logits.data : NULL)
                                : ath_model_forward(&g->m, &b, &g->state, NULL, &g->scratch, &g->exec);
         ath_arena_reset(&g->scratch, (ath_arena_pos){0});
+        if (st == ATH_ERR_NOMEM)
+            ath_log(ATH_LOG_ERROR, "serve: out of memory in a prompt piece of %d tokens; a smaller --chunk needs less "
+                                   "(about the same speed)", b.n_tokens);
         ATH_CHECK(st);
         from = end;
         if (from < to && sink && sink->wait && !sink->wait(sink->u)) {

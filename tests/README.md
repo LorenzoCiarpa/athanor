@@ -98,6 +98,15 @@ The kernels of prompts (`src/ops/README.md`, Prompt kernels) are compared with t
 
 compute-sanitizer: memcheck with leak check on `gpu_attn_mma`, `gpu_gdn_chunk`, `gpu_add_rmsnorm`, `gpu_conv`, on `test_engine` (weights, state, pieces, decoder) and on a prompt of 512 tokens of the real model with 8 decoded tokens; racecheck on the attention, the chunked recurrence and the norms; initcheck on the attention and the chunked recurrence: 0 errors, 0 hazards, 0 bytes leaked.
 
+### Long caches (step 14)
+
+`gpu_attn_long`: the attention kernels over caches of 131,072 keys and more, the length of step 14's gate.
+- Decode and split-K, with queries at positions 100, 65,536, 131,071 and 131,199 of a cache of 131,200 keys, are checked against the reference with the tolerance of short caches. Measured: score 4.6e-4 in bf16 (13 of 8192 values one ulp or more apart: the outputs are small, the mean of many keys); split-K gives the bits of rows.
+- The tensor-core prompt kernel, with the last 16 positions of a 131,072-key cache, stays within its bound: 0.02 of it.
+- An int8 cache of 131,200 keys (groups of 32) gives the bits of attention over what it reads back as, for one and four queries, rows and split-K.
+
+RoPE at long positions was already checked (`gpu_rope`, positions up to 262,143: the frequencies are the reference's, computed on the host). The whole model at 128k: `tests/test_long.c` (Long context, below).
+
 ### Q8_0 (step 12)
 
 No tolerance: every Q8_0 kernel follows the canonical order of `src/ops/q8_0.h`, so the comparisons are bit for bit. `test_ops`: `q8_0_f16_and_exp` (f16 conversion of normal, subnormal, infinite and NaN values; `ath_q8_expf` within 2 ulp of exp in double on [-87, 88), measured 0.89; the clamps; SiLU), `matmul_q8_0` (a hand case where the canonical sum is exact; six random shapes from K = 32 to 4096, x and out in f32 and bf16: the reference within K · 2^-24 Σ|w x| of the exact sum, worst 0.02 of that bound, and `ath_matmul_fast` on one and on three threads the reference's bits). `test_gpu_ops`: `gpu_matmul_q8_0` (seven shapes: one row, a few, 8, 21 (the prompt kernel), K = 96 and 160 (the kernel for other K), x off a 16-byte boundary, f32 and bf16 into both: the reference's bits; the Q8_0 embedding lookup bit for bit).

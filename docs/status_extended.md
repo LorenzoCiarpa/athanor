@@ -25,6 +25,7 @@ How to read it:
   - [Step 10: fast prefill](#step-10-fast-prefill)
   - [Step 12: MoE and tiering](#step-12-moe-and-tiering)
   - [Step 13: server and MTP](#step-13-server-and-mtp)
+  - [Step 14: long context](#step-14-long-context)
 - [Files by step](#files-by-step)
 
 ---
@@ -1379,6 +1380,60 @@ After the first `DEBUG=1` run: the server test's requests run in a function of t
 #### 13.9 Report and documentation
 
 `docs/results/2026-11-25-step13-server/` (report, conformance, benchmarks); `src/net/README.md`, `src/infer/README.md`, `tools/README.md`, `docs/contract/qwen35-0.8b.md` (Draft head), `docs/contract/qwen36-35b-a3b.md`, `docs/ARCHITECTURE.md`, `docs/program/PROGRAM.md` rows 6b and 12, `README.md`, `STATUS.md` and this file.
+
+
+### Step 14: long context
+
+Branch `step14-long-context`, from `main` (steps 1–10, 12 and 13). The gate of `docs/PLAN.md`: 128k context on Qwen3.5-9B in 16 GB; resume after restart; snapshot size reported per context length. Decisions: `STATUS.md`, step 14 (Q8_0 weights from the GGUF; an int8 KV cache, refined to a scale per 32 values after measuring it).
+
+#### 14.1 Qwen3.5-9B
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `tests/golden/gguf.py` | New | Forward records of a dense GGUF: `moe.py`'s method (dequantized exactly, the converter's transforms undone, one layer at a time in fp32 and in bf16) with the dense MLP |
+| `docs/contract/qwen35-9b.md` | New | Checkpoint, dimensions, GGUF names, state sizes, verification |
+| `tests/test_forward.c` | Changed | f32 tolerances per model (`F32_TOL`: the 9B's chat prompt has two ill-conditioned positions); the failure message names the worst position |
+
+Commits `e17afa1` (plan), `bd85407`.
+
+#### 14.3 The KV cache in int8
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `src/core/tensor.h`, `tensor.c`, `safetensors.c` | Changed | `ATH_DTYPE_I8` |
+| `src/ops/kv.c`, `src/ops/cuda/kv.cu` | New | `ath_kv_store_*` (groups of g values of a row, a scale each, q = rint(x · (1/s)), s = max\|x\| / 127, the same bits on CPU and GPU; a warp per group), `ath_kv_load_*` |
+| `src/ops/attn.c`, `src/ops/cuda/attn.cu` | Changed | Keys and values through one descriptor (`kvt`, `kvsrc`: float, or int8 with its group scales); `ath_attn_q8_ref` / `_gpu`, bit for bit attention over the read-back cache; the fast kernels when g is a multiple of 8 |
+| `src/ops/ops.h`, `dispatch.c`, `launch.h`, `gpu_none.c` | Changed | The declarations and entry points |
+| `src/model/model.h`, `state.c` | Changed | `ath_state_spec.group`, `ath_state.kv`, the KV buffer layout as contract, `ath_state_init_kv`, `ath_state_init_gpu_kv`, `ath_state_bytes_kv`, `ath_state_buf_bytes` |
+| `src/models/qwen35/qwen35.h`, `family.c`, `forward.c` | Changed | `ATH_QWEN35_KV_GROUP` (32, or the row when 32 does not divide it); the cache stored in int8, read by the int8 kernels, or read back into scratch for the tensor-core prompt kernel |
+| `src/infer/engine.h`, `engine.c`, `spec.c` | Changed | `ath_engine_state_kv`; the draft head's buffers sized by `ath_state_buf_bytes` |
+| `tools/chat.c`, `bench.c`, `serve.c`, `src/net/gen.{h,c}` | Changed | `--kv <bf16\|q8>` |
+| `tests/golden/kv_int8.py` | New | What a cache format does to the reference's KL: chose groups of 32, gives the bound 1.25 |
+| `tests/test_ops.c`, `test_gpu_ops.c`, `test_forward.c`, `test_engine.c`, `test_core.c` | Changed | `kv_q8`, `gpu_kv_q8` (groups from 4 values to the whole row), the int8 runs of `forward_golden` with their bound, `engine_decoder` over an int8 cache |
+
+Commits `bd85407` (one scale per row), `a7a2015` (groups).
+
+#### 14.4–14.5 Prefix snapshots
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `src/model/model.h`, `state.c` | Changed | `ath_state_snap_bytes`, `ath_state_snap_save`, `ath_state_snap_load`: a state trimmed to its tokens, independent of capacity and side |
+| `src/infer/prefix.h`, `prefix.c` | New | The store: host memory and a folder, LRU under a budget each; the longest stored prefix; files named by SHA-256, a checked header, XXH64 of the payload, written atomically, times that keep the order of use; superseded snapshots not written; the model's identity |
+| `src/net/gen.{h,c}`, `tools/serve.c`, `tools/chat.c` | Changed | The store beside the device's snapshot (which goes there when a new one does not continue it, and at exit); no device snapshot when a second state does not fit; `--snapshots`, `--snap-ram`, `--snap-disk`; chat with `-p` keeps the system prompt's snapshot when there is a folder |
+| `tests/test_prefix.c` | New | Round trip, the store in memory, on disk (supersession, branch points, reopen, budget, damaged, truncated and foreign files) |
+| `tests/test_engine.c`, `test_net.c` | Changed | `engine_snapshots`; `serve_snapshots_resume` |
+| `Makefile` | Changed | `test_prefix`, `test_long` |
+
+Commit `a7a2015`.
+
+#### 14.2, 14.6 Long positions, 128k
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `tests/test_gpu_ops.c` | Changed | `gpu_attn_long`: keys to position 131,199, decode, split-K, tensor cores, an int8 cache |
+| `tests/test_long.c` | New | Opt-in (`ATH_LONG=1`): a prompt that fills the context, retrieval, two chunkings with the same bits, int8 against bf16 at depth, prefill and decode times, device memory, snapshot sizes and times |
+| `src/infer/engine.c` | Changed | The weights in one allocation of their size: 256 MiB blocks left 1.15 GiB unused on the 9B, which a 128k bf16 cache needed |
+| `tools/chat.c`, `src/net/gen.c` | Changed | chat's prompt in pieces (`--chunk`); the server's hint on a prompt piece out of memory |
 
 ---
 

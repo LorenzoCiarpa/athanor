@@ -3,7 +3,8 @@
  * Opt-in, minutes per run: ATH_LONG=1. The model is ATH_MODEL_DIR (the
  * gate's is Qwen3.5-9B), the context ATH_LONG_CTX tokens (default 131072),
  * the prompt's pieces ATH_LONG_CHUNK tokens (default 4096; the second
- * chunking is 5/8 of it, both whole chunks of 64).
+ * chunking is 5/8 of it, both whole chunks of 64), the KV dtypes
+ * ATH_LONG_KV (bf16, q8, or both by default).
  *
  *   ATH_LONG=1 ATH_MODEL_DIR=models/Qwen3.5-9B ./build/cuda/test_long
  *
@@ -15,7 +16,8 @@
  *     chunks of the Gated DeltaNet's 64) gives the same state and logits,
  *     bit for bit;
  *   - int8 against bf16 at depth: the last prompt position and the bf16
- *     answer's tokens fed to the int8 state, KL and the same greedy token;
+ *     answer's tokens fed to the int8 state, KL (at most the bf16 noise)
+ *     and the same greedy token;
  *   - reported: prefill time, decode speed at depth, the device memory in
  *     use, the snapshot's size and the time to copy it out at 8k, 32k, 64k
  *     and the full length, and to write and read it on disk.
@@ -131,6 +133,7 @@ static ath_status prefill(ctx *c, ath_state *s, const int32_t *ids, int32_t n, i
                                     s, NULL, c->scratch, &c->e->exec));
         while (k < n_at && p + len >= at[k]) {
             const size_t b = ath_state_snap_bytes(c->m, s);
+            ATH_CHECK(ath_stream_sync(&c->e->dev, ATH_STREAM_COMPUTE));   /* the pass done: the copy alone timed */
             const double t0 = now();
             if (b <= cap)
                 ATH_CHECK(ath_state_snap_save(s, c->m, buf, b));
@@ -223,10 +226,13 @@ ATH_TEST(long_context)
     char dir[600];
     snprintf(dir, sizeof dir, "%s/snapshots", sd.path);
 
+    const char *kvs = getenv("ATH_LONG_KV");
+    bool have_ref = false;   /* the bf16 run's answer and logits, for the int8 run */
     for (int k = 0; k < 2; k++) {
         const ath_dtype kv = k ? ATH_DTYPE_I8 : ATH_DTYPE_BF16;
         const char *kn = k ? "int8" : "bf16";
-        const ath_dev_arena_pos mark = ath_dev_arena_mark(&e->state_mem);
+        if (kvs && strcmp(kvs, k ? "q8" : "bf16"))
+            continue;
         ath_state s;
         ath_status st = ath_engine_state_kv(e, &s, ATH_DTYPE_BF16, kv, C, &a);
         if (st != ATH_OK) {
@@ -277,7 +283,8 @@ ATH_TEST(long_context)
         printf("    %s KV: answer \"%.60s\": the passphrase %s\n", kn, ath_buf_str(&text), found ? "found" : "MISSING");
         ATH_EXPECT(found);
         for (int i = 0; i < 4; i++)
-            printf("    %s KV: snapshot at %6d tokens: %8.1f MiB, copied out in %.3f s\n", kn, i < 3 ? at[i] : N,
+            if (i == 3 || at[i] < N)
+                printf("    %s KV: snapshot at %6d tokens: %8.1f MiB, copied out in %.3f s\n", kn, i < 3 ? at[i] : N,
                    (double)sb[i] / 1048576.0, ss[i]);
 
         /* the same prompt in pieces of chunk2: the same state and logits */
@@ -298,7 +305,8 @@ ATH_TEST(long_context)
                 answer16[i] = ans[n_ans - 1 >= 0 ? n_ans - 1 : 0];
             ATH_REQUIRE_OK(forced(&c, &s, answer16[0], answer16 + 1, ANSWER_TOKENS - 1, ref + V));
             memcpy(ref, last16, (size_t)V * 4);
-        } else {
+            have_ref = true;
+        } else if (have_ref) {
             ATH_REQUIRE_OK(forced(&c, &s, answer16[0], answer16 + 1, ANSWER_TOKENS - 1, lg + V));
             memcpy(lg, last, (size_t)V * 4);
             double sum = 0, worst = 0;
@@ -311,6 +319,11 @@ ATH_TEST(long_context)
             printf("    int8 against bf16 KV at depth %d: mean KL %.3e (max %.3e) over %d positions, the same greedy "
                    "token at %d\n",
                    N, sum / ANSWER_TOKENS, worst, ANSWER_TOKENS, same);
+            /* the bound: the bf16 noise, the bf16 reference's KL against fp32
+             * on the forward records (3.8e-4 on Qwen3.5-9B, 5.0e-4 on the
+             * 0.8B): the int8 cache moves the output less than bf16 rounding
+             * does */
+            ATH_EXPECT(sum / ANSWER_TOKENS <= 3.8e-4);
         }
 
         /* the snapshot on disk: written, read back */
@@ -337,7 +350,7 @@ ATH_TEST(long_context)
 
         free(snap);
         free(snap2);
-        ath_dev_arena_reset(&e->state_mem, mark);
+        ath_dev_arena_free(&e->state_mem);   /* the device memory itself, for the next state */
     }
     rmdir(sd.path);
     free(last16), free(last), free(lastb), free(ref), free(lg);
