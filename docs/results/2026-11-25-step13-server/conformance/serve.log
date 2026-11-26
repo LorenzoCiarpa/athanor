@@ -1,0 +1,78 @@
+athanor serve: loading models/Qwen3.6-35B-A3B
+athanor serve: Qwen3.6-35B-A3B on NVIDIA GeForce RTX 5080, context 65536; listening on http://127.0.0.1:18080 (Ctrl-C stops)
+serve: messages stream think: prompt 13070 (0 cached) in 71.68 s, 81 out in 2.04 s (39.7/s), tool_calls
+serve: messages stream think: prompt 13291 (13150 cached) in 0.91 s, 157 out in 3.00 s (52.4/s), tool_calls
+serve: messages stream think: prompt 13517 (13447 cached) in 0.48 s, 174 out in 3.35 s (52.0/s), tool_calls
+serve: messages stream think: prompt 13678 (13512 cached) in 0.75 s, 229 out in 4.29 s (53.4/s), tool_calls
+serve: messages stream think: prompt 13976 (13906 cached) in 0.52 s, 363 out in 7.54 s (48.1/s), end
+serve: messages stream think: prompt 13077 (0 cached) in 62.12 s, 77 out in 1.61 s (47.8/s), tool_calls
+serve: messages stream think: prompt 13226 (13153 cached) in 0.47 s, 97 out in 1.83 s (53.1/s), tool_calls
+serve: messages stream think: prompt 13392 (13221 cached) in 0.75 s, 24 out in 0.41 s (59.1/s), end
+serve: messages stream think: prompt 13053 (0 cached) in 62.29 s, 153 out in 3.11 s (49.3/s), tool_calls
+serve: messages stream think: prompt 13334 (13205 cached) in 0.75 s, 151 out in 3.03 s (49.9/s), tool_calls
+serve: messages stream think: prompt 13568 (13329 cached) in 1.05 s, 88 out in 1.60 s (54.9/s), tool_calls
+serve: messages stream think: prompt 13672 (13655 cached) in 0.16 s, 51 out in 0.91 s (56.0/s), end
+serve: messages stream think: prompt 13115 (0 cached) in 61.66 s, 235 out in 4.90 s (48.0/s), tool_calls
+serve: messages stream think: prompt 13421 (13349 cached) in 0.48 s, 251 out in 4.74 s (52.9/s), tool_calls
+serve: messages stream think: prompt 13720 (13671 cached) in 0.36 s, 217 out in 4.13 s (52.6/s), end
+serve: messages stream think: prompt 13058 (0 cached) in 63.60 s, 81 out in 1.73 s (46.8/s), tool_calls
+serve: messages stream think: prompt 13233 (13138 cached) in 0.59 s, 460 out in 9.17 s (50.1/s), tool_calls
+serve: messages stream think: prompt 13931 (13228 cached) in 2.90 s, 105 out in 1.99 s (52.9/s), tool_calls
+serve: messages stream think: prompt 14021 (13926 cached) in 0.43 s, 66 out in 1.19 s (55.5/s), tool_calls
+serve: messages stream think: prompt 14116 (14086 cached) in 0.22 s, 78 out in 1.44 s (54.2/s), end
+serve: responses stream think: prompt 6720 (0 cached) in 31.06 s, 151 out in 2.90 s (52.2/s), tool_calls
+serve: responses stream think: prompt 6959 (6870 cached) in 0.62 s, 110 out in 1.99 s (55.4/s), tool_calls
+serve: responses stream think: prompt 7094 (7068 cached) in 0.20 s, 106 out in 1.87 s (56.7/s), tool_calls
+serve: responses stream think: prompt 7253 (7199 cached) in 0.36 s, 45 out in 0.85 s (52.9/s), tool_calls
+serve: responses stream think: prompt 7368 (7297 cached) in 0.49 s, 47 out in 0.92 s (51.2/s), tool_calls
+serve: responses stream think: prompt 7475 (7414 cached) in 0.44 s, 60 out in 1.18 s (50.9/s), tool_calls
+serve: responses stream think: prompt 7588 (7534 cached) in 0.40 s, 40 out in 0.71 s (56.1/s), tool_calls
+serve: responses stream think: prompt 7688 (7627 cached) in 0.32 s, 78 out in 1.36 s (57.5/s), end
+serve: responses stream think: prompt 6728 (0 cached) in 30.28 s, 1097 out in 16.05 s (68.4/s), tool_calls
+serve: responses stream think: prompt 7898 (7824 cached) in 0.48 s, 46 out in 0.89 s (51.5/s), tool_calls
+serve: responses stream think: prompt 8050 (7943 cached) in 0.55 s, 66 out in 1.17 s (56.2/s), tool_calls
+serve: responses stream think: prompt 8169 (8115 cached) in 0.33 s, 43 out in 0.74 s (58.4/s), tool_calls
+serve: responses stream think: prompt 8274 (8211 cached) in 0.33 s, 46 out in 0.84 s (55.0/s), end
+serve: responses stream think: prompt 6706 (0 cached) in 28.83 s, 164 out in 3.07 s (53.4/s), tool_calls
+serve: responses stream think: prompt 7062 (6869 cached) in 0.95 s, 127 out in 2.33 s (54.4/s), tool_calls
+serve: responses stream think: prompt 7242 (7188 cached) in 0.35 s, 76 out in 1.35 s (56.5/s), tool_calls
+serve: responses stream think: prompt 7372 (7317 cached) in 0.33 s, 45 out in 0.93 s (48.4/s), end
+serve: responses stream think: prompt 6757 (0 cached) in 32.85 s, 218 out in 4.53 s (48.1/s), tool_calls
+serve: responses stream think: prompt 7000 (6974 cached) in 0.25 s, 225 out in 4.20 s (53.6/s), tool_calls
+serve: responses stream think: prompt 7279 (7224 cached) in 0.38 s, 51 out in 0.94 s (54.2/s), tool_calls
+serve: responses stream think: prompt 7416 (7329 cached) in 0.49 s, 181 out in 3.29 s (55.0/s), end
+serve: responses stream think: prompt 6704 (0 cached) in 32.12 s, 138 out in 2.54 s (54.2/s), tool_calls
+serve: responses stream think: prompt 7090 (6841 cached) in 1.08 s, 130 out in 2.27 s (57.2/s), tool_calls
+serve: responses stream think: prompt 7273 (7219 cached) in 0.34 s, 162 out in 2.89 s (56.1/s), tool_calls
+serve: responses stream think: prompt 7665 (7434 cached) in 1.05 s, 133 out in 2.50 s (53.3/s), tool_calls
+serve: responses stream think: prompt 7852 (7797 cached) in 0.35 s, 91 out in 1.61 s (56.5/s), end
+serve: chat stream think: prompt 595 (0 cached) in 3.18 s, 1317 out in 23.38 s (56.3/s), end (no tools)
+serve: chat stream think: prompt 10942 (0 cached) in 73.46 s, 99 out in 2.15 s (46.1/s), tool_calls
+serve: chat stream think: prompt 11087 (11040 cached) in 0.32 s, 86 out in 1.66 s (51.9/s), tool_calls
+serve: chat stream think: prompt 11305 (11172 cached) in 0.67 s, 140 out in 2.64 s (53.1/s), tool_calls
+serve: chat stream think: prompt 11465 (11444 cached) in 0.21 s, 36 out in 0.67 s (53.7/s), tool_calls
+serve: chat stream think: prompt 11685 (11500 cached) in 1.00 s, 45 out in 0.83 s (54.0/s), tool_calls
+serve: chat stream think: prompt 11750 (11729 cached) in 0.18 s, 92 out in 1.86 s (49.5/s), tool_calls
+serve: chat stream think: prompt 11862 (11841 cached) in 0.21 s, 74 out in 1.54 s (47.9/s), end
+serve: chat stream think: prompt 603 (0 cached) in 4.45 s, 2142 out in 38.95 s (55.0/s), end (no tools)
+serve: chat stream think: prompt 10949 (0 cached) in 51.07 s, 59 out in 1.35 s (43.5/s), tool_calls
+serve: chat stream think: prompt 11072 (11007 cached) in 0.46 s, 89 out in 1.65 s (53.8/s), tool_calls
+serve: chat stream think: prompt 11181 (11160 cached) in 0.17 s, 33 out in 0.59 s (55.6/s), end
+serve: chat stream think: prompt 580 (0 cached) in 2.61 s, 856 out in 14.35 s (59.7/s), end (no tools)
+serve: chat stream think: prompt 10949 (0 cached) in 50.47 s, 139 out in 3.02 s (46.0/s), tool_calls
+serve: chat stream think: prompt 11347 (11087 cached) in 1.21 s, 112 out in 2.13 s (52.6/s), tool_calls
+serve: chat stream think: prompt 11478 (11458 cached) in 0.19 s, 42 out in 0.77 s (54.8/s), tool_calls
+serve: chat stream think: prompt 11536 (11519 cached) in 0.16 s, 69 out in 1.31 s (52.8/s), end
+serve: chat stream think: prompt 640 (0 cached) in 3.18 s, 1368 out in 24.35 s (56.2/s), end (no tools)
+serve: chat stream think: prompt 11007 (0 cached) in 51.15 s, 221 out in 4.68 s (47.3/s), tool_calls
+serve: chat stream think: prompt 11248 (11227 cached) in 0.19 s, 38 out in 0.72 s (52.7/s), tool_calls
+serve: chat stream think: prompt 11470 (11285 cached) in 0.91 s, 54 out in 1.01 s (53.3/s), tool_calls
+serve: chat stream think: prompt 11572 (11523 cached) in 0.34 s, 24 out in 0.46 s (52.6/s), end
+serve: chat stream think: prompt 587 (0 cached) in 2.72 s, 1443 out in 25.23 s (57.2/s), end (no tools)
+serve: chat stream think: prompt 10930 (0 cached) in 51.13 s, 96 out in 2.03 s (47.3/s), tool_calls
+serve: chat stream think: prompt 11379 (11025 cached) in 1.58 s, 182 out in 3.22 s (56.5/s), tool_calls
+serve: chat stream think: prompt 11958 (11560 cached) in 2.23 s, 288 out in 5.47 s (52.6/s), tool_calls
+serve: chat stream think: prompt 12283 (12245 cached) in 0.27 s, 115 out in 2.15 s (53.4/s), tool_calls
+serve: chat stream think: prompt 12417 (12397 cached) in 0.20 s, 40 out in 0.75 s (53.6/s), tool_calls
+serve: chat stream think: prompt 12473 (12456 cached) in 0.16 s, 78 out in 1.46 s (53.5/s), end
+athanor serve: stopped

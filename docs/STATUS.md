@@ -6,7 +6,7 @@ This file is the overview. [`status_extended.md`](status_extended.md) goes one l
 
 ## Current step
 
-**Step 13: server and MTP** (see `docs/PLAN.md` §4). Started 2026-11-25 on branch `step13-server-mtp`, from `main` (steps 1–10 and 12), at the maintainer's request: the main functions first, optimizations later (the prefill of MoE prompts, among others, stays in Possible later work).
+**Step 13: server and MTP** (see `docs/PLAN.md` §4). Started 2026-11-25 on branch `step13-server-mtp`, from `main` (steps 1–10 and 12), at the maintainer's request: the main functions first, optimizations later (the prefill of MoE prompts, among others, stays in Possible later work). **Done 2026-11-26** (pushed; merging into `main` is the maintainer's call).
 
 Goal: athanor as a model server that coding agents drive.
 - **The server.** `athanor serve` speaks the three APIs the target harnesses use, verified 2026-11-25:
@@ -60,7 +60,7 @@ The gate of `docs/PLAN.md`: works with Claude Code, Codex CLI and OpenCode; mult
   - A loopback server test (requests over a socket, streamed responses).
   - Speculative greedy decoding gives the tokens of plain greedy decoding.
   - compute-sanitizer on the new kernels.
-- [ ] **13.9 Report and documentation.**
+- [x] **13.9 Report and documentation.**
   - The speculative decoding speedup (Qwen3.5-0.8B and Qwen3.6-35B-A3B, draft acceptance) and the conformance results under `docs/results/`.
   - READMEs, ARCHITECTURE, PROGRAM.md, the contracts, this file and `status_extended.md`.
 
@@ -75,6 +75,18 @@ The gate of `docs/PLAN.md`: works with Claude Code, Codex CLI and OpenCode; mult
 5. **Nothing else changes.** Decode, prefill and numerics of steps 10 and 12 as before.
 6. **Build and tests.** `make test`, `make cuda test` (also `DEBUG=1`) green; compute-sanitizer clean on new kernels; no warnings; `ldd` as in step 12 (sockets are libc).
 7. **Documentation updated.**
+
+Result (2026-11-25, RTX 5080 `sm_120`, Ryzen 7 9800X3D, 59 GiB; driver 580.178.04 (CUDA 13.0), CUDA toolkit 13.5.0, gcc 15.2; Claude Code 2.1.332, Codex CLI 0.167.0, OpenCode 1.19.6; reference vLLM 0.34.0 for the MTP head):
+
+| # | Criterion | Result |
+| --- | --- | --- |
+| 1 | the harnesses | `athanor serve models/Qwen3.6-35B-A3B --ctx 65536` answers Claude Code (Anthropic Messages), Codex CLI (OpenAI Responses) and OpenCode (OpenAI Chat Completions), streamed, thinking on, tool calls in both directions; every later request of a session runs only its new tokens (13,291 with 13,150 cached, 0.91 s) |
+| 2 | tool-calling conformance | 15 of 15: five tasks (fix a failing test, write a file to a specification and run it, rename across three files, find a constant and write the answer, compute a mean from a CSV and write it) through each harness, outcomes decided by each task's `check.sh`, 38 to 115 s per task; transcripts, diffs and the server's log in `docs/results/2026-11-25-step13-server/conformance/` |
+| 3 | speculative decoding | the tokens of plain decoding, bit for bit: 96 of 96 on Qwen3.5-0.8B and Qwen3.6-35B-A3B, CPU and GPU, greedy, sampled (T 0.7, top-k 20, top-p 0.8) and with a presence penalty (`tests/test_spec.c`); the server answers the same with and without the head (`test_net`). Guesses kept: coding prompt 86% (0.8B) and 98% (35B), story 63% and 76%. Decode, host-driven speculative against host-driven plain: 430.6 against 358.4 tok/s (1.20) and 55.5 against 44.3 (1.25) on code, 1.04 and 1.07 on the story; the recorded decoder: 441.1 and 86.8 (faster than the host-driven speculative decoder: its passes are recorded, the speculative ones not yet: Possible later work). Report: `docs/results/2026-11-25-step13-server/` |
+| 4 | the server's own tests | `tests/test_net.c`: the HTTP parser (whole and pipelined, split at every byte, chunked, malformed, too large), the three APIs' requests on fixtures shaped as each harness sends them, the loop over a socket (keep-alive, 100-continue, events in chunks), the whole server on Qwen3.5-0.8B (streams, a tool call, stop strings, snapshots across turns and a side request, errors); the presence penalty against its reference: the GPU kernel the reference's bits and the decoder's tokens and logits those of the steps run directly with `ath_presence_ref` (`gpu_presence`, `engine_decoder_presence`) |
+| 5 | nothing else changes | Qwen3.5-0.8B: pp512 49,722, pp4096 57,004, tg128 446.4 (step 12's report: 49,665, 56,997, 448.1). Qwen3.6-35B-A3B: tg128 92.7 after 33 tokens (94.1); after 4096 tokens 77.7 (80.3) and prefill 194.8 (209.4), where step 12's build run alternately with step 13's gives the same (77.5 and 77.6 against 76.9 and 78.0; 202.9 and 209.7 against 207.7 and 209.1): the machine that evening. The step 8 gate, the forward records, `test_forward` and `test_text` as before (`make test`, `make cuda test`) |
+| 6 | build and tests | `make test` and `make cuda test` green, also with `DEBUG=1` (ASan and UBSan; the Qwen3.6-35B-A3B tests skipped there with `ATH_MOE_DIR` unset, as in step 12). The first `DEBUG=1` run found a fault in the server test: under ASan a request outlasted the client's 60 s wait, a failed check returned while the server's thread still used the test's stack (a use after return). The server test now stops its server whatever happens, waits up to 10 minutes, and runs its prompts in chunks of 64 tokens (the stream's pings keep the client reading); `test_spec` decodes 24 tokens instead of 96 under `DEBUG=1`. compute-sanitizer memcheck (with leak check), racecheck and initcheck on `gpu_presence`, memcheck on `engine_decoder_presence`, `test_spec` (GPU) and the server tests on the GPU: 0 errors, 0 hazards, 0 bytes leaked. No warnings; `ldd` as in step 12 (libm, cuBLASLt, libc, librt, libpthread, libdl) |
+| 7 | documentation | `src/net/README.md` (new content), `src/infer/README.md` (speculative decoding), `tools/README.md` (`serve`, `--mtp`), `docs/contract/qwen35-0.8b.md` (the draft head), `docs/contract/qwen36-35b-a3b.md` (`blk.40`), `docs/ARCHITECTURE.md` (step 13's contract additions), `docs/BENCHMARKS.md` (the speculative metric), `docs/program/PROGRAM.md` rows 6b and 12, `README.md`, the report, this file and `status_extended.md` |
 
 ## Completed steps
 
@@ -795,4 +807,6 @@ From step 13 (`docs/results/2026-11-25-step13-server/`):
 - 2026-11-25: tasks 13.1 to 13.4 done (`40e43f6`, `7ef37f1`, `2836214`): `athanor serve` with the three APIs. Claude Code fixed a failing test through it with Qwen3.6-35B-A3B after two fixes found by its requests (`--dump`): its environment comes as a `system` message inside the conversation, and a 64k context did not open (the device states' buffers wasted half of each 256 MiB arena block: a state is now one allocation). Claude Code refuses to edit files under `~/.claude`, so the conformance tasks run under `$TMPDIR`.
 - 2026-11-25: tasks 13.5, 13.7 and most of 13.8 done (`d599c81`): the presence penalty (the same bits on the GPU, in the decoder against its reference), `tests/test_net.c`, and the conformance task set: 15 of 15 with Claude Code 2.1.332, Codex CLI 0.167.0 and OpenCode 1.19.6, about a minute per task. OpenCode installed with npm for it (decisions). The snapshot rule changed after the server's test showed a new short conversation losing its first snapshot to an older, longer one.
 - 2026-11-25: task 13.6 done: the MTP head as the draft head. Its GGUF norms checked on the values of Qwen3.5-0.8B's two files: llama.cpp's converter stores `enorm`, `hnorm` and `shared_head_norm` as 1 + w like every other norm. The head's input is the main model's output after the final norm (vLLM's `get_drafter_hidden_states` hands the target model's output to the drafter). Speculative decoding gives plain decoding's tokens bit for bit (96 of 96, CPU and GPU, greedy, sampled and with a presence penalty; the 35B too); on a coding prompt 86% (0.8B) and 98% (35B) of the guesses are kept, on a story 58% and 75%.
+- 2026-11-25: the step's measurements (`docs/results/2026-11-25-step13-server/`): Qwen3.5-0.8B and Qwen3.6-35B-A3B as in step 12 (the 35B after 4096 tokens 3% under step 12's report, and step 12's build run alternately gives the same: the machine that evening); speculative decoding 1.20 and 1.25 times host-driven plain decoding on code, slower than the recorded decoder.
+- 2026-11-26: the `DEBUG=1` suites green after a fix to the server test (a use after return when a check failed under ASan's slowness); compute-sanitizer clean. Step 13 done (all acceptance criteria met; table above); pushed on `step13-server-mtp`: merging into `main` is the maintainer's call.
 

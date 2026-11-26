@@ -1,0 +1,4 @@
+athanor bench: qwen35 on NVIDIA GeForce RTX 5080, context 161, 3 runs after 1 warm-up
+pp33                119.0 tok/s  (min 112.7, max 140.5)  TTFT 277.4 ms
+tg128@d32           105.9 tok/s  (min 105.7, max 106.6)  9.441 ms/token
+report: docs/results/2026-11-25-step13-server/bench/mtp-35b-story-decoder.json

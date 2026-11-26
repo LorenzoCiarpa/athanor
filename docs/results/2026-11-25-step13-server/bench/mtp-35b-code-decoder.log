@@ -1,0 +1,4 @@
+athanor bench: qwen35 on NVIDIA GeForce RTX 5080, context 191, 3 runs after 1 warm-up
+pp63                144.1 tok/s  (min 122.7, max 156.1)  TTFT 437.5 ms
+tg128@d62            86.8 tok/s  (min 84.5, max 87.7)  11.523 ms/token
+report: docs/results/2026-11-25-step13-server/bench/mtp-35b-code-decoder.json

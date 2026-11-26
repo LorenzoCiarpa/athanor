@@ -26,7 +26,11 @@ static double now_s(void)
     return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
 }
 
+#ifdef ATH_DEBUG
+enum { NG = 24, CAP = 512 };   /* the CPU under ASan, at -O0, is slow */
+#else
 enum { NG = 96, CAP = 512 };
+#endif
 
 static const char PROMPT[] =
     "<|im_start|>user\nWrite a short story about a lighthouse keeper who finds a message in a bottle. "

@@ -421,15 +421,16 @@ static bool send_str(int fd, const char *s)
     return true;
 }
 
-/* Read until `until` appears in what was read (or the peer closes, or 60 s
- * pass without data); the bytes in b. */
+/* Read until `until` appears in what was read (or the peer closes, or 10
+ * minutes pass without data: a model on the CPU under ASan is slow); the
+ * bytes in b. */
 static bool read_until(int fd, ath_buf *b, const char *until)
 {
     for (;;) {
         if (b->data && strstr(b->data, until))
             return true;
         struct pollfd p = {.fd = fd, .events = POLLIN};
-        if (poll(&p, 1, 60000) <= 0)
+        if (poll(&p, 1, 600000) <= 0)
             return false;
         char tmp[4096];
         ssize_t r = recv(fd, tmp, sizeof tmp, 0);
@@ -456,7 +457,7 @@ static void echo_handler(void *ctx, const ath_http_req *req, ath_http_out *out)
 
 ATH_TEST(http_loopback)
 {
-    server s;
+    static server s;   /* the server's thread reads it: not on a stack a failed check may leave */
     ATH_REQUIRE(server_start(&s, echo_handler, NULL));
     int fd = dial(s.srv.port);
     ATH_REQUIRE(fd >= 0);
@@ -597,26 +598,12 @@ static int64_t jint(const ath_json *j, const char *path)
     return v;
 }
 
-ATH_TEST(serve_real_model)
+/* The requests of serve_real_model, against a running server: a failed
+ * check returns here, and the caller still stops the server. */
+static void serve_session(ath_test *t_, const server *srv, ath_arena *a_)
 {
-    char cfg[1024];
-    if (!model_file(cfg, sizeof cfg, "config.json"))
-        ATH_SKIP("no checkpoint (ATH_MODEL_DIR)");
-    ath_arena a;
-    ath_arena_init(&a, 0);
-    static ath_gen g;
-    const ath_gen_opts go = {.ctx = 2048, .experts = -1, .seed = 1};
-    ATH_REQUIRE_OK(ath_gen_open(&g, model_dir(), &go, &a));
-    ath_api api;
-    const ath_api_defaults d = {.model = "qwen-test",
-                                .think = false,
-                                .sampler_think = {0, 20, 0.95f, 0, 0},
-                                .sampler_plain = {0, 20, 0.8f, 0, 0},
-                                .client_sampling = true};
-    ath_api_init(&api, &g, &d);
-    server s;
-    ATH_REQUIRE(server_start(&s, ath_api_handle, &api));
-    printf("    on %s\n", g.engine ? "the GPU" : "the CPU");
+    server s = *srv;
+    ath_arena *a = a_;
     response r;
     const ath_json *j, *ev[2048];
 
@@ -624,9 +611,9 @@ ATH_TEST(serve_real_model)
     ATH_REQUIRE(request(s.srv.port, "/v1/chat/completions",
                         "{\"model\": \"x\", \"max_tokens\": 24, \"messages\": [{\"role\": \"user\", \"content\":"
                         " \"Count from 1 to 20, separated by commas.\"}]}",
-                        &r, &a));
+                        &r, a));
     ATH_EXPECT_EQ_INT(r.status, 200);
-    ATH_REQUIRE_OK(ath_json_parse(&a, r.body, strlen(r.body), &j, NULL));
+    ATH_REQUIRE_OK(ath_json_parse(a, r.body, strlen(r.body), &j, NULL));
     const char *text = NULL;
     ath_json_to_str(ath_json_path(j, "choices.0.message.content"), &text, NULL);
     ATH_REQUIRE(text);
@@ -642,8 +629,8 @@ ATH_TEST(serve_real_model)
     ATH_REQUIRE(request(s.srv.port, "/v1/chat/completions",
                         "{\"max_tokens\": 40, \"stop\": [\", 5\"], \"messages\": [{\"role\": \"user\", \"content\":"
                         " \"Count from 1 to 20, separated by commas.\"}]}",
-                        &r, &a));
-    ATH_REQUIRE_OK(ath_json_parse(&a, r.body, strlen(r.body), &j, NULL));
+                        &r, a));
+    ATH_REQUIRE_OK(ath_json_parse(a, r.body, strlen(r.body), &j, NULL));
     text = NULL;
     ath_json_to_str(ath_json_path(j, "choices.0.message.content"), &text, NULL);
     ATH_REQUIRE(text);
@@ -659,9 +646,9 @@ ATH_TEST(serve_real_model)
                         "{\"model\": \"claude-x\", \"max_tokens\": 16, \"stream\": true, \"messages\": [{\"role\": \"user\","
                         " \"content\": \"Say hello.\"}, {\"role\": \"assistant\", \"content\": \"Hello!\"},"
                         " {\"role\": \"user\", \"content\": \"Again, in Italian.\"}]}",
-                        &r, &a));
+                        &r, a));
     ATH_EXPECT_EQ_INT(r.status, 200);
-    int n = events(r.body, ev, 2048, &a);
+    int n = events(r.body, ev, 2048, a);
     ATH_REQUIRE(n >= 5);
     ATH_EXPECT_STR_EQ(jtype(ev[0]), "message_start");
     ATH_EXPECT_STR_EQ(jtype(ev[n - 1]), "message_stop");
@@ -700,8 +687,8 @@ ATH_TEST(serve_real_model)
     int64_t cached[4], prompt[4];
     const char *conv[4] = {conv1, conv2, side, conv3};
     for (int i = 0; i < 4; i++) {
-        ATH_REQUIRE(request(s.srv.port, "/v1/chat/completions", conv[i], &r, &a));
-        ATH_REQUIRE_OK(ath_json_parse(&a, r.body, strlen(r.body), &j, NULL));
+        ATH_REQUIRE(request(s.srv.port, "/v1/chat/completions", conv[i], &r, a));
+        ATH_REQUIRE_OK(ath_json_parse(a, r.body, strlen(r.body), &j, NULL));
         cached[i] = jint(j, "usage.prompt_tokens_details.cached_tokens");
         prompt[i] = jint(j, "usage.prompt_tokens");
     }
@@ -718,8 +705,8 @@ ATH_TEST(serve_real_model)
                         "  \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}},"
                         "  \"required\": [\"city\"]}}],"
                         " \"input\": \"What is the weather in Rome? Use the tool.\"}",
-                        &r, &a));
-    n = events(r.body, ev, 2048, &a);
+                        &r, a));
+    n = events(r.body, ev, 2048, a);
     ATH_REQUIRE(n >= 4);
     ATH_EXPECT_STR_EQ(jtype(ev[0]), "response.created");
     ATH_EXPECT_STR_EQ(jtype(ev[n - 1]), "response.completed");
@@ -742,25 +729,52 @@ ATH_TEST(serve_real_model)
 
     /* errors: a prompt longer than the context, a malformed body, an unknown path */
     ath_buf big;
-    ath_buf_init(&big, &a);
+    ath_buf_init(&big, a);
     ath_buf_puts(&big, "{\"messages\": [{\"role\": \"user\", \"content\": \"");
     for (int i = 0; i < 3000; i++)
         ath_buf_puts(&big, "word ");
     ath_buf_puts(&big, "\"}]}");
-    ATH_REQUIRE(request(s.srv.port, "/v1/messages", big.data, &r, &a));
+    ATH_REQUIRE(request(s.srv.port, "/v1/messages", big.data, &r, a));
     ATH_EXPECT_EQ_INT(r.status, 400);
     ATH_EXPECT(strstr(r.body, "prompt is too long") != NULL);
-    ATH_REQUIRE(request(s.srv.port, "/v1/chat/completions", big.data, &r, &a));
+    ATH_REQUIRE(request(s.srv.port, "/v1/chat/completions", big.data, &r, a));
     ATH_EXPECT(strstr(r.body, "context_length_exceeded") != NULL);
-    ATH_REQUIRE(request(s.srv.port, "/v1/responses", "{\"input\": ", &r, &a));
+    ATH_REQUIRE(request(s.srv.port, "/v1/responses", "{\"input\": ", &r, a));
     ATH_EXPECT_EQ_INT(r.status, 400);
-    ATH_REQUIRE(request(s.srv.port, "/v1/nothing", "{}", &r, &a));
+    ATH_REQUIRE(request(s.srv.port, "/v1/nothing", "{}", &r, a));
     ATH_EXPECT_EQ_INT(r.status, 404);
     ATH_REQUIRE(request(s.srv.port, "/v1/messages/count_tokens",
-                        "{\"messages\": [{\"role\": \"user\", \"content\": \"Say hello.\"}]}", &r, &a));
+                        "{\"messages\": [{\"role\": \"user\", \"content\": \"Say hello.\"}]}", &r, a));
     ATH_EXPECT(strstr(r.body, "\"input_tokens\": ") != NULL);
+}
 
-    server_stop(&s);
+ATH_TEST(serve_real_model)
+{
+    char cfg[1024];
+    if (!model_file(cfg, sizeof cfg, "config.json"))
+        ATH_SKIP("no checkpoint (ATH_MODEL_DIR)");
+    ath_arena a;
+    ath_arena_init(&a, 0);
+    static ath_gen g;
+    /* prompts in chunks of 64 tokens: the stream's pings between them keep
+     * the client reading, however slow the pass (the CPU under ASan) */
+    const ath_gen_opts go = {.ctx = 2048, .experts = -1, .seed = 1, .chunk = 64};
+    ATH_REQUIRE_OK(ath_gen_open(&g, model_dir(), &go, &a));
+    static ath_api api;
+    const ath_api_defaults d = {.model = "qwen-test",
+                                .think = false,
+                                .sampler_think = {0, 20, 0.95f, 0, 0},
+                                .sampler_plain = {0, 20, 0.8f, 0, 0},
+                                .client_sampling = true};
+    ath_api_init(&api, &g, &d);
+    static server s;
+    if (server_start(&s, ath_api_handle, &api)) {
+        printf("    on %s\n", g.engine ? "the GPU" : "the CPU");
+        serve_session(t_, &s, &a);
+        server_stop(&s);
+    } else {
+        ATH_EXPECT(!"the server starts");
+    }
     ath_gen_close(&g);
     ath_arena_free(&a);
 }
@@ -798,8 +812,13 @@ static bool answers(ath_test *t_, bool mtp, const char **out, int n, ath_arena *
         ath_buf_init(&c.text, a);
         const ath_gen_sink sink = {.text = c_text, .thinking = c_think, .tool_begin = c_begin, .tool_args = c_text,
                                    .tool_end = c_end, .u = &c};
+#ifdef ATH_DEBUG
+        const int32_t max_tokens = 16;   /* the CPU under ASan is slow */
+#else
+        const int32_t max_tokens = 60;
+#endif
         ath_gen_request r = {.msgs = convs[i], .n_msgs = lens[i], .sampler = {0, 0, 1, 0, i == 2 ? 1.5f : 0},
-                             .max_tokens = 60};
+                             .max_tokens = max_tokens};
         ath_gen_result res;
         ok = ath_gen_run(&g, &r, &sink, &res, a) == ATH_OK;
         out[i] = ath_buf_str(&c.text);

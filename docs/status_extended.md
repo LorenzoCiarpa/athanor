@@ -24,6 +24,7 @@ How to read it:
   - [Step 9: fast decode and bench](#step-9-fast-decode-and-bench)
   - [Step 10: fast prefill](#step-10-fast-prefill)
   - [Step 12: MoE and tiering](#step-12-moe-and-tiering)
+  - [Step 13: server and MTP](#step-13-server-and-mtp)
 - [Files by step](#files-by-step)
 
 ---
@@ -1294,6 +1295,91 @@ No file of its own: the decoder of step 9 runs a MoE model unchanged, since the 
 
 compute-sanitizer: memcheck with leak check, racecheck and initcheck on `gpu_matmul_q8_0`, `gpu_moe` and `gpu_moe_split`, memcheck on the engine's tests and on the tiny MoE model's forward pass on the GPU: 0 errors, 0 hazards, 0 bytes leaked.
 
+### Step 13: server and MTP
+
+Branch `step13-server-mtp`, from `main` (steps 1–10 and 12). The gate of `docs/PLAN.md`: works with Claude Code, Codex CLI and OpenCode; multi-turn sessions with tool calls succeed on a fixed task set; speculative-decoding speedup reported. At the maintainer's request the main functions first, optimizations later. Decisions: `STATUS.md`, step 13.
+
+#### 13.1 HTTP
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `src/net/http.h`, `http.c` | New | `ath_http_parse` (request line, headers, `Content-Length` (digits only) or chunked bodies joined into a NUL-terminated copy, keep-alive by version and `Connection`, `Expect: 100-continue`; `ATH_ERR_RANGE` with the header length when more bytes are needed, so the loop can answer 100-continue); `ath_http_reply`, server-sent events in chunks (`ath_http_sse_start`, `ath_http_sse`, `ath_http_sse_ping`, `ath_http_sse_end`), `ath_http_alive` (a client gone: `POLLRDHUP`); `ath_http_listen` and `ath_http_run`, one `poll` loop over up to 32 connections, each with an arena reset after every request, 400 or 413 for malformed requests, 500 when a handler wrote nothing |
+| `Makefile` | Changed | `NET_SRC` into the library |
+
+Commit `40e43f6` (with 13.2 to 13.4); 100-continue for chunked bodies and the digits-only `Content-Length` in `d599c81`.
+
+#### 13.2 The APIs
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `src/net/api.h`, `api.c` | New | `ath_api_parse`: Anthropic Messages, OpenAI Chat Completions and OpenAI Responses requests into one `ath_api_request` (messages with one leading system message, tools, calls and results, thinking, sampling with the server's defaults, limits, stop strings, streaming; Responses' reasoning items and custom tools). The writer: an `ath_gen_sink` per request that opens and closes content blocks / output items / tool-call deltas as the events come, streamed (each API's events: `message_start` … `message_stop`; chunks and `[DONE]`; `response.*` with sequence numbers) or whole; usage with cached tokens; errors in each API's shape (a prompt too long: "prompt is too long", `context_length_exceeded`); `count_tokens`, `/v1/models`, `/health`; `--dump` |
+
+Claude Code's `system` messages inside the conversation and its billing line: `2836214`.
+
+#### 13.3 Generation for the server
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `src/net/gen.h`, `gen.c` | New | `ath_gen_open` (the model, tokenizer, engine with room reserved for two states, the states, the pool), `ath_gen_run`: render and tokenize, go on from the state, the snapshot or the start, the prompt in chunks with the sink's `wait` between them (pings, a client gone), the decoder reopened when the sampler changes, the answer's events with stop strings held back and whole UTF-8 characters, EOS, limits, cancellation; `ath_gen_tokens` for token counts. The snapshot's own tokens kept apart; a much shorter prompt does not replace it (`d599c81`) |
+| `src/model/state.c` | Changed | A device state in one allocation: one by one, the 128 MiB KV buffers of a 64k context wasted half of each 256 MiB arena block (`7ef37f1`) |
+
+#### 13.4 `athanor serve`
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `tools/serve.c` | New | Options (host, port, name, context, experts, threads, device, thinking default, token limit, server sampling, chunk, seed, `--mtp`, `--dump`, `--quiet`), the card's samplers as defaults, signals, the loop |
+| `tools/athanor.c`, `commands.h` | Changed | The `serve` entry |
+
+#### 13.5 Presence penalty
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `src/ops/ops.h`, `sample.c` | Changed | `ath_sampler.presence`; `ath_presence_ref` and `ath_presence_gpu` (f32 logits, one subtraction per marked token) |
+| `src/ops/cuda/sample.cu`, `launch.h`, `gpu_none.c` | Changed | `presence_kernel`: the step's token marked by its own thread, then the penalty |
+| `src/infer/engine.h`, `engine.c` | Changed | The decoder's `seen` buffer; the penalty before the choice (on the device or before the logits go to the host); `ath_decoder_forget` |
+| `tests/test_gpu_ops.c`, `test_engine.c`, `test_net.c` | Changed | `gpu_presence`, `engine_decoder_presence`, `presence_reference` |
+| `tests/test_text.c`, others | Changed | Sampler initializers with their fifth field |
+
+Commit `d599c81`.
+
+#### 13.6 MTP
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `src/model/model.h`, `state.c`, `registry.c` | Changed | `ATH_P_DRAFT`, `n_draft_layers`, `ATH_STATE_HIDDEN`, `ath_state.n_draft` (reset and copied), `ath_batch.hidden`, `ath_draft`, `ath_model_draft` with its checks, the family's `draft` member |
+| `src/models/qwen35/qwen35.h`, `config.c`, `family.c`, `weights.c` | Changed | `mtp_num_hidden_layers`; the head bound from `mtp.*` or `blk.<n>.nextn.*` (when the file has it), flagged `draft`, layers `n_layers` and on; its states |
+| `src/models/qwen35/forward.c` | Changed | The main pass's `hidden` output (the final norm of every row, the logits from its rows: the same bits); `ath_qwen35_draft`; `put_cols` |
+| `src/infer/tier.h`, `tier.c`, `engine.h`, `engine.c` | Changed | `ath_place_opts.draft`: the head's params copied and its experts placed only on request; `ath_engine.draft` |
+| `src/infer/spec.h`, `spec.c` | New | `ath_spec`: `feed` (the main model and the head over a prompt), `begin`, `step` (save, verify, choose as plain decoding, keep or undo, guess again), host-driven |
+| `tools/bench.c`, `chat.c`, `src/net/gen.c`, `gen.h`, `tools/serve.c` | Changed | `--mtp` |
+| `tests/test_spec.c` | New | `draft_checks`, `spec_matches_plain_cpu`, `spec_matches_plain_gpu` |
+| `tests/test_model.c`, `test_forward.c`, `test_net.c` | Changed | The counts without the head plus its own; the state specs with the head's; `serve_mtp_same_answers` |
+
+Commit `049d497`.
+
+#### 13.7 Conformance
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `tests/conformance/run.sh` | New | A harness (claude, codex, opencode) over the task set: a fresh git repository per task under `$TMPDIR`, the harness's configuration in a folder of its own (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_*`), the commands it may run limited, then the task's check; transcripts, diffs and results into the output folder |
+| `tests/conformance/tasks/*/` | New | `fix-bug`, `new-file`, `rename`, `find-constant`, `csv-stats`: files, prompt, check |
+| `docs/results/2026-11-25-step13-server/conformance/` | New | The run with Qwen3.6-35B-A3B: 15 of 15, transcripts |
+
+Commit `d599c81`.
+
+#### 13.8 Tests
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `tests/test_net.c` | New | The HTTP parser (whole and pipelined, split at every byte, chunked, malformed, too large), the three APIs' requests on fixtures, the loop over a socket (keep-alive, 100-continue, events in chunks with their sizes checked, 500, 400), the whole server on the real checkpoint (streams, a tool call, stop strings, the snapshot across turns and a side request, errors, `count_tokens`), the same answers with the draft head |
+| `Makefile` | Changed | `test_net`, `test_spec` |
+
+After the first `DEBUG=1` run: the server test's requests run in a function of their own, so the server stops whatever a check does (under ASan a request outlasted the client's wait, and a failed check had returned while the server's thread used the test's stack); the client waits up to 10 minutes; the test's server runs prompts in chunks of 64 tokens, so the stream's pings keep it reading; under `DEBUG=1` `test_spec` decodes 24 tokens and the draft-head answers 16. compute-sanitizer: memcheck with leak check, racecheck and initcheck on `gpu_presence`, memcheck on `engine_decoder_presence`, `test_spec` and the server tests on the GPU: 0 errors, 0 hazards, 0 bytes leaked.
+
+#### 13.9 Report and documentation
+
+`docs/results/2026-11-25-step13-server/` (report, conformance, benchmarks); `src/net/README.md`, `src/infer/README.md`, `tools/README.md`, `docs/contract/qwen35-0.8b.md` (Draft head), `docs/contract/qwen36-35b-a3b.md`, `docs/ARCHITECTURE.md`, `docs/program/PROGRAM.md` rows 6b and 12, `README.md`, `STATUS.md` and this file.
+
 ---
 
 ## Files by step
@@ -1370,3 +1456,5 @@ Every file of the repository and the steps that created or changed it (documenta
 Before step 9 (source layout), `src/backend/{gpu.cu,gpu.h,compat.h}` moved to `src/backend/cuda/` and `src/ops/{kernel.cuh,*.cu}` to `src/ops/cuda/`. The rows above keep the paths the steps used.
 
 Steps 9 and 10 list their files in their own sections above. New in step 10: `src/ops/cuda/mma.cuh`, `attn_mma.cu`, `gdn_chunk.cu`.
+
+Step 13 lists its files in its own section above. New in step 13: `src/net/http.{h,c}`, `api.{h,c}`, `gen.{h,c}`, `src/infer/spec.{h,c}`, `tools/serve.c`, `tests/test_net.c`, `tests/test_spec.c`, `tests/conformance/`.

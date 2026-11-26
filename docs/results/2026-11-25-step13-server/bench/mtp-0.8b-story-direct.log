@@ -1,0 +1,4 @@
+athanor bench: qwen35 on NVIDIA GeForce RTX 5080, context 289, 5 runs after 1 warm-up
+pp33               8235.7 tok/s  (min 8225.1, max 8274.0)  TTFT 4.1 ms
+tg256@d32           357.1 tok/s  (min 357.1, max 357.4)  2.800 ms/token
+report: docs/results/2026-11-25-step13-server/bench/mtp-0.8b-story-direct.json

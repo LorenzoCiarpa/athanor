@@ -1,0 +1,16 @@
+{
+  "athanor_bench": 1,
+  "date": "2026-11-25T21:50:37Z",
+  "hardware": {"gpu": "NVIDIA GeForce RTX 5080", "gpu_memory_bytes": 16585719808, "compute_capability": "12.0", "pci_bus_id": "0000:01:00.0", "pcie": "32.0 GT/s PCIe x16 (maximum of the link)", "driver": "NVIDIA UNIX Open Kernel Module for x86_64  580.178.04  Release Build  (dvs-builder@U22-I3-AE18-16-4)  Tue Jul  7 12:18:12 UTC 2026", "cpu": "AMD Ryzen 7 9800X3D 8-Core Processor", "cpu_threads": 8, "ram": "62267304 kB", "ram_speed": "not recorded (reading it needs root)", "storage": "CT500P310SSD8                           "},
+  "software": {"athanor_commit": "v0.1-cpu-chat-61-g049d497c6aec", "compiler": "gcc 15.2.0", "gpu_backend": "cuda", "runtime_version": 13050, "driver_api_version": 13000, "blas_version": 131000},
+  "model": {"dir": "models/Qwen3.6-35B-A3B", "family": "qwen35", "weights": "as stored in the checkpoint (gguf: q8_0, f32, bf16)", "files": [{"name": "Qwen3.6-35B-A3B-Q8_0.gguf", "bytes": 37801097504, "sha256": "not hashed (--no-hash)", "hf_revision": "5bc3e238d916f48a861bac2f8a1990a0e9b7e98d"}]},
+  "workload": {"tokens": "pseudo-random ids (ath_rng, seed 1)", "batch": 1, "prompt_chunk": 2048, "context": 161, "activations": "bf16", "sampling": "greedy", "decode": "speculative: the draft head's guess verified in one pass with the next token, forward calls from the host, ath_sample_ref (step 13)", "device": "gpu"},
+  "prompt_ids": "docs/results/2026-11-25-step13-server/bench/prompt-story.ids",
+  "experts": {"per_layer": 256, "in_device_memory": 69, "bytes_each": 3342336, "host_bytes": 35081158656, "moved": 0, "period": 4, "moves": 2, "cpu_threads": 8},
+  "method": {"warmup_runs": 1, "measured_runs": 3, "statistic": "median, with min and max", "timer": "CLOCK_MONOTONIC around whole calls; a GPU pass waits for its logits"},
+  "results": [
+    {"test": "pp33", "prompt": 33, "depth": 0, "tokens_per_s": {"median": 109.92811104725284, "min": 107.78601700625521, "max": 143.25600913651985, "runs": [143.25600913651985, 107.78601700625521, 109.92811104725284]}, "ttft_ms": {"median": 300.4080629980308, "min": 230.50114099896746, "max": 306.3493459994788, "runs": [230.50114099896746, 306.3493459994788, 300.4080629980308]}},
+    {"test": "tg128@d32", "generated": 128, "depth": 32, "tokens_per_s": {"median": 48.53103394409115, "min": 48.22803901810487, "max": 48.53794484128552, "runs": [48.22803901810487, 48.53794484128552, 48.53103394409115]}, "ms_per_token": {"median": 20.605371835927144, "min": 20.602438015657754, "max": 20.734826054706446, "runs": [20.734826054706446, 20.602438015657754, 20.605371835927144]}, "guesses_kept": 0.7639}
+  ],
+  "memory": {"device_used_before_bytes": 1904803840, "device_used_peak_bytes": 14993195008, "device_note": "all processes, from the driver (cudaMemGetInfo); before = after this process created its context", "process_peak_rss_bytes": 49535700992}
+}

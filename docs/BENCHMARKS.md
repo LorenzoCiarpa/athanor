@@ -21,6 +21,7 @@ Every performance or quality claim in athanor, in an issue, a pull request, an a
 | Decode tok/s | generated tokens / decode time, at batch 1 and 4, at context 0, 4k and 32k |
 | Peak VRAM, peak RAM | from the driver and the process, not from athanor's own accounting |
 | Disk read | bytes read per token for MoE streaming |
+| Speculative decoding | decode tok/s with and without the draft, on the same prompt ids, and the share of passes whose guess was kept (`athanor bench --mtp`, `guesses_kept`); the prompt is named, since predictable text keeps more guesses (step 13) |
 
 ## Quality metrics
 
