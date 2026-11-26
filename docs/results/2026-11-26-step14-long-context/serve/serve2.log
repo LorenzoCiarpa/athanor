@@ -1,0 +1,6 @@
+athanor serve: loading models/Qwen3.5-9B
+athanor warn: gpu: cannot allocate 4346478592 bytes on NVIDIA GeForce RTX 5080: out of memory
+athanor warn: serve: 0.81 GiB of device memory left for prompt pieces of 1024 tokens; if a long prompt runs out of memory, use a smaller --chunk (about the same speed)
+athanor serve: Qwen3.5-9B on NVIDIA GeForce RTX 5080, context 131072; listening on http://127.0.0.1:8091 (Ctrl-C stops)
+serve: chat no-think: prompt 123861 (123827 cached) in 0.96 s, 16 out in 0.40 s (40.2/s), end (no tools)
+athanor serve: stopped

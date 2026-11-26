@@ -1,0 +1,20 @@
+    models/Qwen3.5-9B: a prompt of 130524 tokens (5794 notes), context 131072
+    weights on NVIDIA GeForce RTX 5080: 8.86 GiB; 4.89 of 15.45 GiB free
+    bf16 KV: prefill 197.5 s (661 tokens/s); decode at depth 36.3 tokens/s; device memory in use 14.85 GiB
+    bf16 KV: answer "amber-falcon-4127": the passphrase found
+    bf16 KV: snapshot at   8192 tokens:    305.1 MiB, copied out in 0.064 s
+    bf16 KV: snapshot at  32768 tokens:   1073.1 MiB, copied out in 0.167 s
+    bf16 KV: snapshot at  65536 tokens:   2097.1 MiB, copied out in 0.248 s
+    bf16 KV: snapshot at 130524 tokens:   4128.0 MiB, copied out in 0.481 s
+    bf16 KV: pieces of 640 against 1024: state the same bits, logits the same bits
+    bf16 KV: snapshot of 130524 tokens on disk: 4128.0 MiB, written in 0.82 s, read and loaded in 1.06 s
+    int8 KV: prefill 199.0 s (656 tokens/s); decode at depth 32.8 tokens/s; device memory in use 14.29 GiB
+    int8 KV: answer "amber-falcon-4127": the passphrase found
+    int8 KV: snapshot at   8192 tokens:    193.1 MiB, copied out in 0.041 s
+    int8 KV: snapshot at  32768 tokens:    625.1 MiB, copied out in 0.097 s
+    int8 KV: snapshot at  65536 tokens:   1201.1 MiB, copied out in 0.148 s
+    int8 KV: snapshot at 130524 tokens:   2343.5 MiB, copied out in 0.273 s
+    int8 KV: pieces of 640 against 1024: state the same bits, logits the same bits
+    int8 against bf16 KV at depth 130524: mean KL 1.088e-05 (max 9.927e-05) over 24 positions, the same greedy token at 24
+    int8 KV: snapshot of 130524 tokens on disk: 2343.5 MiB, written in 0.45 s, read and loaded in 0.62 s
+1 passed, 0 failed, 0 skipped

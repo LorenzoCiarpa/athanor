@@ -64,10 +64,10 @@ ath_status ath_gen_open(ath_gen *g, const char *dir, const ath_gen_opts *o, ath_
         g->has_snap = st == ATH_OK && ath_engine_state_kv(g->engine, &g->snap, ATH_DTYPE_BF16, kv, g->ctx, a) == ATH_OK;
         uint64_t fr = 0, tot = 0;
         ath_device_mem(&g->engine->dev, &fr, &tot);
-        ath_log(ATH_LOG_INFO, "serve: %s; %.2f GiB of device memory free",
+        ath_log(st == ATH_OK && !g->has_snap ? ATH_LOG_WARN : ATH_LOG_INFO, "serve: %s; %.2f GiB of device memory free",
                 st != ATH_OK      ? "the state does not fit"
                 : g->has_snap     ? "state and snapshot allocated"
-                                  : "state allocated; no room for a snapshot on the device (snapshots in host memory)",
+                                  : "no room on the device for a second state, the snapshot: snapshots go to host memory",
                 (double)fr / 1073741824.0);
         /* a prompt piece's working memory grows with its tokens (about a
          * quarter of a GiB per 1024 on Qwen3.5-9B) */

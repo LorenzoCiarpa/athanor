@@ -1,0 +1,6 @@
+total 12041376
+drwxr-xr-x 2 ciarpa ciarpa       4096 Nov 26 11:14 .
+drwxrwxr-x 3 ciarpa ciarpa       4096 Nov 26 10:59 ..
+-rw-r--r-- 1 ciarpa ciarpa 4109569868 Nov 26 11:14 72a5c0e7649b400f367c5232a0a5de84.snap
+-rw-r--r-- 1 ciarpa ciarpa 4110323624 Nov 26 11:14 b8009c799f1eb5ca77a1bfae24d12cbd.snap
+-rw-r--r-- 1 ciarpa ciarpa 4110454712 Nov 26 11:14 ebb884d29fa99ce186658796b0e60792.snap

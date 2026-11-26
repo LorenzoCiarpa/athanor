@@ -1419,7 +1419,8 @@ Commits `bd85407` (one scale per row), `a7a2015` (groups).
 | --- | --- | --- |
 | `src/model/model.h`, `state.c` | Changed | `ath_state_snap_bytes`, `ath_state_snap_save`, `ath_state_snap_load`: a state trimmed to its tokens, independent of capacity and side |
 | `src/infer/prefix.h`, `prefix.c` | New | The store: host memory and a folder, LRU under a budget each; the longest stored prefix; files named by SHA-256, a checked header, XXH64 of the payload, written atomically, times that keep the order of use; superseded snapshots not written; the model's identity |
-| `src/net/gen.{h,c}`, `tools/serve.c`, `tools/chat.c` | Changed | The store beside the device's snapshot (which goes there when a new one does not continue it, and at exit); no device snapshot when a second state does not fit; `--snapshots`, `--snap-ram`, `--snap-disk`; chat with `-p` keeps the system prompt's snapshot when there is a folder |
+| `src/net/gen.{h,c}`, `tools/serve.c`, `tools/chat.c` | Changed | The store beside the device's snapshot (which goes there when a new one does not continue it, and at exit); no device snapshot when a second state does not fit; the shared part (system prompt and tools, 1024 tokens or more) stored once as shared (`2a5b862`); `--snapshots`, `--snap-ram`, `--snap-disk`; chat with `-p` keeps its snapshots when there is a folder |
+| `src/model/model.h`, `text.c` | Changed | `ath_model_chat_shared`: the prefix two renderings of the system messages and tools with different user messages have in common |
 | `tests/test_prefix.c` | New | Round trip, the store in memory, on disk (supersession, branch points, reopen, budget, damaged, truncated and foreign files) |
 | `tests/test_engine.c`, `test_net.c` | Changed | `engine_snapshots`; `serve_snapshots_resume` |
 | `Makefile` | Changed | `test_prefix`, `test_long` |

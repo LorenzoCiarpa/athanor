@@ -265,9 +265,10 @@ Step 9 (`engine_decoder`): the decoder's recorded and replayed steps give the lo
 - `test_prefix` (CPU, tiny random models):
   - `prefix_snapshot_roundtrip`: a state saved after 20 tokens has the size the specs give. Loaded into a larger state, it gives the logits of 6 more tokens bit for bit, with the KV cache in bf16 and in int8. A wrong size and a state too small for its rows are refused.
   - `prefix_store_memory`: the longest prefix shorter than the prompt; the minimum length; a prefix saved twice kept once; the budget in host memory, where the least recently used leaves; a loaded snapshot goes on as the sequence it was taken from.
+  - `prefix_store_shared`: a shared prefix is written even though a longer snapshot continues it, and stays not superseded after a reopen.
   - `prefix_store_disk`: nothing is written before it must be. At close, only a conversation's latest turn is written, not the turns it supersedes. After a reopen, that turn read from disk goes on with the same logits. A branch point (a prefix continued two ways) is written with the rest. The folder's budget keeps the most recently used file. Files of another model or other dtypes are left alone and not used. A file whose payload was damaged passes the scan, is refused at load with the state untouched, and is deleted; a truncated file is not used.
 - `test_engine`, `engine_snapshots`: the same round trip for states on the device, bf16 and int8 KV; the snapshot of a device state loads into a host state too.
-- `test_net`, `serve_snapshots_resume` (Qwen3.5-0.8B): a server opened on a snapshot folder answers a conversation and stops; a new one on the same folder starts the same conversation from the snapshot on disk (89 prompt tokens cached) and gives the same greedy answer.
+- `test_net`, `serve_snapshots_resume` (Qwen3.5-0.8B): a server opened on a snapshot folder answers a conversation with a system prompt of 1112 tokens and stops. A new one on the same folder starts the same conversation from the snapshot on disk (1136 prompt tokens cached) and gives the same greedy answer. A third starts a new conversation with the same system prompt from the shared part (1112 tokens cached).
 
 ## Text
 
