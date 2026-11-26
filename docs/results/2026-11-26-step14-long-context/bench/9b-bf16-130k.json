@@ -1,0 +1,13 @@
+{
+  "athanor_bench": 1,
+  "date": "2026-11-26T09:45:10Z",
+  "hardware": {"gpu": "NVIDIA GeForce RTX 5080", "gpu_memory_bytes": 16585719808, "compute_capability": "12.0", "pci_bus_id": "0000:01:00.0", "pcie": "32.0 GT/s PCIe x16 (maximum of the link)", "driver": "NVIDIA UNIX Open Kernel Module for x86_64  580.178.04  Release Build  (dvs-builder@U22-I3-AE18-16-4)  Tue Jul  7 12:18:12 UTC 2026", "cpu": "AMD Ryzen 7 9800X3D 8-Core Processor", "cpu_threads": 8, "ram": "62267304 kB", "ram_speed": "not recorded (reading it needs root)", "storage": "CT500P310SSD8                           "},
+  "software": {"athanor_commit": "v0.1-cpu-chat-65-ga7a201551f86-dirty", "compiler": "gcc 15.2.0", "gpu_backend": "cuda", "runtime_version": 13050, "driver_api_version": 13000, "blas_version": 131000},
+  "model": {"dir": "models/Qwen3.5-9B", "family": "qwen35", "weights": "as stored in the checkpoint (gguf: q8_0, f32)", "files": [{"name": "Qwen3.5-9B-Q8_0.gguf", "bytes": 9527502048, "sha256": "not hashed (--no-hash)", "hf_revision": ""}]},
+  "workload": {"tokens": "pseudo-random ids (ath_rng, seed 1)", "batch": 1, "prompt_chunk": 1024, "context": 130065, "activations": "bf16", "sampling": "greedy", "decode": "decoder: one recorded graph per token, the choice on the GPU (step 9)", "device": "gpu"},
+  "method": {"warmup_runs": 0, "measured_runs": 2, "statistic": "median, with min and max", "timer": "CLOCK_MONOTONIC around whole calls; a GPU pass waits for its logits"},
+  "results": [
+    {"test": "tg64@d130000", "generated": 64, "depth": 130000, "tokens_per_s": {"median": 37.08050892766128, "min": 37.074091110800644, "max": 37.08692674452191, "runs": [37.08692674452191, 37.074091110800644]}, "ms_per_token": {"median": 26.968346953026412, "min": 26.963679327991485, "max": 26.97301457806134, "runs": [26.963679327991485, 26.97301457806134]}}
+  ],
+  "memory": {"device_used_before_bytes": 2150629376, "device_used_peak_bytes": 16163340288, "device_note": "all processes, from the driver (cudaMemGetInfo); before = after this process created its context", "process_peak_rss_bytes": 9838534656}
+}

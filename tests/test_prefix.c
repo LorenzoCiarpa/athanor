@@ -184,14 +184,14 @@ ATH_TEST(prefix_store_memory)
     ATH_REQUIRE_OK(ath_prefix_open(&ps, &t.m, ATH_DTYPE_BF16, ATH_DTYPE_BF16,
                                    &(ath_prefix_opts){.ram_bytes = budget, .min_tokens = 6}));
     ATH_REQUIRE_OK(feed(&t.m, &s, p, 0, 4, 4, NULL, &scratch));
-    ATH_REQUIRE_OK(ath_prefix_save(ps, p, &s));                       /* 4 < 6: not stored */
+    ATH_REQUIRE_OK(ath_prefix_save(ps, p, &s, false));                       /* 4 < 6: not stored */
     ATH_EXPECT_EQ_INT(stats(ps).ram_count, 0);
     ATH_REQUIRE_OK(feed(&t.m, &s, p, 4, 8, 8, NULL, &scratch));
-    ATH_REQUIRE_OK(ath_prefix_save(ps, p, &s));                       /* p[0, 8) */
-    ATH_REQUIRE_OK(ath_prefix_save(ps, p, &s));                       /* again: one entry */
+    ATH_REQUIRE_OK(ath_prefix_save(ps, p, &s, false));                       /* p[0, 8) */
+    ATH_REQUIRE_OK(ath_prefix_save(ps, p, &s, false));                       /* again: one entry */
     ATH_EXPECT_EQ_INT(stats(ps).ram_count, 1);
     ATH_REQUIRE_OK(feed(&t.m, &s, p, 8, 12, 12, NULL, &scratch));
-    ATH_REQUIRE_OK(ath_prefix_save(ps, p, &s));                       /* p[0, 12) */
+    ATH_REQUIRE_OK(ath_prefix_save(ps, p, &s, false));                       /* p[0, 12) */
     ATH_EXPECT_EQ_INT(ath_prefix_find(ps, p, N), 12);
     ATH_EXPECT_EQ_INT(ath_prefix_find(ps, p, 12), 8);                 /* shorter than n */
     ATH_EXPECT_EQ_INT(ath_prefix_find(ps, q, N), 0);
@@ -202,7 +202,7 @@ ATH_TEST(prefix_store_memory)
     /* a third sequence: the least recently used (p[0, 8)) leaves host memory */
     ATH_REQUIRE_OK(ath_state_reset(&r, &t.m));
     ATH_REQUIRE_OK(feed(&t.m, &r, q, 0, 16, 16, NULL, &scratch));
-    ATH_REQUIRE_OK(ath_prefix_save(ps, q, &r));
+    ATH_REQUIRE_OK(ath_prefix_save(ps, q, &r, false));
     ATH_EXPECT_EQ_INT(stats(ps).ram_count, 2);
     ATH_EXPECT(stats(ps).ram_bytes <= budget);
     ATH_EXPECT_EQ_INT(ath_prefix_find(ps, branch, N), 0);
@@ -248,9 +248,9 @@ ATH_TEST(prefix_store_disk)
     ath_prefix_store *ps;
     ATH_REQUIRE_OK(ath_prefix_open(&ps, &t.m, ATH_DTYPE_BF16, ATH_DTYPE_BF16, &po));
     ATH_REQUIRE_OK(feed(&t.m, &s, p, 0, 16, 16, NULL, &scratch));
-    ATH_REQUIRE_OK(ath_prefix_save(ps, p, &s));
+    ATH_REQUIRE_OK(ath_prefix_save(ps, p, &s, false));
     ATH_REQUIRE_OK(feed(&t.m, &s, p, 16, 24, 24, NULL, &scratch));
-    ATH_REQUIRE_OK(ath_prefix_save(ps, p, &s));
+    ATH_REQUIRE_OK(ath_prefix_save(ps, p, &s, false));
     ATH_EXPECT_EQ_INT(snap_files(dir, NULL), 0);   /* nothing written before it must be */
     ath_prefix_close(ps);
     ATH_EXPECT_EQ_INT(snap_files(dir, NULL), 1);
@@ -275,10 +275,10 @@ ATH_TEST(prefix_store_disk)
     b2[12] = (b2[12] + 1) % V;
     ATH_REQUIRE_OK(ath_state_reset(&r, &t.m));
     ATH_REQUIRE_OK(feed(&t.m, &r, p, 0, 12, 12, NULL, &scratch));
-    ATH_REQUIRE_OK(ath_prefix_save(ps, p, &r));
+    ATH_REQUIRE_OK(ath_prefix_save(ps, p, &r, false));
     ATH_REQUIRE_OK(ath_prefix_load(ps, b2, 12, N, &r));   /* continued with b2[12] (p[12] already seen) */
     ATH_REQUIRE_OK(feed(&t.m, &r, b2, 12, 20, 20, NULL, &scratch));
-    ATH_REQUIRE_OK(ath_prefix_save(ps, b2, &r));          /* b2[0, 20) */
+    ATH_REQUIRE_OK(ath_prefix_save(ps, b2, &r, false));          /* b2[0, 20) */
     ath_prefix_close(ps);
     ATH_EXPECT_EQ_INT(snap_files(dir, NULL), 3);          /* p[0, 24), p[0, 12), b2[0, 20) */
 
@@ -324,7 +324,7 @@ ATH_TEST(prefix_store_disk)
 
     /* truncated: not used at open */
     ATH_REQUIRE_OK(ath_prefix_open(&ps, &t.m, ATH_DTYPE_BF16, ATH_DTYPE_BF16, &po));
-    ATH_REQUIRE_OK(ath_prefix_save(ps, p, &s));           /* s holds p[0, 32) */
+    ATH_REQUIRE_OK(ath_prefix_save(ps, p, &s, false));           /* s holds p[0, 32) */
     ath_prefix_close(ps);
     ATH_REQUIRE(snap_files(dir, path) == 1);
     ATH_REQUIRE(truncate(path, 200) == 0);
@@ -339,10 +339,51 @@ ATH_TEST(prefix_store_disk)
     tiny_close(&t);
 }
 
+/* A shared prefix (a system prompt) is written even when a longer snapshot
+ * continues it, and its file says so: after a reopen it is still not
+ * superseded. */
+ATH_TEST(prefix_store_shared)
+{
+    enum { N = 40 };
+    tiny_model t;
+    ATH_REQUIRE_OK(tiny_open(&t, 9));
+    ath_arena scratch;
+    ath_arena_init(&scratch, 0);
+    tmpdir sd;
+    ATH_REQUIRE(tmpdir_make(&sd));
+    char dir[600];
+    snprintf(dir, sizeof dir, "%s/snapshots", sd.path);
+    int32_t p[N];
+    tokens(p, N, 6);
+    ath_state s;
+    ATH_REQUIRE_OK(ath_state_init(&s, &t.m, ATH_DTYPE_BF16, N, &t.a));
+    const ath_prefix_opts po = {.dir = dir, .min_tokens = 8};
+    ath_prefix_store *ps;
+    ATH_REQUIRE_OK(ath_prefix_open(&ps, &t.m, ATH_DTYPE_BF16, ATH_DTYPE_BF16, &po));
+    ATH_REQUIRE_OK(feed(&t.m, &s, p, 0, 12, 12, NULL, &scratch));
+    ATH_REQUIRE_OK(ath_prefix_save(ps, p, &s, true));       /* the shared part */
+    ATH_EXPECT(ath_prefix_has(ps, p, 12) && !ath_prefix_has(ps, p, 11));
+    ATH_REQUIRE_OK(feed(&t.m, &s, p, 12, 20, 20, NULL, &scratch));
+    ATH_REQUIRE_OK(ath_prefix_save(ps, p, &s, false));      /* a turn that continues it */
+    ath_prefix_close(ps);
+    ATH_EXPECT_EQ_INT(snap_files(dir, NULL), 2);
+    /* reopened: another turn continues both; the shared one stays */
+    ATH_REQUIRE_OK(ath_prefix_open(&ps, &t.m, ATH_DTYPE_BF16, ATH_DTYPE_BF16, &po));
+    ATH_REQUIRE_OK(feed(&t.m, &s, p, 20, 28, 28, NULL, &scratch));
+    ATH_REQUIRE_OK(ath_prefix_save(ps, p, &s, false));
+    ath_prefix_close(ps);
+    ATH_EXPECT_EQ_INT(snap_files(dir, NULL), 3);
+    remove_folder(dir);
+    rmdir(sd.path);
+    ath_arena_free(&scratch);
+    tiny_close(&t);
+}
+
 static const ath_test_case tests[] = {
     ATH_TEST_ENTRY(prefix_snapshot_roundtrip),
     ATH_TEST_ENTRY(prefix_store_memory),
     ATH_TEST_ENTRY(prefix_store_disk),
+    ATH_TEST_ENTRY(prefix_store_shared),
 };
 
 int main(int argc, char **argv)

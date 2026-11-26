@@ -226,12 +226,12 @@ static ath_status set_tokens(ath_tokens *dst, const int32_t *ids, size_t n)
 static ath_status keep_snapshot(session *s, const ath_tokens *ids, size_t stable)
 {
     if (!s->has_snap) {
-        if (ath_prefix_save(s->store, ids->ids, &s->state) != ATH_OK)
+        if (ath_prefix_save(s->store, ids->ids, &s->state, false) != ATH_OK)
             fprintf(stderr, "athanor chat: the snapshot of %zu tokens could not be stored\n", stable);
         return ATH_OK;
     }
     const bool continues = s->snap_n <= stable && common_prefix(&s->snap_ids, ids) >= s->snap_n;
-    if (s->snap_n && !continues && ath_prefix_save(s->store, s->snap_ids.ids, &s->snap) != ATH_OK)
+    if (s->snap_n && !continues && ath_prefix_save(s->store, s->snap_ids.ids, &s->snap, false) != ATH_OK)
         fprintf(stderr, "athanor chat: the snapshot of %zu tokens could not be stored\n", s->snap_n);
     ATH_CHECK(ath_state_copy(&s->snap, &s->state, &s->m));
     ATH_CHECK(set_tokens(&s->snap_ids, ids->ids, stable));
@@ -240,10 +240,12 @@ static ath_status keep_snapshot(session *s, const ath_tokens *ids, size_t stable
 }
 
 /* Bring the state to ids[0 .. stable) and then ids[stable .. n), keeping a
- * copy at stable. It starts from the longest prefix of ids at hand: the
- * state itself, the snapshot, a snapshot of the store (step 14), else the
- * start. Returns the prompt tokens actually run in *ran. */
-static ath_status prefill(session *s, const ath_tokens *ids, size_t stable, size_t *ran)
+ * copy at stable, and the shared part ids[0 .. shared) (the system prompt
+ * and tools) in the store if it is not there yet. It starts from the
+ * longest prefix of ids at hand: the state itself, the snapshot, a
+ * snapshot of the store (step 14), else the start. Returns the prompt
+ * tokens actually run in *ran. */
+static ath_status prefill(session *s, const ath_tokens *ids, size_t shared, size_t stable, size_t *ran)
 {
     const size_t goes_on = s->seen.n < ids->n && common_prefix(&s->seen, ids) == s->seen.n ? s->seen.n : 0;
     const size_t from_snap =
@@ -268,12 +270,20 @@ static ath_status prefill(session *s, const ath_tokens *ids, size_t stable, size
         ATH_CHECK(ath_state_reset(&s->state, &s->m));
         s->seen.n = 0;
     }
-    size_t start = s->seen.n;
-    if (start < stable) {
-        ATH_CHECK(feed(s, ids->ids, start, stable, false));
-        ATH_CHECK(keep_snapshot(s, ids, stable));
+    const size_t start = s->seen.n;
+    size_t at = start;
+    if (shared > at && shared < ids->n && !ath_prefix_has(s->store, ids->ids, (int32_t)shared)) {
+        ATH_CHECK(feed(s, ids->ids, at, shared, false));
+        if (ath_prefix_save(s->store, ids->ids, &s->state, true) != ATH_OK)
+            fprintf(stderr, "athanor chat: the snapshot of the shared %zu tokens could not be stored\n", shared);
+        at = shared;
     }
-    ATH_CHECK(feed(s, ids->ids, start > stable ? start : stable, ids->n, true));
+    if (at < stable) {
+        ATH_CHECK(feed(s, ids->ids, at, stable, false));
+        ATH_CHECK(keep_snapshot(s, ids, stable));
+        at = stable;
+    }
+    ATH_CHECK(feed(s, ids->ids, at, ids->n, true));
     *ran = ids->n - start;
     return ATH_OK;
 }
@@ -365,9 +375,16 @@ static ath_status turn(session *s, history *h, ath_arena *tmp)
         return ATH_ERR_RANGE;
     }
 
+    /* the shared part: the leading system messages and the tools, which the
+     * next run begins with too (step 14) */
+    size_t shared_n = ath_model_chat_shared(&s->m, &s->tok, h->msgs, h->n, s->tools, s->n_tools, ids.ids, ids.n,
+                                            s->scratch);
+    if (shared_n < ATH_PREFIX_SHARED_MIN)
+        shared_n = 0;
+
     double t0 = now_s();
     size_t ran;
-    ATH_CHECK(prefill(s, &ids, stable_n, &ran));
+    ATH_CHECK(prefill(s, &ids, shared_n, stable_n, &ran));
     double t1 = now_s();
 
     ath_parse_state ps = {.opts = opts, .tools = s->tools, .n_tools = s->n_tools, .a = tmp};
@@ -709,7 +726,7 @@ int ath_cmd_chat(ath_arena *a, int argc, char **argv)
     }
     /* the snapshot outlives the run through the store */
     if (s->store && o.snap_dir && s->has_snap && s->snap_n &&
-        ath_prefix_save(s->store, s->snap_ids.ids, &s->snap) != ATH_OK)
+        ath_prefix_save(s->store, s->snap_ids.ids, &s->snap, false) != ATH_OK)
         fprintf(stderr, "athanor chat: the snapshot of %zu tokens could not be stored\n", s->snap_n);
     ath_prefix_close(s->store);
     if (s->dec)

@@ -111,7 +111,7 @@ void ath_gen_close(ath_gen *g)
 {
     /* the snapshot on the device outlives the server through the store */
     if (g->store && g->snap_persist && g->has_snap && g->snap_n &&
-        ath_prefix_save(g->store, g->snap_ids.ids, &g->snap) != ATH_OK)
+        ath_prefix_save(g->store, g->snap_ids.ids, &g->snap, false) != ATH_OK)
         ath_log(ATH_LOG_WARN, "serve: the snapshot of %zu tokens could not be stored", g->snap_n);
     ath_prefix_close(g->store);
     g->store = NULL;
@@ -233,13 +233,13 @@ static ath_status reuse(ath_gen *g, const ath_tokens *ids, size_t *kept)
 static ath_status keep_snapshot(ath_gen *g, const ath_tokens *ids, size_t stable)
 {
     if (!g->has_snap) {
-        if (ath_prefix_save(g->store, ids->ids, &g->state) != ATH_OK)
+        if (ath_prefix_save(g->store, ids->ids, &g->state, false) != ATH_OK)
             ath_log(ATH_LOG_WARN, "serve: the snapshot of %zu tokens could not be stored", stable);
         g->snap_n = 0;
         return ATH_OK;
     }
     const bool continues = g->snap_n <= stable && common_prefix(&g->snap_ids, ids) >= g->snap_n;
-    if (g->snap_n && !continues && ath_prefix_save(g->store, g->snap_ids.ids, &g->snap) != ATH_OK)
+    if (g->snap_n && !continues && ath_prefix_save(g->store, g->snap_ids.ids, &g->snap, false) != ATH_OK)
         ath_log(ATH_LOG_WARN, "serve: the snapshot of %zu tokens could not be stored", g->snap_n);
     ATH_CHECK(ath_state_copy(&g->snap, &g->state, &g->m));
     ATH_CHECK(set_tokens(&g->snap_ids, ids->ids, stable));
@@ -251,10 +251,20 @@ static ath_status keep_snapshot(ath_gen *g, const ath_tokens *ids, size_t stable
  * snapshot (under a quarter) does not replace a longer one: an agent's side
  * request (a title, a summary) must not cost its conversation the next
  * prefill. Unless the snapshot has gone unused twice in a row: another
- * conversation now. */
-static ath_status prefill(ath_gen *g, const ath_tokens *ids, size_t stable, const ath_gen_sink *sink, bool *cancel)
+ * conversation now. Before that, the shared part (the system prompt and
+ * tools: step 14) goes to the store as shared, if it is not there yet. */
+static ath_status prefill(ath_gen *g, const ath_tokens *ids, size_t shared, size_t stable, const ath_gen_sink *sink,
+                          bool *cancel)
 {
     size_t start = g->seen.n;
+    if (shared > start && shared < ids->n && !ath_prefix_has(g->store, ids->ids, (int32_t)shared)) {
+        ATH_CHECK(feed(g, ids->ids, start, shared, false, sink, cancel));
+        if (*cancel)
+            return ATH_OK;
+        if (ath_prefix_save(g->store, ids->ids, &g->state, true) != ATH_OK)
+            ath_log(ATH_LOG_WARN, "serve: the snapshot of the shared %zu tokens could not be stored", shared);
+        start = shared;
+    }
     if (start < stable && 4 * stable < g->snap_n && g->snap_misses < 2)
         stable = start;   /* no new snapshot */
     if (start < stable) {
@@ -413,6 +423,7 @@ static void out_events(emitter *e, const ath_out_event *ev, int32_t n)
 
 /* ---- a request ------------------------------------------------------------------- */
 
+
 ath_status ath_gen_run(ath_gen *g, const ath_gen_request *r, const ath_gen_sink *sink, ath_gen_result *res,
                        ath_arena *a)
 {
@@ -439,12 +450,19 @@ ath_status ath_gen_run(ath_gen *g, const ath_gen_request *r, const ath_gen_sink 
         ath_log(ATH_LOG_WARN, "serve: a prompt of %zu tokens does not fit in a context of %d", ids.n, g->ctx);
         return ATH_ERR_RANGE;
     }
+    /* the shared part (the system prompt and tools), when long enough for a
+     * snapshot of its own (step 14) */
+    size_t shared_n = ath_model_chat_shared(&g->m, &g->tok, r->msgs, r->n_msgs, r->tools, r->n_tools, ids.ids, ids.n,
+                                            &g->scratch);
+    ath_log(ATH_LOG_DEBUG, "serve: the shared part is %zu tokens of %zu", shared_n, ids.n);
+    if (shared_n < ATH_PREFIX_SHARED_MIN)
+        shared_n = 0;
     size_t kept;
     ATH_CHECK(reuse(g, &ids, &kept));
     res->cached_tokens = (int32_t)kept;
     bool cancel = sink->begin && !sink->begin(sink->u, res);
     if (!cancel)
-        ATH_CHECK(prefill(g, &ids, stable_n, sink, &cancel));
+        ATH_CHECK(prefill(g, &ids, shared_n, stable_n, sink, &cancel));
     if (cancel) {
         res->finish = ATH_GEN_CANCELLED;
         return ATH_OK;

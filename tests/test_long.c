@@ -330,7 +330,7 @@ ATH_TEST(long_context)
         ath_prefix_store *ps;
         ATH_REQUIRE_OK(ath_prefix_open(&ps, &m, ATH_DTYPE_BF16, kv, &(ath_prefix_opts){.dir = dir}));
         ATH_REQUIRE_OK(ath_state_snap_load(&s, &m, N, 0, snap, bytes));
-        ATH_REQUIRE_OK(ath_prefix_save(ps, ids.ids, &s));
+        ATH_REQUIRE_OK(ath_prefix_save(ps, ids.ids, &s, false));
         t0 = now();
         ath_prefix_close(ps);
         const double t_write = now() - t0;

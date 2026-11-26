@@ -491,6 +491,17 @@ ath_status ath_model_chat(const ath_model *m, const ath_msg *msgs, int32_t n_msg
 ath_status ath_model_parse(const ath_model *m, ath_parse_state *st, const char *piece, size_t n,
                            ath_out_event *events, int32_t cap, int32_t *n_events);
 
+/* The part of a prompt other conversations begin with too (step 14): its
+ * leading system messages and its tools, and the header of the user
+ * message after them, in tokens: the prefix two renderings of them with
+ * different user messages have in common. 0 if there are no system
+ * messages nor tools, if a system message is the last one, or if that
+ * prefix does not begin ids[0, n). Working memory in scratch (reset to
+ * where it was). */
+size_t ath_model_chat_shared(const ath_model *m, const ath_tokenizer *tok, const ath_msg *msgs, int32_t n_msgs,
+                             const ath_tool_def *tools, int32_t n_tools, const int32_t *ids, size_t n,
+                             ath_arena *scratch);
+
 /* Families compiled into this binary (Makefile FAMILIES), in order. */
 size_t            ath_family_count(void);
 const ath_family *ath_family_at(size_t i);

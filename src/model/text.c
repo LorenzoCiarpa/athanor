@@ -48,6 +48,40 @@ ath_status ath_model_chat(const ath_model *m, const ath_msg *msgs, int32_t n_msg
     return m->family->chat(msgs, n_msgs, tools, n_tools, opts, out);
 }
 
+size_t ath_model_chat_shared(const ath_model *m, const ath_tokenizer *tok, const ath_msg *msgs, int32_t n_msgs,
+                             const ath_tool_def *tools, int32_t n_tools, const int32_t *ids, size_t n,
+                             ath_arena *scratch)
+{
+    int32_t n_sys = 0;
+    while (n_sys < n_msgs && msgs[n_sys].role == ATH_MSG_SYSTEM)
+        n_sys++;
+    if ((!n_sys && !n_tools) || n_sys == n_msgs || !scratch)
+        return 0;
+    const ath_arena_pos mark = ath_arena_mark(scratch);
+    ath_arena tk;   /* the tokenizer's working memory, apart from the tokens it writes */
+    ath_arena_init(&tk, 0);
+    ath_msg *two = ath_arena_alloc(scratch, (size_t)(n_sys + 1) * sizeof *two, _Alignof(ath_msg));
+    ath_buf b[2];
+    ath_tokens t[2];
+    bool ok = two != NULL;
+    for (int k = 0; ok && k < 2; k++) {
+        memcpy(two, msgs, (size_t)n_sys * sizeof *two);
+        two[n_sys] = (ath_msg){.role = ATH_MSG_USER, .content = k ? "b" : "a"};
+        ath_buf_init(&b[k], scratch);
+        ath_tokens_init(&t[k], scratch);
+        ok = ath_model_chat(m, two, n_sys + 1, tools, n_tools, 0, &b[k]) == ATH_OK &&
+             ath_tokenizer_encode(tok, b[k].data, b[k].len, &t[k], &tk) == ATH_OK;
+    }
+    size_t c = 0;
+    while (ok && c < t[0].n && c < t[1].n && t[0].ids[c] == t[1].ids[c])
+        c++;
+    if (!ok || c > n || memcmp(t[0].ids, ids, c * sizeof *ids))
+        c = 0;
+    ath_arena_free(&tk);
+    ath_arena_reset(scratch, mark);
+    return c;
+}
+
 ath_status ath_model_parse(const ath_model *m, ath_parse_state *st, const char *piece, size_t n,
                            ath_out_event *events, int32_t cap, int32_t *n_events)
 {

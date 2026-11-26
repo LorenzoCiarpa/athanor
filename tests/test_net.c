@@ -857,7 +857,7 @@ static bool answer_once(ath_test *t_, const char *dir, const ath_msg *msgs, int3
                         int32_t *cached, ath_arena *a)
 {
     static ath_gen g;
-    const ath_gen_opts go = {.ctx = 1024, .experts = -1, .seed = 1, .snap_dir = dir};
+    const ath_gen_opts go = {.ctx = 2048, .experts = -1, .seed = 1, .snap_dir = dir};
     if (ath_gen_open(&g, model_dir(), &go, a) != ATH_OK) {
         ATH_EXPECT(!"gen opens");
         return false;
@@ -883,7 +883,9 @@ static bool answer_once(ath_test *t_, const char *dir, const ath_msg *msgs, int3
 
 /* A server stopped and started again on the same snapshot folder starts a
  * conversation it has seen from the snapshot on disk: the prompt's stable
- * part cached, the same answer as the first time. */
+ * part cached, the same answer as the first time. Started once more, a new
+ * conversation with the same system prompt (over ATH_PREFIX_SHARED_MIN
+ * tokens: the next session of an agent) starts from the shared part. */
 ATH_TEST(serve_snapshots_resume)
 {
     char cfg[1024];
@@ -895,10 +897,16 @@ ATH_TEST(serve_snapshots_resume)
     ATH_REQUIRE(tmpdir_make(&d));
     char dir[600];
     snprintf(dir, sizeof dir, "%s/snapshots", d.path);
-    static const char sys[] =
-        "You are a careful assistant for a small library. You answer questions about books, authors and opening "
-        "hours. You keep answers short, you never invent titles, and when you do not know something you say so. "
-        "The library opens at nine and closes at six, every day but Sunday.";
+    ath_buf sb;
+    ath_buf_init(&sb, &a);
+    ath_buf_puts(&sb, "You are a careful assistant for a small library. You answer questions about books, authors and "
+                      "opening hours. You keep answers short, you never invent titles, and when you do not know "
+                      "something you say so. The library opens at nine and closes at six, every day but Sunday. ");
+    for (int i = 1; i <= 48; i++)
+        ath_buf_printf(&sb, "Shelf %d holds books on %s, sorted by the author's surname; ask at desk %d. ", i,
+                       (const char *const[]){"history", "poetry", "science", "travel", "cooking", "art"}[i % 6],
+                       1 + i % 3);
+    const char *sys = ath_buf_str(&sb);
     const ath_msg conv[] = {{.role = ATH_MSG_SYSTEM, .content = sys},
                             {.role = ATH_MSG_USER, .content = "When do you open?"},
                             {.role = ATH_MSG_ASSISTANT, .content = "At nine."},
@@ -913,6 +921,14 @@ ATH_TEST(serve_snapshots_resume)
         ATH_EXPECT(cached2 >= 64);
         ATH_EXPECT_STR_EQ(again, first);
     }
+    const ath_msg other[] = {{.role = ATH_MSG_SYSTEM, .content = sys},
+                             {.role = ATH_MSG_USER, .content = "Where are the poetry books?"}};
+    const char *third = NULL;
+    int32_t cached3 = -1;
+    if (answer_once(t_, dir, other, 2, &third, &cached3, &a)) {
+        printf("    a new conversation with the same system prompt: %d tokens cached from disk\n", cached3);
+        ATH_EXPECT(cached3 >= ATH_PREFIX_SHARED_MIN && cached3 < cached2);
+    }
     /* the folder and its snapshot */
     DIR *dd = opendir(dir);
     int files = 0;
@@ -922,7 +938,7 @@ ATH_TEST(serve_snapshots_resume)
             files += unlink(p) == 0;
     if (dd)
         closedir(dd);
-    ATH_EXPECT_EQ_INT(files, 1);
+    ATH_EXPECT_EQ_INT(files, 3);   /* the shared part, the first conversation, the second */
     rmdir(dir);
     rmdir(d.path);
     ath_arena_free(&a);

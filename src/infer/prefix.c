@@ -36,6 +36,7 @@ typedef struct {
     void    *data;             /* the payload in host memory, or NULL                */
     bool     on_disk;
     bool     dead;
+    bool     shared;           /* saved as a prefix other prompts begin with too     */
     uint64_t used;             /* clock of the last save or load                     */
     int32_t  next[2];          /* tokens seen after the prefix, up to two different  */
     int32_t  n_next;
@@ -204,12 +205,13 @@ static uint64_t file_bytes(const entry *e)
 typedef struct {
     int32_t  n, n_draft;
     uint64_t bytes, hash, ids_hash;
+    uint32_t flags;            /* 1: shared                                          */
 } header;
 
 /* Layout (little-endian): magic [0, 8), version and header size [8, 16),
  * identity [16, 48), act and kv dtypes [48, 56), n and n_draft [56, 64),
  * payload bytes [64, 72), payload hash [72, 80), tokens' hash [80, 88),
- * zeros, the hash of bytes [0, 120) at [120, 128). */
+ * flags [88, 92), zeros, the hash of bytes [0, 120) at [120, 128). */
 static void put_header(const ath_prefix_store *ps, const header *h, uint8_t b[HEADER])
 {
     memset(b, 0, HEADER);
@@ -223,6 +225,7 @@ static void put_header(const ath_prefix_store *ps, const header *h, uint8_t b[HE
     memcpy(b + 64, &h->bytes, 8);
     memcpy(b + 72, &h->hash, 8);
     memcpy(b + 80, &h->ids_hash, 8);
+    memcpy(b + 88, &h->flags, 4);
     const uint64_t self = xxh64(b, HEADER - 8);
     memcpy(b + HEADER - 8, &self, 8);
 }
@@ -247,6 +250,7 @@ static const char *get_header(const ath_prefix_store *ps, const uint8_t b[HEADER
     memcpy(&h->bytes, b + 64, 8);
     memcpy(&h->hash, b + 72, 8);
     memcpy(&h->ids_hash, b + 80, 8);
+    memcpy(&h->flags, b + 88, 4);
     if (h->n < 1 || h->n_draft < 0 || h->bytes > (1ull << 48))
         return "impossible sizes";
     return NULL;
@@ -308,7 +312,7 @@ static bool write_file(ath_prefix_store *ps, entry *e)
     if (!path_of(ps, e, path) || snprintf(tmp, sizeof tmp, "%s.%d.tmp", path, (int)getpid()) >= (int)sizeof tmp)
         return false;
     const header h = {e->n, e->n_draft, e->bytes, xxh64(e->data, e->bytes),
-                      xxh64(e->ids, (size_t)e->n * sizeof *e->ids)};
+                      xxh64(e->ids, (size_t)e->n * sizeof *e->ids), e->shared ? 1u : 0u};
     uint8_t hb[HEADER];
     put_header(ps, &h, hb);
     const int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
@@ -386,11 +390,11 @@ static void note_next(entry *e, int32_t tok)
         e->next[e->n_next++] = tok;
 }
 
-/* A longer snapshot begins with e's tokens, and they were only ever
- * followed one way. */
+/* A longer snapshot begins with e's tokens, they were only ever followed
+ * one way, and e was not saved as shared. */
 static bool superseded(const ath_prefix_store *ps, const entry *e)
 {
-    if (e->n_next >= 2)
+    if (e->n_next >= 2 || e->shared)
         return false;
     for (uint32_t i = 0; i < ps->n; i++) {
         const entry *f = &ps->e[i];
@@ -557,6 +561,7 @@ static ath_status scan(ath_prefix_store *ps)
             continue;
         }
         *e = (entry){.ids = ids, .n = h.n, .n_draft = h.n_draft, .bytes = h.bytes, .on_disk = true,
+                     .shared = h.flags & 1u,
                      .used = (uint64_t)sb.st_mtim.tv_sec * 1000000000ull + (uint64_t)sb.st_mtim.tv_nsec};
         if (e->used > ps->mtime)
             ps->mtime = e->used;
@@ -707,7 +712,12 @@ ath_status ath_prefix_load(ath_prefix_store *ps, const int32_t *ids, int32_t len
     return ATH_OK;
 }
 
-ath_status ath_prefix_save(ath_prefix_store *ps, const int32_t *ids, const ath_state *s)
+bool ath_prefix_has(ath_prefix_store *ps, const int32_t *ids, int32_t n)
+{
+    return ps && ids && n > 0 && exact(ps, ids, n) != NULL;
+}
+
+ath_status ath_prefix_save(ath_prefix_store *ps, const int32_t *ids, const ath_state *s, bool shared)
 {
     if (!ps || !ids || !s)
         return ATH_ERR_INVALID_ARG;
@@ -717,6 +727,7 @@ ath_status ath_prefix_save(ath_prefix_store *ps, const int32_t *ids, const ath_s
     entry *same = exact(ps, ids, n);
     if (same) {
         same->used = ++ps->clock;
+        same->shared |= shared;   /* on disk already: its header says otherwise until rewritten */
         return ATH_OK;
     }
     const double t0 = now();
@@ -731,7 +742,8 @@ ath_status ath_prefix_save(ath_prefix_store *ps, const int32_t *ids, const ath_s
         return st != ATH_OK ? st : ATH_ERR_NOMEM;
     }
     memcpy(cp, ids, (size_t)n * sizeof *cp);
-    *e = (entry){.ids = cp, .n = n, .n_draft = s->n_draft, .bytes = bytes, .data = data, .used = ++ps->clock};
+    *e = (entry){.ids = cp, .n = n, .n_draft = s->n_draft, .bytes = bytes, .data = data, .used = ++ps->clock,
+                 .shared = shared};
     ps->ram_used += bytes;
     /* how this prefix and the others continue one another */
     for (uint32_t i = 0; i < ps->n; i++) {

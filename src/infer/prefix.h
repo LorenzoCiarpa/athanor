@@ -21,9 +21,11 @@
  *
  * A snapshot goes to disk when it leaves host memory and when the store
  * closes, unless it is superseded: a longer stored snapshot begins with
- * its tokens, and its tokens were only ever followed one way. So the
- * earlier turns of a conversation are not written, while its latest turn
- * and a prefix several prompts share (a system prompt) are.
+ * its tokens, its tokens were only ever followed one way, and it was not
+ * saved as shared. So the earlier turns of a conversation are not
+ * written, while its latest turn is, and so is a shared prefix: the system
+ * prompt and tools that the next session of an agent begins with too,
+ * saved as such (and a prefix that turned out to branch).
  *
  * One thread at a time.
  */
@@ -35,6 +37,8 @@
 #define ATH_PREFIX_RAM_DEFAULT  (8ull << 30)    /* bytes of snapshots in host memory */
 #define ATH_PREFIX_DISK_DEFAULT (64ull << 30)   /* bytes of snapshot files           */
 #define ATH_PREFIX_MIN_TOKENS   64              /* shorter prefixes are not stored   */
+#define ATH_PREFIX_SHARED_MIN   1024            /* a shared part worth a snapshot of
+                                                 * its own (serve, chat)             */
 
 typedef struct ath_prefix_store ath_prefix_store;
 
@@ -74,10 +78,14 @@ int32_t    ath_prefix_find(ath_prefix_store *ps, const int32_t *ids, int32_t n);
  * reads back whole (the store forgets it); s is unchanged then. */
 ath_status ath_prefix_load(ath_prefix_store *ps, const int32_t *ids, int32_t len, int32_t n, ath_state *s);
 
-/* Store the state s, which holds ids[0, s->n_past). Prefixes under the
+/* Store the state s, which holds ids[0, s->n_past); shared: a prefix
+ * other prompts begin with too (never superseded). Prefixes under the
  * minimum length are not stored; a prefix already stored is only marked
- * used. */
-ath_status ath_prefix_save(ath_prefix_store *ps, const int32_t *ids, const ath_state *s);
+ * used (and shared, if it is now). */
+ath_status ath_prefix_save(ath_prefix_store *ps, const int32_t *ids, const ath_state *s, bool shared);
+
+/* true if ids[0, n) itself is stored. */
+bool       ath_prefix_has(ath_prefix_store *ps, const int32_t *ids, int32_t n);
 
 void       ath_prefix_get_stats(const ath_prefix_store *ps, ath_prefix_stats *out);
 

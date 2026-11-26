@@ -21,9 +21,11 @@
  * on the device goes there when a new one does not continue it (another
  * conversation, a branch) and when the server stops; when two states do
  * not fit in device memory (a long context) there is no snapshot on the
- * device and every one goes to the store. A request starts from the
- * longest prefix of its prompt that the state, the device's snapshot or
- * the store holds.
+ * device and every one goes to the store. The shared part of a prompt
+ * (its system messages and tools, ATH_PREFIX_SHARED_MIN tokens or more)
+ * also goes to the store, once, as shared: an agent's next session starts
+ * from it. A request starts from the longest prefix of its prompt that
+ * the state, the device's snapshot or the store holds.
  */
 #ifndef ATH_NET_GEN_H
 #define ATH_NET_GEN_H
