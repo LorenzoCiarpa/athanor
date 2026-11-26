@@ -6,7 +6,7 @@
 | --- | --- |
 | `http.c/.h` | HTTP/1.1: requests with a `Content-Length` or chunked body, `Expect: 100-continue`, keep-alive; whole responses or server-sent events in chunks; one `poll` loop over the listening socket and up to 32 connections |
 | `api.c/.h` | the three APIs: each request parsed into one `ath_api_request` (`ath_api_parse`, tested on fixtures), the generation's events written back in the request's format, streamed or whole; each API's error shapes |
-| `gen.c/.h` | generation for the server, whatever the API: the prompt (from a snapshot when it extends one), decoding (the GPU decoder, or the draft head's speculative decoder with `--mtp`), stop strings, whole UTF-8 characters, cancellation when the client goes away |
+| `gen.c/.h` | generation for the server, whatever the API: the prompt (from a snapshot when it extends one: the device's, or one of the store's in host memory and on disk, step 14), decoding (the GPU decoder, or the draft head's speculative decoder with `--mtp`), stop strings, whole UTF-8 characters, cancellation when the client goes away |
 
 ## Endpoints
 
@@ -35,10 +35,10 @@ Paths work with and without the `/v1` prefix; a query string is ignored (Claude 
 A recurrent state cannot be rolled back, so `gen.c` keeps a snapshot after each prompt's stable part (the conversation up to its last message, as `athanor chat` does) and a request goes on from:
 
 1. the state itself, when it holds a prefix of the new prompt (an agent's loop of tool calls usually does: the model's turn renders back as it was generated);
-2. else the snapshot, when its tokens are a prefix of the new prompt;
+2. else the longest prefix of the new prompt among the snapshot on the device and the store's snapshots (step 14: `src/infer/prefix.h`, in host memory and, with `--snapshots <dir>`, on disk across restarts);
 3. else the start.
 
-A prompt under a quarter of the snapshot's length (an agent's side request: OpenCode's title, a summary) does not replace it, unless the snapshot went unused twice in a row (another conversation). With Claude Code, Codex CLI and OpenCode the first request of a session runs its whole prompt (13k, 7k and 11k tokens with Qwen3.6-35B-A3B: about a minute at the 35B's prefill speed), and every later one runs only what it adds. Several snapshots, and prefix snapshots on disk, are later work (`docs/STATUS.md`).
+A prompt under a quarter of the snapshot's length (an agent's side request: OpenCode's title, a summary) does not replace it, unless the snapshot went unused twice in a row (another conversation). With Claude Code, Codex CLI and OpenCode the first request of a session runs its whole prompt (13k, 7k and 11k tokens with Qwen3.6-35B-A3B: about a minute at the 35B's prefill speed), and every later one runs only what it adds. Since step 14 the store keeps more snapshots: the device's goes there when a new one does not continue it (another conversation) and when the server stops, and the shared part of a prompt (its system messages and tools, 1024 tokens or more) goes there once. A new session of the same agent then starts from its system prompt, and a restarted server from what it had (`--snapshots <dir>`; `src/infer/README.md`, Prefix snapshots). Measured at 128k on Qwen3.5-9B: a new question on a 123,800-token document, after a restart, runs its prompt in 0.96 s instead of 187 s (`docs/results/2026-11-26-step14-long-context/`).
 
 ## Running it
 
@@ -46,7 +46,7 @@ A prompt under a quarter of the snapshot's length (an agent's side request: Open
 athanor serve models/Qwen3.6-35B-A3B --ctx 65536            # http://127.0.0.1:8080
 ```
 
-The server keeps two states of `--ctx` tokens on the GPU (state and snapshot: 1.31 GiB each at 64k for the 35B) and gives the experts the rest. Clients, with their configuration kept apart from the user's (as `tests/conformance/run.sh` does):
+The server keeps two states of `--ctx` tokens on the GPU (state and snapshot: 1.31 GiB each at 64k for the 35B) and gives the experts the rest. When a second one does not fit (Qwen3.5-9B at 128k: 4 GiB each), there is no snapshot on the device and the snapshots go to host memory. The KV cache can be int8 (`--kv q8`, a scale per 32 values: 18 KiB per token on the 9B instead of 32). A prompt runs in pieces of `--chunk` tokens (4096), whose working memory grows with them at about the same speed: at 128k in bf16 on the 9B, `--chunk 1024`. Clients, with their configuration kept apart from the user's (as `tests/conformance/run.sh` does):
 
 ```sh
 # Claude Code

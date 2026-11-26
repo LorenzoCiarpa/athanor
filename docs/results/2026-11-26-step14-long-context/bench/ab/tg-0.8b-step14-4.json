@@ -1,0 +1,13 @@
+{
+  "athanor_bench": 1,
+  "date": "2026-11-26T10:27:28Z",
+  "hardware": {"gpu": "NVIDIA GeForce RTX 5080", "gpu_memory_bytes": 16585719808, "compute_capability": "12.0", "pci_bus_id": "0000:01:00.0", "pcie": "32.0 GT/s PCIe x16 (maximum of the link)", "driver": "NVIDIA UNIX Open Kernel Module for x86_64  580.178.04  Release Build  (dvs-builder@U22-I3-AE18-16-4)  Tue Jul  7 12:18:12 UTC 2026", "cpu": "AMD Ryzen 7 9800X3D 8-Core Processor", "cpu_threads": 8, "ram": "62267304 kB", "ram_speed": "not recorded (reading it needs root)", "storage": "CT500P310SSD8                           "},
+  "software": {"athanor_commit": "v0.1-cpu-chat-68-g28d66853c7bf", "compiler": "gcc 15.2.0", "gpu_backend": "cuda", "runtime_version": 13050, "driver_api_version": 13000, "blas_version": 131000},
+  "model": {"dir": "models/Qwen3.5-0.8B", "family": "qwen35", "weights": "as stored in the checkpoint (safetensors: bf16, f32)", "files": [{"name": "model.safetensors-00001-of-00001.safetensors", "bytes": 1746942600, "sha256": "not hashed (--no-hash)", "hf_revision": "2fc06364715b967f1860aea9cf38778875588b17"}]},
+  "workload": {"tokens": "pseudo-random ids (ath_rng, seed 1)", "batch": 1, "prompt_chunk": 2048, "context": 129, "activations": "bf16", "sampling": "greedy", "decode": "decoder: one recorded graph per token, the choice on the GPU (step 9)", "device": "gpu"},
+  "method": {"warmup_runs": 1, "measured_runs": 10, "statistic": "median, with min and max", "timer": "CLOCK_MONOTONIC around whole calls; a GPU pass waits for its logits"},
+  "results": [
+    {"test": "tg128@d0", "generated": 128, "depth": 0, "tokens_per_s": {"median": 440.2359370836915, "min": 440.00289481065954, "max": 441.0882772574292, "runs": [440.0773097652035, 440.14548390589204, 440.95909761586245, 441.0882772574292, 440.19988583246436, 440.66374990019955, 440.00289481065954, 440.16559922640243, 441.03368289406677, 440.2719883349186]}, "ms_per_token": {"median": 2.271509257809612, "min": 2.2671198750003896, "max": 2.272712320291248, "runs": [2.2723280155787506, 2.271976054657898, 2.2677840312326225, 2.2671198750003896, 2.271695273407204, 2.2693039766181755, 2.272712320291248, 2.271872226629057, 2.2674005156204657, 2.27132324221202]}}
+  ],
+  "memory": {"device_used_before_bytes": 2107310080, "device_used_peak_bytes": 4152033280, "device_note": "all processes, from the driver (cudaMemGetInfo); before = after this process created its context", "process_peak_rss_bytes": 1811746816}
+}

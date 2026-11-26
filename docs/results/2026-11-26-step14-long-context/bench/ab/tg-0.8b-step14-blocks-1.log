@@ -1,0 +1,3 @@
+athanor bench: qwen35 on NVIDIA GeForce RTX 5080, context 129, 10 runs after 1 warm-up
+tg128@d0            441.0 tok/s  (min 425.3, max 441.9)  2.268 ms/token
+report: docs/results/2026-11-26-step14-long-context/bench/ab/tg-0.8b-step14-blocks-1.json

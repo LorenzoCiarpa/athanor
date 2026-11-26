@@ -213,8 +213,24 @@ Keys survive one scale per row; values do not: a few large values in a row coars
 | 0.8B, CPU | 3.39e-4 (3.02e-4) | 0.68 | 0 differences of 104 | 4.9e-4, 118 of 119 |
 | 0.8B, GPU | 4.95e-4 (4.40e-4) | 0.99 | 0 differences of 104 | 4.0e-4, 117 of 119 |
 | 9B, GPU | 1.78e-4 (1.86e-4) | 0.47 | 0 differences of 206 | 1.7e-4, 232 of 234 |
+| 9B, CPU | 1.78e-4 (1.28e-4) | 0.46 | 0 differences of 206 | 1.6e-4, 231 of 234 |
+| Qwen3.6-35B-A3B, GPU | 1.86e-3 (1.81e-3) | 0.62 | 0 differences of 180 | 1.9e-3, 232 of 234 |
 
 `test_engine` (`engine_decoder`) runs the recorded decode step over an int8 cache too: the tokens, and on the host the logits, of the same steps run directly, bit for bit.
+
+### Long context (step 14)
+
+`tests/test_long.c`, opt-in (`ATH_LONG=1`, minutes): a real model at a context that a prompt fills (`ATH_LONG_CTX`, default 131,072; `ATH_MODEL_DIR`). The prompt is some 5,800 short notes, with a passphrase a tenth of the way in and the question at the end. For the KV cache in bf16 and in int8:
+- the greedy answer names the passphrase;
+- the prompt in pieces of `ATH_LONG_CHUNK` and of 5/8 of it (whole chunks of 64) gives the same state and the same logits, bit for bit;
+- the int8 cache against the bf16 one at that depth: the bf16 answer's tokens fed to both, mean KL at most the bf16 noise (3.8e-4, the 9B's bf16 reference against fp32 on the forward records);
+- reported: prefill and decode times, device memory, the snapshot's size at 8k, 32k, 64k and the full length, the time to copy it out, write it and read it back.
+
+Qwen3.5-9B, 2026-11-26 (`docs/results/2026-11-26-step14-long-context/`): a prompt of 130,524 tokens, found with both caches, the same bits for pieces of 1024 and 640, int8 against bf16 KL 1.1e-5 with 24 of 24 greedy tokens.
+
+```
+ATH_LONG=1 ATH_LONG_CHUNK=1024 ATH_MODEL_DIR=models/Qwen3.5-9B ./build/cuda/test_long
+```
 
 ## Engine
 

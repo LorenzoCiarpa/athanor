@@ -570,7 +570,8 @@ static ath_status scan(ath_prefix_store *ps)
     }
     closedir(d);
     /* the files' times give the order of use; then the clock goes on from it */
-    qsort(ps->e, ps->n, sizeof *ps->e, by_used);
+    if (ps->n > 1)   /* qsort wants an array, even of none */
+        qsort(ps->e, ps->n, sizeof *ps->e, by_used);
     for (uint32_t i = 0; i < ps->n; i++)
         ps->e[i].used = ++ps->clock;
     /* how the prefixes on disk continue one another */

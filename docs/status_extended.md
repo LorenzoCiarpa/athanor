@@ -1436,6 +1436,17 @@ Commit `a7a2015`.
 | `src/infer/engine.c` | Changed | The weights in one allocation of their size: 256 MiB blocks left 1.15 GiB unused on the 9B, which a 128k bf16 cache needed |
 | `tools/chat.c`, `src/net/gen.c` | Changed | chat's prompt in pieces (`--chunk`); the server's hint on a prompt piece out of memory |
 
+Commits `0ed1c91` (128k), `2a5b862` (the shared part), `28d6685` (serve and chat resume at 128k).
+
+#### 14.7–14.8 Tests, report and documentation
+
+| File | Kind | What it is for |
+| --- | --- | --- |
+| `src/infer/prefix.c` | Changed | UBSan (`DEBUG=1`): no `qsort` of the store's empty list |
+| `docs/results/2026-11-26-step14-long-context/` | New | The report: 128k (`long/`), benchmarks and the A/B against step 13's build (`bench/`), `serve` and `chat` resuming from disk (`serve/`, `chat/`) |
+| `src/ops/README.md`, `src/infer/README.md`, `src/net/README.md`, `tools/README.md`, `tests/README.md` | Changed | The int8 cache, prefix snapshots, the server's snapshots and options, the tests and tolerances |
+| `docs/ARCHITECTURE.md`, `docs/PLAN.md`, `docs/program/PROGRAM.md`, `README.md`, `docs/STATUS.md` | Changed | Step 14's contract additions, the format's refinement, row 9, the status |
+
 ---
 
 ## Files by step

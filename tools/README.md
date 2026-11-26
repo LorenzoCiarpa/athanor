@@ -63,7 +63,8 @@ check    488 checkpoint tensors (1.63 GiB): 488 bound to 488 params (168 in igno
 ```
 athanor chat <model_dir> [-p <text>] [--system <text>] [--think] [--tools <file.json>]
              [--temp t] [--top-k k] [--top-p p] [--min-p p] [--seed n] [--max-tokens n]
-             [--ctx n] [--device cpu|gpu] [--threads n] [--f32] [--stats]
+             [--ctx n] [--device cpu|gpu] [--threads n] [--f32] [--stats] [--kv bf16|q8]
+             [--chunk n] [--snapshots dir] [--snap-ram GiB] [--snap-disk GiB] [--mtp]
 ```
 
 A conversation, through the contract only: the family's chat template renders the whole conversation, the tokenizer encodes it, the forward pass runs on the GPU (the engine, `src/infer/engine.h`) or on a thread pool on the CPU, `ath_sample_ref` picks each token on the host, and the family's parser splits the output into text, thinking and tool calls as it streams. With `-p` it answers one message and exits; otherwise it reads one message per line from stdin (a line ending in `\` continues), with `/reset`, `/tool <text>` and `/exit`.
@@ -74,6 +75,8 @@ A conversation, through the contract only: the family's chat template renders th
 - The state is reused across turns: only new tokens run when the prompt extends what the state has seen; otherwise a copy of the state taken at the end of the previous prompt's last message is restored (the template rewrites a past assistant turn), and only when that does not match either does the conversation run again.
 - `--device`: the GPU by default when the build has a GPU backend (`make cuda`) and the machine a device; otherwise, or with `--device cpu`, the CPU. Without a usable GPU the default falls back to the CPU with a note; `--device gpu` then fails instead. On the GPU the weights are copied to the device at start (1.40 GiB for Qwen3.5-0.8B) and the state and its copy live there.
 - `--ctx` bounds the conversation (default 8192 tokens); the KV cache and the copy are allocated for it. `--f32` runs with f32 activations. `--stats` prints the device at start and, after each answer, how many prompt tokens ran and the speeds.
+- `--kv q8` keeps the KV cache in int8 (step 14: a scale per 32 values, about half the memory). `--chunk` (4096) is the prompt's piece per forward call: fewer tokens, less device memory, about the same speed (Qwen3.5-9B at 128k in bf16 needs 1024).
+- `--snapshots <dir>` keeps prefix snapshots on disk too (step 14, `src/infer/README.md`): a conversation or a system prompt seen in an earlier run starts from its snapshot (with `--stats`, the line `[N tokens from a stored snapshot ...]`). `--snap-ram` and `--snap-disk` set the budgets (8 and 64 GiB). With `-p` the snapshots are kept only with a folder.
 
 ```
 $ athanor chat models/Qwen3.5-0.8B -p "What is the capital of Italy? Answer in one sentence." --temp 0
@@ -116,7 +119,8 @@ athanor bench models/Qwen3.5-0.8B -p 512,4096 -n 128 -d 0,4096,32768 -r 5 --json
 
 ```
 athanor serve <model_dir> [--host 127.0.0.1] [--port 8080] [--ctx 65536] [--experts n] [--no-think]
-              [--max-tokens n] [--server-sampling] [--mtp] [--dump dir] [--quiet]
+              [--max-tokens n] [--server-sampling] [--mtp] [--dump dir] [--quiet] [--kv bf16|q8]
+              [--chunk n] [--snapshots dir] [--snap-ram GiB] [--snap-disk GiB]
 ```
 
 The model behind the HTTP APIs of coding agents: Anthropic Messages (`/v1/messages`, Claude Code), OpenAI Responses (`/v1/responses`, Codex CLI) and OpenAI Chat Completions (`/v1/chat/completions`, OpenCode and most clients), streamed or whole, with tool calls; `/v1/models`. One request at a time; the server never runs a tool. `src/net/README.md` has the endpoints, how requests become messages, the prompt's snapshots and the clients' configuration; `tests/conformance/` runs a task set through the three harnesses.
@@ -133,3 +137,4 @@ serve: messages stream think: prompt 13267 (13138 cached) in 0.95 s, 129 out in 
 - `--no-think`: requests that do not say get no thinking. `--server-sampling`: the model card's sampling for every request.
 - `--mtp`: decode with the draft head: the same tokens; on a GPU slower than the default decoder until its passes are recorded too (`src/infer/README.md`).
 - `--dump <dir>`: every request body saved there, to see what a client sends.
+- `--kv q8`, `--chunk n`: as in `athanor chat`. `--snapshots <dir>` (step 14): prefix snapshots on disk, kept across restarts; the server writes them when it stops (SIGINT or SIGTERM) and when they leave host memory (`src/net/README.md`, The prompt's state).

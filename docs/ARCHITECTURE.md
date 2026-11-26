@@ -193,6 +193,8 @@ Step 12 added the routed experts of a MoE model to `ath_exec`, by addition: `exp
 
 Step 13 added the draft head (multi-token prediction), by addition: a flag `ATH_P_DRAFT` for its params, which come after the main ones with layers `n_layers` and on (`ath_model.n_draft_layers` of them; `ath_model.layers` lists them after the main ones); a state kind `ATH_STATE_HIDDEN` for the head's input waiting for the next token, and `ath_state.n_draft`, the positions the head has run, which `ath_state_copy` carries with `n_past`; `ath_batch.hidden`, every token's output after the final norm; and `ath_draft` with `ath_model_draft`, through the family's new `draft` member, which runs rows of the head (a position, the token after it, the main model's output there) and gives the last row's guess. The engine copies the head's params, and its placement places the head's routed experts, only when asked (`ath_place_opts.draft`), so a run without the head is as before. Speculative decoding (`src/infer/spec.c`) is written once over these, for every family that has a draft head. `ath_sampler` gained `presence` (the presence penalty), which the caller applies before choosing (`ath_presence_ref`, `ath_presence_gpu`; the decoder does).
 
+Step 14 added, by addition: the KV dtype of a state (`ath_state.kv`: the activation dtype, or int8 with a scale per group of `ath_state_spec.group` values of a row), with the layout of a KV buffer as part of the contract (keys, values, then in int8 their scales), so that a snapshot can keep the first rows of each; snapshots of a state trimmed to its tokens (`ath_state_snap_bytes`, `_save`, `_load`), whose bytes depend on neither the capacity nor the side; and `ath_model_chat_shared`, the part of a prompt other conversations begin with too (system messages and tools). The store of snapshots, in host memory and on disk, is a pipeline over these (`src/infer/prefix.c`).
+
 Step 9 made a decode step something that can be recorded once and replayed, for the decoder of `src/infer/` (one graph launch per token, the next token chosen on the GPU). Two additions to the contract, both by addition: `ath_batch` gained `pos` and `flags`, and a device batch (`ATH_BATCH_DEVICE`) has its tokens, positions and logits in the memory of the device the pass runs on, so the pass copies nothing to or from the host and waits for nothing; the host cannot check its token ids or positions, which the caller guarantees. And no op argument depends on `n_past` any more: the family writes the new keys and values into the cache at their positions (`ath_scatter_rows`) and gives attention the whole cache with the queries' positions (`ath_attn` with `pos`), so the work of a step is the same whatever the length of the sequence. A replayed step gives the logits of the same step run directly, bit for bit.
 
 ### Text
@@ -269,7 +271,7 @@ athanor/
 │   ├── model/     model.h registry.c state.c text.c
 │   ├── models/
 │   │   └── qwen35/  qwen35.h family.c config.c weights.c forward.c text.c [backward.c] [cuda/fused.cu]
-│   ├── infer/     engine.h engine.c (step 8; the decoder, step 9), tier.h tier.c (step 12), spec.h spec.c (step 13), state.c sched.c (later)
+│   ├── infer/     engine.h engine.c (step 8; the decoder, step 9), tier.h tier.c (step 12), spec.h spec.c (step 13), prefix.h prefix.c (step 14), sched.c (later)
 │   ├── quant/     formats.c rtn.c gptq.c awq.c recipe.c container.c gguf.c eval.c
 │   ├── ablit/     capture.c direction.c edit.c search.c eval.c
 │   ├── train/     loop.c optim.c lora.c hotcold.c data.c planner.c ckpt.c

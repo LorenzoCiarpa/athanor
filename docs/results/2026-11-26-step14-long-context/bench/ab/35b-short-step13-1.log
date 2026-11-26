@@ -1,0 +1,4 @@
+athanor bench: qwen35 on NVIDIA GeForce RTX 5080, context 161, 5 runs after 1 warm-up
+pp33                131.2 tok/s  (min 107.1, max 136.0)  TTFT 251.6 ms
+tg128@d32            83.3 tok/s  (min 82.2, max 87.6)  12.005 ms/token
+report: docs/results/2026-11-26-step14-long-context/bench/ab/35b-short-step13-1.json

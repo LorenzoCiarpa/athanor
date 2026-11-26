@@ -47,13 +47,32 @@ So 32 KiB per token in bf16 and 18 KiB in int8, plus 49 MiB. The copies run at a
 | --- | --- |
 | Qwen3.5-9B against its reference (the GGUF dequantized; `tests/golden/gguf.py`), bf16 | pooled KL ratio 0.33 (CPU), 0.49 (GPU); 0 greedy differences above the noise at 206 positions |
 | the same, f32 | logits within 1.6e-5 (CPU) and 1.1e-4 (GPU), residual stream within 2.0e-5 and 8.5e-5: within the 9B's tolerances, 5e-4 and 4e-4, set at four times the worst measured. Step 4's 1e-4 did not hold on the GPU: two ill-conditioned positions of the chat prompt amplify every device's rounding tenfold (`tests/README.md`) |
-| int8 KV against the fp32 reference, short prompts | KL ratio 0.68 and 0.99 on the 0.8B (CPU, GPU), 0.46 and 0.47 on the 9B; 0 greedy differences above the noise; bound 1.25, the bf16 reference with the same cache (`tests/golden/kv_int8.py`) |
+| int8 KV against the fp32 reference, short prompts | KL ratio 0.68 and 0.99 on the 0.8B (CPU, GPU), 0.46 and 0.47 on the 9B, 0.62 on Qwen3.6-35B-A3B (GPU); 0 greedy differences above the noise; bound 1.25, the bf16 reference with the same cache (`tests/golden/kv_int8.py`) |
 | int8 KV against bf16 KV, at 130,524 tokens | KL 1.1e-5, 24 of 24 greedy tokens (above) |
 | long caches, the kernels (`gpu_attn_long`) | decode and split-K at positions to 131,199 within the short caches' tolerance; tensor cores at 0.02 of their bound; the int8 cache bit for bit |
 
-**Nothing else changes** (criterion 5): RESULT-UNCHANGED.
+**Nothing else changes** (criterion 5). The numerics of the 0.8B and the 35B are those of before: the forward records, the decoder and the engine tests give the same results and bits (`make cuda test`). Speed, with step 13's commands (`bench/athanor-*.json`):
 
-**Build and tests** (criterion 6): RESULT-TESTS.
+| test | step 13's report | step 14 |
+| --- | --- | --- |
+| Qwen3.5-0.8B pp512 | 49,722 | 49,238 (48,110–49,512) |
+| Qwen3.5-0.8B pp4096 | 57,004 | 56,286 (55,982–56,845) |
+| Qwen3.5-0.8B tg128 at depth 0 | 446.4 | 434.5 (431.0–434.9) |
+| Qwen3.6-35B-A3B tg128 after 33 tokens | 92.7 | 82.6 (73.4–88.0) |
+| Qwen3.6-35B-A3B tg128 after 4096 tokens | 77.7 | 74.1 (72.4–75.8) |
+| Qwen3.6-35B-A3B prefill of 4096 tokens | 194.8 | 202.8 |
+
+The decodes came out under step 13's report, the 35B's with a wide range. So step 13's build (`main`, `f840d33`, in a worktree) and step 14's ran alternately right after (`bench/ab/`):
+
+| test | step 13's build | step 14's build |
+| --- | --- | --- |
+| 35B tg128 after 33 tokens, two rounds | 83.3, 89.8 | 84.1, 88.3 |
+| 0.8B tg128, four rounds of 10 runs | 446.3, 431.9, 445.8, 434.5 | 440.2, 440.4, 440.2, 440.2 |
+| the same, step 14 with the weights in 256 MiB blocks again | | 441.0, 439.5, 440.0, 440.3 |
+
+The same speed: step 13's own build is as far from its report today, as in step 13's own A/B. The weights' single allocation changes nothing for decode. The 35B keeps one more expert per layer in device memory (74 instead of 73), from the memory it frees.
+
+**Build and tests** (criterion 6). `make test` and `make cuda test` are green, and so is `DEBUG=1` (ASan and UBSan; the 35B's tests skipped with `ATH_MOE_DIR` unset, as in steps 12 and 13) green too, after one fix: UBSan caught `qsort` called on the store's empty list when a snapshot folder is new (undefined, harmless in practice; now skipped below two entries). compute-sanitizer: memcheck (with leak check), racecheck and initcheck on `gpu_kv_q8`; memcheck on `gpu_attn_long`, `engine_snapshots`, `engine_decoder`, the forward records on the GPU and `serve_snapshots_resume`. 0 errors, 0 hazards, 0 bytes leaked. No warnings.
 
 ## What the step changed on the way
 
