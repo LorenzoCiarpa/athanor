@@ -230,6 +230,35 @@ ath_status ath_attn_ref(const ath_tensor *q, const ath_tensor *k, const ath_tens
 ath_status ath_attn_gpu(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
                         const ath_tensor *pos, float scale, ath_dev_arena *scratch, ath_tensor *out);
 
+/* ---- kv.c (step 14): the KV cache in int8 ---------------------------------------
+ *
+ * A cache [S, nkv, d] of ATH_DTYPE_I8 with a scale per row (one token, one
+ * KV head) in scale [S, nkv] f32. A row x is stored as q = rint(x / s),
+ * s = max|x| / 127 (all zero for a zero row), and a value reads back as
+ * q · s rounded to the activation dtype (bf16 or f32): the int8 cache is
+ * the activation-dtype cache those values make, and attention over it
+ * (ath_attn_q8) gives, bit for bit, what ath_attn gives over that cache.
+ * The same arithmetic on the CPU and the GPU: the same bits. */
+
+/* The rows of x [T, nkv, d] (f32 or bf16) into the rows pos[t] of cache and
+ * scale. On the GPU pos is in device memory: a row whose position is
+ * outside [0, S) is not written. */
+ath_status ath_kv_store_ref(const ath_tensor *x, const ath_tensor *pos, ath_tensor *cache, ath_tensor *scale);
+ath_status ath_kv_store_gpu(const ath_device *d, const ath_tensor *x, const ath_tensor *pos, ath_tensor *cache,
+                            ath_tensor *scale);
+/* Rows [0, n) of cache read back into out [n, nkv, d] (f32 or bf16: the
+ * dtype they round to). */
+ath_status ath_kv_load_ref(const ath_tensor *cache, const ath_tensor *scale, ath_tensor *out);
+ath_status ath_kv_load_gpu(const ath_device *d, const ath_tensor *cache, const ath_tensor *scale, ath_tensor *out);
+/* ath_attn over int8 keys k [S, nkv, d] and values v [S, nkv, dv] with
+ * their scales ks, vs [S, nkv], read back in q's dtype. On the GPU the
+ * kernels of short batches (decode), whatever the number of queries. */
+ath_status ath_attn_q8_ref(const ath_tensor *q, const ath_tensor *k, const ath_tensor *ks, const ath_tensor *v,
+                           const ath_tensor *vs, const ath_tensor *pos, float scale, ath_tensor *out);
+ath_status ath_attn_q8_gpu(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *ks,
+                           const ath_tensor *v, const ath_tensor *vs, const ath_tensor *pos, float scale,
+                           ath_dev_arena *scratch, ath_tensor *out);
+
 /* ---- scatter.c (step 9) ---------------------------------------------------- */
 
 /* dst[idx[i]] = src[i] for every row i: src [n, ...] and dst [R, ...] of the
@@ -435,6 +464,12 @@ ath_status ath_matmul_n(const ath_device *d, ath_pool *pool, const ath_tensor *x
                         ath_tensor *const *out);
 ath_status ath_attn(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
                     const ath_tensor *pos, float scale, ath_dev_arena *scratch, ath_tensor *out);
+ath_status ath_kv_store(const ath_device *d, const ath_tensor *x, const ath_tensor *pos, ath_tensor *cache,
+                        ath_tensor *scale);
+ath_status ath_kv_load(const ath_device *d, const ath_tensor *cache, const ath_tensor *scale, ath_tensor *out);
+ath_status ath_attn_q8(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *ks,
+                       const ath_tensor *v, const ath_tensor *vs, const ath_tensor *pos, float scale,
+                       ath_dev_arena *scratch, ath_tensor *out);
 ath_status ath_conv(const ath_device *d, const ath_tensor *x, const ath_tensor *w, ath_tensor *state, ath_act act,
                     ath_tensor *out);
 ath_status ath_scatter_rows(const ath_device *d, const ath_tensor *src, const ath_tensor *idx, ath_tensor *dst);

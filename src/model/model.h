@@ -128,7 +128,16 @@ typedef struct {
     int32_t        layer;
     int64_t        fixed;       /* elements independent of the sequence length (CONV, RECURRENT) */
     int64_t        per_token;   /* elements per token (KV: keys and values)                      */
+    int64_t        row;         /* KV: elements of one row of the cache (a token's key or value
+                                 * for one head), which an int8 cache scales as one (step 14);
+                                 * 0: the state cannot hold this KV in int8                      */
 } ath_state_spec;
+
+/* A KV buffer of capacity C holds the keys [C, per_token / 2] and then the
+ * values [C, per_token / 2] (step 14 makes this layout part of the
+ * contract, for snapshots that keep the first rows only). In an int8 cache
+ * (ath_state.kv ATH_DTYPE_I8) both are int8, followed by the keys' row
+ * scales [C, per_token / 2 / row] and the values' (f32): ops.h, kv.c. */
 
 /* ---- text (step 5) ------------------------------------------------------------
  *
@@ -236,6 +245,7 @@ typedef struct {
     int32_t           capacity; /* tokens the KV buffers hold                                 */
     int32_t           n_past;   /* tokens processed so far: the position of the next token    */
     int32_t           n_draft;  /* positions the draft head has run: [0, n_draft) (step 13)   */
+    ath_dtype         kv;       /* the KV cache's elements: act, or ATH_DTYPE_I8 (step 14)    */
     void            **buf;      /* [n_states]: buf[i] holds m->states[i] (the pointer array
                                  * itself is always in host memory)                           */
     const ath_device *dev;      /* NULL: the buffers are in host memory; otherwise on dev     */
@@ -388,14 +398,25 @@ void ath_model_close(ath_model *m);
  * fit in size_t. */
 ath_status ath_state_bytes(const ath_model *m, ath_dtype act, int32_t capacity, size_t *bytes);
 
+/* The same with the KV cache in kv: act, or ATH_DTYPE_I8 (step 14), which
+ * every KV spec of the model must allow (row > 0). */
+ath_status ath_state_bytes_kv(const ath_model *m, ath_dtype act, ath_dtype kv, int32_t capacity, size_t *bytes);
+
+/* The bytes of buffer i of state s (m->states[i] at s's dtypes and capacity). */
+size_t ath_state_buf_bytes(const ath_model *m, const ath_state *s, uint32_t i);
+
 /* Allocate the state of one sequence in a and reset it. capacity >= 1. */
 ath_status ath_state_init(ath_state *s, const ath_model *m, ath_dtype act, int32_t capacity,
                           ath_arena *a);
+ath_status ath_state_init_kv(ath_state *s, const ath_model *m, ath_dtype act, ath_dtype kv, int32_t capacity,
+                             ath_arena *a);
 
 /* The same in the memory of device d (step 8): the buffers from mem, the
  * pointer array from a. */
 ath_status ath_state_init_gpu(ath_state *s, const ath_model *m, ath_dtype act, int32_t capacity,
                               const ath_device *d, ath_dev_arena *mem, ath_arena *a);
+ath_status ath_state_init_gpu_kv(ath_state *s, const ath_model *m, ath_dtype act, ath_dtype kv, int32_t capacity,
+                                 const ath_device *d, ath_dev_arena *mem, ath_arena *a);
 
 /* Start a new sequence: n_past = 0, conv and recurrent state zeroed. (The
  * KV cache is not cleared: positions at or past n_past are never read.) On
@@ -404,7 +425,7 @@ ath_status ath_state_init_gpu(ath_state *s, const ath_model *m, ath_dtype act, i
 ath_status ath_state_reset(ath_state *s, const ath_model *m);
 
 /* Copy the state of one sequence into another state of the same model,
- * activation dtype and capacity: every buffer and n_past. A copy taken at
+ * activation and KV dtypes and capacity: every buffer, n_past and n_draft. A copy taken at
  * a point the conversation will come back to (the end of a turn's stable
  * prefix) lets a pipeline resume there, since a recurrent state cannot be
  * rolled back. ATH_ERR_INVALID_ARG if the two states differ in dtype,

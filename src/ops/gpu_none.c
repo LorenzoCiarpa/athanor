@@ -214,3 +214,24 @@ ath_status ath_presence_launch(const ath_device *d, ath_tensor *logits, uint8_t 
     (void)d, (void)logits, (void)seen, (void)token, (void)penalty;
     return none("presence");
 }
+
+ath_status ath_attn_q8_launch(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *ks,
+                              const ath_tensor *v, const ath_tensor *vs, const ath_tensor *pos, float scale,
+                              float *part, ath_tensor *out)
+{
+    (void)d, (void)q, (void)k, (void)ks, (void)v, (void)vs, (void)pos, (void)scale, (void)part, (void)out;
+    return none("attn_q8");
+}
+
+ath_status ath_kv_store_launch(const ath_device *d, const ath_tensor *x, const ath_tensor *pos, ath_tensor *cache,
+                               ath_tensor *scale)
+{
+    (void)d, (void)x, (void)pos, (void)cache, (void)scale;
+    return none("kv_store");
+}
+
+ath_status ath_kv_load_launch(const ath_device *d, const ath_tensor *cache, const ath_tensor *scale, ath_tensor *out)
+{
+    (void)d, (void)cache, (void)scale, (void)out;
+    return none("kv_load");
+}

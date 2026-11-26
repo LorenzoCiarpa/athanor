@@ -154,6 +154,32 @@ Two more sets of forward records, in `forward_golden`'s layout, replayed by poin
   - f32: KL 3e-13, logits within 5.7e-6, residual stream within 5.1e-6.
   - bf16: the greedy token is right above the noise; the KL is reported, not gated (`ATH_FORWARD_NO_KL_GATE=1`). On random weights it is chance whether athanor's rounding or the reference's lands closer to fp32: the ratio measured 0.14 to 1.65 over five seeds.
 
+### Forward records of Qwen3.5-9B (step 14)
+
+`tests/golden/gguf.py` is `moe.py`'s method for a dense GGUF: Qwen3.5-9B in Q8_0 (`docs/contract/qwen35-9b.md`), one layer at a time over the dequantized weights, the same 4 prompts and 234 positions; `tests/golden/data/qwen35-9b/` (514 MiB, not committed). Both devices run it (the CPU in about 9 minutes, the GPU in seconds). Measured 2026-11-26:
+
+| Run | Check | CPU | GPU |
+| --- | --- | --- | --- |
+| bf16 | pooled KL against the fp32 reference; the bf16 reference: 3.829e-4 | 1.283e-4 (ratio 0.33) | 1.864e-4 (ratio 0.49) |
+| bf16 | greedy token where the margin exceeds the noise (0.238) | 0 differences of 206 | 0 differences of 206 |
+| f32 | residual stream, every layer (tolerance 4e-4) | 2.0e-5 | 8.5e-5 |
+| f32 | logits (tolerance 5e-4) | 1.6e-5 | 1.1e-4 |
+
+**Why this model has its own f32 tolerances** (`F32_TOL` in `test_forward.c`). The GPU's logits on the chat prompt measured 1.11e-4, over step 4's 1e-4, at position 20; its other positions stay within 4.7e-5, and the other prompts within 5e-6. The error per position and per layer (residual stream against the fp32 reference) shows where it comes from. Two positions are ill-conditioned: 20, the newline after `<|im_end|>`, and 21, the `<|im_start|>` after it. From layer 3 on, their error grows through Gated DeltaNet and attention layers alike, while every other position stays near 3e-6:
+
+| Position | Device | Entering layer 6 | Layer 10 | Layer 20 | Layer 30 |
+| --- | --- | --- | --- | --- | --- |
+| 20 | GPU | 4.5e-6 | 1.3e-5 | 7.2e-5 | 8.5e-5 |
+| 20 | CPU | 1.2e-6 | 2.7e-6 | 1.1e-5 | 1.4e-5 |
+| 21 | GPU | 3.6e-6 | 3.4e-5 | 3.4e-5 | 3.7e-5 |
+| 21 | CPU | 1.5e-6 | 6.5e-6 | 5.6e-6 | 4.8e-6 |
+
+The two devices amplify at the same positions, by a factor of 4 to 20 over these layers. The GPU enters the amplifying layers with a larger rounding difference (its sums go in another order), and the amplification does the rest. That is a property of the model on this prompt, not a kernel's error: no residual value is large there (at most 21, as at the other positions), the prompt in one call and one token at a time give the same bits, and the KL stays at 1e-9. The tolerances follow the usual rule, about four times the worst measured value: 5e-4 for the logits and 4e-4 for the residual stream (8.5e-5). An error of any real kernel, such as a value rounded to bf16, is 1e-2 or more.
+
+```
+ATH_MODEL_DIR=models/Qwen3.5-9B ATH_GOLDEN_DIR=tests/golden/data/qwen35-9b ./build/cuda/test_forward forward_golden
+```
+
 ## Engine
 
 Step 8 runs the forward pass on the GPU through the engine (`src/infer/engine.h`). Three checks hold it to the reference.

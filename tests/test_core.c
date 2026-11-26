@@ -505,6 +505,7 @@ ATH_TEST(dtype_table)
     ATH_EXPECT_EQ_U64(ath_dtype_size(ATH_DTYPE_U8), 1);
     ATH_EXPECT_EQ_U64(ath_dtype_size(ATH_DTYPE_F8_E4M3), 1);
     ATH_EXPECT_EQ_U64(ath_dtype_size(ATH_DTYPE_F8_E5M2), 1);
+    ATH_EXPECT_EQ_U64(ath_dtype_size(ATH_DTYPE_I8), 1);
     ATH_EXPECT_EQ_U64(ath_dtype_size(ATH_DTYPE_COUNT), 0);
     ATH_EXPECT_EQ_U64(ath_dtype_size(ATH_DTYPE_QUANT_FIRST), 0);
     ATH_EXPECT_STR_EQ(ath_dtype_name(ATH_DTYPE_BF16), "bf16");

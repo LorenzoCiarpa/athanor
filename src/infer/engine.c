@@ -101,9 +101,15 @@ void ath_engine_close(ath_engine *e)
 
 ath_status ath_engine_state(ath_engine *e, ath_state *s, ath_dtype act, int32_t capacity, ath_arena *a)
 {
+    return ath_engine_state_kv(e, s, act, act, capacity, a);
+}
+
+ath_status ath_engine_state_kv(ath_engine *e, ath_state *s, ath_dtype act, ath_dtype kv, int32_t capacity,
+                               ath_arena *a)
+{
     if (!e || !e->m)
         return ATH_ERR_INVALID_ARG;
-    return ath_state_init_gpu(s, e->m, act, capacity, &e->dev, &e->state_mem, a);
+    return ath_state_init_gpu_kv(s, e->m, act, kv, capacity, &e->dev, &e->state_mem, a);
 }
 
 /* ---- decoding ------------------------------------------------------------------- */

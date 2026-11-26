@@ -27,7 +27,8 @@ static ath_status declare_states(ath_model *m, ath_arena *a, ath_qwen35_model *q
         ath_qwen35_layer *L = &q->layer[l];
         if (c->mixer[l] == ATH_QWEN35_ATTENTION) {
             L->kv = (int32_t)m->n_states;
-            m->states[m->n_states++] = (ath_state_spec){.kind = ATH_STATE_KV, .layer = l, .per_token = 2 * kv};
+            m->states[m->n_states++] = (ath_state_spec){
+                .kind = ATH_STATE_KV, .layer = l, .per_token = 2 * kv, .row = c->head_dim};
         } else {
             L->conv_state = (int32_t)m->n_states;
             m->states[m->n_states++] = (ath_state_spec){
@@ -42,7 +43,8 @@ static ath_status declare_states(ath_model *m, ath_arena *a, ath_qwen35_model *q
      * waiting for the next token (the main model's last output) */
     for (int32_t i = 0; i < q->n_draft; i++) {
         q->draft[i].kv = (int32_t)m->n_states;
-        m->states[m->n_states++] = (ath_state_spec){.kind = ATH_STATE_KV, .layer = c->n_layers + i, .per_token = 2 * kv};
+        m->states[m->n_states++] = (ath_state_spec){
+            .kind = ATH_STATE_KV, .layer = c->n_layers + i, .per_token = 2 * kv, .row = c->head_dim};
     }
     if (q->n_draft) {
         q->d_hidden = (int32_t)m->n_states;

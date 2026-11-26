@@ -79,6 +79,7 @@ typedef struct {
     uint64_t seed;           /* of the sampling                                    */
     bool    cpu;             /* run on the CPU even with a GPU                     */
     bool    mtp;             /* decode speculatively with the draft head (step 13) */
+    bool    kv8;             /* the KV cache in int8 (step 14)                     */
 } ath_gen_opts;
 
 typedef struct {

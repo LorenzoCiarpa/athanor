@@ -62,6 +62,25 @@ ath_status ath_attn(const ath_device *d, const ath_tensor *q, const ath_tensor *
     return d ? ath_attn_gpu(d, q, k, v, pos, scale, scratch, out) : ath_attn_ref(q, k, v, pos, scale, out);
 }
 
+ath_status ath_kv_store(const ath_device *d, const ath_tensor *x, const ath_tensor *pos, ath_tensor *cache,
+                        ath_tensor *scale)
+{
+    return d ? ath_kv_store_gpu(d, x, pos, cache, scale) : ath_kv_store_ref(x, pos, cache, scale);
+}
+
+ath_status ath_kv_load(const ath_device *d, const ath_tensor *cache, const ath_tensor *scale, ath_tensor *out)
+{
+    return d ? ath_kv_load_gpu(d, cache, scale, out) : ath_kv_load_ref(cache, scale, out);
+}
+
+ath_status ath_attn_q8(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *ks,
+                       const ath_tensor *v, const ath_tensor *vs, const ath_tensor *pos, float scale,
+                       ath_dev_arena *scratch, ath_tensor *out)
+{
+    return d ? ath_attn_q8_gpu(d, q, k, ks, v, vs, pos, scale, scratch, out)
+             : ath_attn_q8_ref(q, k, ks, v, vs, pos, scale, out);
+}
+
 ath_status ath_matmul_n(const ath_device *d, ath_pool *pool, const ath_tensor *x, int n, const ath_tensor *const *w,
                         ath_tensor *const *out)
 {

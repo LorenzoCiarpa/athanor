@@ -63,6 +63,8 @@ void ath_cmd_chat_usage(FILE *out)
             "  --experts <n>        MoE: routed experts per layer kept in device memory\n"
             "                       (default: as many as fit; the rest run on the CPU)\n"
             "  --f32                f32 activations instead of bf16 (slower)\n"
+            "  --kv <bf16|q8>       the KV cache in the activation dtype (default) or in int8\n"
+            "                       with a scale per token and head (half the memory)\n"
             "  --mtp                decode speculatively with the model's draft head: the same\n"
             "                       tokens, fewer passes (on a GPU slower than the default\n"
             "                       decoder until its passes are recorded too)\n"
@@ -71,7 +73,7 @@ void ath_cmd_chat_usage(FILE *out)
 
 typedef struct {
     const char  *dir, *prompt, *system, *tools_file, *device;
-    bool         think, f32, stats, mtp;
+    bool         think, f32, stats, mtp, kv8;
     ath_sampler  sampler;
     bool         temp_set, top_p_set;
     uint64_t     seed;
@@ -464,6 +466,7 @@ static int parse_options(options *o, int argc, char **argv)
         else if (!strcmp(a, "--threads") && num(v, 1, 4096, &x)) o->threads = (int32_t)x;
         else if (!strcmp(a, "--experts") && num(v, 0, 1e6, &x)) o->experts = (int32_t)x;
         else if (!strcmp(a, "--device") && (!strcmp(v, "cpu") || !strcmp(v, "gpu"))) o->device = v;
+        else if (!strcmp(a, "--kv") && (!strcmp(v, "bf16") || !strcmp(v, "q8"))) o->kv8 = !strcmp(v, "q8");
         else if (a[0] == '-')
             return usage_error("bad option or value:", a);
         else if (!o->dir) {
@@ -557,6 +560,7 @@ int ath_cmd_chat(ath_arena *a, int argc, char **argv)
         return ATH_EXIT_FAILURE;
     }
     const ath_dtype act = o.f32 ? ATH_DTYPE_F32 : ATH_DTYPE_BF16;
+    const ath_dtype kv = o.kv8 ? ATH_DTYPE_I8 : act;
     float *lg = ath_arena_alloc(a, (size_t)s->m.vocab_size * sizeof *lg, _Alignof(float));
     if (!lg)
         st = ATH_ERR_NOMEM;
@@ -582,9 +586,9 @@ int ath_cmd_chat(ath_arena *a, int argc, char **argv)
     }
     if (st == ATH_OK && s->engine) {
         s->exec = s->engine->exec;
-        st = ath_engine_state(s->engine, &s->state, act, o.ctx, a);
+        st = ath_engine_state_kv(s->engine, &s->state, act, kv, o.ctx, a);
         if (st == ATH_OK && !o.prompt)
-            st = ath_engine_state(s->engine, &s->snap, act, o.ctx, a);
+            st = ath_engine_state_kv(s->engine, &s->snap, act, kv, o.ctx, a);
         if (st == ATH_OK && !o.mtp) {
             ath_decoder *dec = ath_arena_zalloc(a, sizeof *dec, _Alignof(ath_decoder));
             st = dec ? ath_decoder_open(dec, s->engine, &s->state, &o.sampler, a) : ATH_ERR_NOMEM;
@@ -595,9 +599,9 @@ int ath_cmd_chat(ath_arena *a, int argc, char **argv)
             fprintf(stderr, "athanor chat: on %s, %.2f GiB of weights\n", s->engine->dev.name,
                     (double)s->engine->weight_bytes / 1073741824.0);
     } else if (st == ATH_OK) {
-        st = ath_state_init(&s->state, &s->m, act, o.ctx, a);
+        st = ath_state_init_kv(&s->state, &s->m, act, kv, o.ctx, a);
         if (st == ATH_OK && !o.prompt)
-            st = ath_state_init(&s->snap, &s->m, act, o.ctx, a);
+            st = ath_state_init_kv(&s->snap, &s->m, act, kv, o.ctx, a);
     }
     if (st == ATH_OK)
         st = ath_pool_init(&s->pool, o.threads, a);

@@ -5,9 +5,7 @@
 
 static size_t buf_bytes(const ath_model *m, const ath_state *s, uint32_t i)
 {
-    const ath_state_spec *sp = &m->states[i];
-    const size_t es = ath_dtype_size(sp->kind == ATH_STATE_RECURRENT ? ATH_DTYPE_F32 : s->act);
-    return (size_t)(sp->fixed + sp->per_token * s->capacity) * es;
+    return ath_state_buf_bytes(m, s, i);
 }
 
 static bool fixed_size(ath_state_kind k)

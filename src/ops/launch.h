@@ -55,6 +55,16 @@ ath_status ath_elem_launch(const ath_device *d, ath_elem_kind kind, const ath_te
  * (pieces = ceil(S / ATH_ATTN_SPLIT)); pos may be NULL. */
 ath_status ath_attn_launch(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *v,
                            const ath_tensor *pos, float scale, float *part, ath_tensor *out);
+/* The same over an int8 cache: k and v ATH_DTYPE_I8 with their row scales
+ * ks and vs, read back in q's dtype (step 14). */
+ath_status ath_attn_q8_launch(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *ks,
+                              const ath_tensor *v, const ath_tensor *vs, const ath_tensor *pos, float scale,
+                              float *part, ath_tensor *out);
+/* The int8 KV cache (kv.c, step 14). */
+ath_status ath_kv_store_launch(const ath_device *d, const ath_tensor *x, const ath_tensor *pos, ath_tensor *cache,
+                               ath_tensor *scale);
+ath_status ath_kv_load_launch(const ath_device *d, const ath_tensor *cache, const ath_tensor *scale,
+                              ath_tensor *out);
 /* Prompts on the tensor cores (attn_mma.cu, step 10): whether the kernel
  * takes these tensors on d (bf16, d == dv, a multiple of 16 up to 256, an
  * NVIDIA GPU of compute capability 8 or more), and the launch. */

@@ -75,6 +75,8 @@ void ath_cmd_bench_usage(FILE *out)
             "  --json <file>         write the report there\n"
             "  --direct              decode with one forward call per token and the logits on\n"
             "                        the host (step 8), not with the decoder's graph\n"
+            "  --kv <bf16|q8>        the KV cache in bf16 (default) or int8 with a scale per token\n"
+            "                        and head (step 14)\n"
             "  --mtp                 decode speculatively with the model's draft head (multi-token\n"
             "                        prediction, step 13): tg tests also report the guesses kept\n"
             "  --no-hash             do not hash the weight files for the report\n",
@@ -91,6 +93,7 @@ typedef struct {
     uint64_t    seed;
     bool        hash, direct;
     bool        mtp;        /* decode with the draft head (step 13) */
+    bool        kv8;        /* the KV cache in int8 (step 14) */
 } options;
 
 typedef struct {
@@ -566,6 +569,8 @@ static int parse(int argc, char **argv, options *o)
             o->direct = true, takes = false;
         else if (!strcmp(a, "--mtp"))
             o->mtp = true, takes = false;
+        else if (!strcmp(a, "--kv") && v && (!strcmp(v, "bf16") || !strcmp(v, "q8")))
+            o->kv8 = !strcmp(v, "q8");
         else if (!strcmp(a, "--no-hash"))
             o->hash = false, takes = false;
         else if (a[0] != '-' && !o->model)
@@ -649,7 +654,7 @@ int ath_cmd_bench(ath_arena *a, int argc, char **argv)
         st = b.e ? ath_engine_open_tier(b.e, &b.m, 0, &po, a) : ATH_ERR_NOMEM;
         if (st == ATH_OK) {
             b.exec = b.e->exec;
-            st = ath_engine_state(b.e, &b.st, ATH_DTYPE_BF16, (int32_t)ctx, a);
+            st = ath_engine_state_kv(b.e, &b.st, ATH_DTYPE_BF16, o.kv8 ? ATH_DTYPE_I8 : ATH_DTYPE_BF16, (int32_t)ctx, a);
         }
         if (st == ATH_OK && !o.direct && !o.mtp) {
             st = ath_decoder_open(&b.dc, b.e, &b.st, &b.greedy, a);
@@ -660,7 +665,7 @@ int ath_cmd_bench(ath_arena *a, int argc, char **argv)
         b.pool_open = st == ATH_OK;
         b.exec = (ath_exec){.pool = &b.pool};
         if (st == ATH_OK)
-            st = ath_state_init(&b.st, &b.m, ATH_DTYPE_BF16, (int32_t)ctx, a);
+            st = ath_state_init_kv(&b.st, &b.m, ATH_DTYPE_BF16, o.kv8 ? ATH_DTYPE_I8 : ATH_DTYPE_BF16, (int32_t)ctx, a);
     }
     if (st == ATH_OK && o.mtp) {
         st = ath_spec_open(&b.sp, &b.m, &b.st, &b.exec, &b.greedy, o.chunk, a);

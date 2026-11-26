@@ -44,6 +44,41 @@
 #define ATTN_VKEYS 4             /* keys whose values are loaded at once    */
 #define ATTN_KREG (ATH_ATTN_MAX_DV / ATH_WARP)
 
+/* Keys or values as the kernels read them: f32 or bf16, or (step 14) an
+ * int8 cache with a scale per row (one token, one KV head) read back as
+ * q · s rounded to rnd, the queries' dtype; the arithmetic after the load
+ * is the same either way, so attention over an int8 cache gives the bits it
+ * gives over the cache those values make. */
+typedef struct {
+    const void  *p;
+    int          dt;     /* ATH_DTYPE_F32, ATH_DTYPE_BF16 or ATH_DTYPE_I8 */
+    const float *s;      /* I8: the row scales                            */
+    int          rnd;    /* I8: the dtype the values round to             */
+} kvsrc;
+
+/* Element i of a [S, nkv, n] buffer whose rows have n elements. */
+static __device__ __forceinline__ float kv_ld(kvsrc a, int64_t i, int64_t n)
+{
+    if (a.dt == ATH_DTYPE_I8)
+        return k_round(a.rnd, __fmul_rn((float)((const int8_t *)a.p)[i], a.s[i / n]));
+    return k_ld(a.p, a.dt, i);
+}
+
+/* Elements 8e … 8e + 7, in one row (n a multiple of 8). */
+static __device__ __forceinline__ void kv_ld8(kvsrc a, int64_t e, int64_t n, float f[8])
+{
+    if (a.dt != ATH_DTYPE_I8) {
+        k_ld8(a.p, a.dt, e, f);
+        return;
+    }
+    const uint2 u = ((const uint2 *)a.p)[e];
+    const float s = a.s[8 * e / n];
+    const uint32_t w[2] = {u.x, u.y};
+#pragma unroll
+    for (int i = 0; i < 8; i++)
+        f[i] = k_round(a.rnd, __fmul_rn((float)(int8_t)(w[i / 4] >> (8 * (i % 4))), s));
+}
+
 /* The position of query t, or -1 if it is outside [0, S). */
 static __device__ __forceinline__ int64_t attn_last(const int32_t *pos, int64_t S, int64_t T, int64_t t)
 {
@@ -55,8 +90,8 @@ static __device__ __forceinline__ int64_t attn_last(const int32_t *pos, int64_t 
  * whose queries are in qs [G][d] (shared). Each thread owns the output
  * elements tid, tid + ATTN_THREADS, ... of each head; m and l are the same
  * on every thread. sc is shared [G][ATTN_TILE]. */
-static __device__ __forceinline__ void attn_piece(const float *qs, float *sc, int G, const void *k, int kdt,
-                                                  const void *v, int vdt, int64_t nkv, int64_t kh, int64_t d,
+static __device__ __forceinline__ void attn_piece(const float *qs, float *sc, int G, kvsrc k, kvsrc v,
+                                                  int64_t nkv, int64_t kh, int64_t d,
                                                   int64_t dv, float scale, int64_t j0, int64_t j1,
                                                   float m[ATTN_MAX_GROUP], float l[ATTN_MAX_GROUP],
                                                   float acc[ATTN_MAX_GROUP][ATTN_PER_THREAD])
@@ -78,7 +113,7 @@ static __device__ __forceinline__ void attn_piece(const float *qs, float *sc, in
             float kr[ATTN_KREG];
 #pragma unroll
             for (int i = 0; i < ATTN_KREG; i++)
-                kr[i] = lane + (int64_t)i * ATH_WARP < d ? k_ld(k, kdt, kb + lane + (int64_t)i * ATH_WARP) : 0.0f;
+                kr[i] = lane + (int64_t)i * ATH_WARP < d ? kv_ld(k, kb + lane + (int64_t)i * ATH_WARP, d) : 0.0f;
             for (int g = 0; g < G; g++) {
                 float s = 0.0f;
 #pragma unroll
@@ -116,7 +151,7 @@ static __device__ __forceinline__ void attn_piece(const float *qs, float *sc, in
 #pragma unroll
                 for (int r = 0; r < ATTN_PER_THREAD; r++) {
                     const int64_t i = tid + (int64_t)r * ATTN_THREADS;
-                    vv[q][r] = j0 + q < n && i < dv ? k_ld(v, vdt, vb + i) : 0.0f;
+                    vv[q][r] = j0 + q < n && i < dv ? kv_ld(v, vb + i, dv) : 0.0f;
                 }
             }
 #pragma unroll
@@ -167,7 +202,7 @@ static __device__ __forceinline__ void attn_store(void *out, int odt, int64_t ro
 
 /* rows: one block per (query, head), its pieces in order. */
 static __global__ void __launch_bounds__(ATTN_THREADS)
-attn_rows(const void *q, int qdt, const void *k, int kdt, const void *v, int vdt, const int32_t *pos, void *out,
+attn_rows(const void *q, int qdt, kvsrc k, kvsrc v, const int32_t *pos, void *out,
           int odt, int64_t T, int64_t S, int64_t nh, int64_t nkv, int64_t d, int64_t dv, float scale)
 {
     extern __shared__ float sh[];
@@ -184,7 +219,7 @@ attn_rows(const void *q, int qdt, const void *k, int kdt, const void *v, int vdt
     for (int64_t j0 = 0; j0 <= last; j0 += ATH_ATTN_SPLIT) {
         const int64_t j1 = j0 + ATH_ATTN_SPLIT < last + 1 ? j0 + ATH_ATTN_SPLIT : last + 1;
         float mp[ATTN_MAX_GROUP], lp[ATTN_MAX_GROUP], ap[ATTN_MAX_GROUP][ATTN_PER_THREAD];
-        attn_piece(qs, sc, 1, k, kdt, v, vdt, nkv, kh, d, dv, scale, j0, j1, mp, lp, ap);
+        attn_piece(qs, sc, 1, k, v, nkv, kh, d, dv, scale, j0, j1, mp, lp, ap);
         attn_combine(&m, &l, acc, mp[0], lp[0], ap[0]);
     }
     attn_store(out, odt, th, dv, l, acc, last >= 0);
@@ -194,7 +229,7 @@ attn_rows(const void *q, int qdt, const void *k, int kdt, const void *v, int vdt
  * the partials of those heads to part [T, nh, pieces, dv + 2] as m, l,
  * acc[0 .. dv). */
 static __global__ void __launch_bounds__(ATTN_THREADS)
-attn_split(const void *q, int qdt, const void *k, int kdt, const void *v, int vdt, const int32_t *pos,
+attn_split(const void *q, int qdt, kvsrc k, kvsrc v, const int32_t *pos,
            float *part, int64_t T, int64_t S, int64_t nh, int64_t nkv, int64_t d, int64_t dv, float scale, int G)
 {
     extern __shared__ float sh[];
@@ -209,7 +244,7 @@ attn_split(const void *q, int qdt, const void *k, int kdt, const void *v, int vd
         qs[i] = k_ld(q, qdt, (t * nh + h0) * d + i);
     __syncthreads();
     float m[ATTN_MAX_GROUP], l[ATTN_MAX_GROUP], acc[ATTN_MAX_GROUP][ATTN_PER_THREAD];
-    attn_piece(qs, sc, G, k, kdt, v, vdt, nkv, kh, d, dv, scale, j0, j1, m, l, acc);
+    attn_piece(qs, sc, G, k, v, nkv, kh, d, dv, scale, j0, j1, m, l, acc);
 #pragma unroll
     for (int g = 0; g < ATTN_MAX_GROUP; g++) {
         if (g >= G)
@@ -274,8 +309,8 @@ static __device__ __forceinline__ float k_warp_max(float v)
     return v;
 }
 
-static __device__ __forceinline__ void fast_piece(const float *qs, float *sc, float *xch, float *st, int G, const void *k,
-                                                  int kdt, const void *v, int vdt, int64_t nkv, int64_t kh, int64_t d,
+static __device__ __forceinline__ void fast_piece(const float *qs, float *sc, float *xch, float *st, int G, kvsrc k,
+                                                  kvsrc v, int64_t nkv, int64_t kh, int64_t d,
                                                   int64_t dv, float scale, int64_t j0, int64_t j1,
                                                   float m[ATTN_MAX_GROUP], float l[ATTN_MAX_GROUP],
                                                   float accp[ATTN_MAX_GROUP][8])
@@ -298,7 +333,7 @@ static __device__ __forceinline__ void fast_piece(const float *qs, float *sc, fl
         for (int q = 0; q < FAST_KEYS; q++) {
             const int jj = warp * FAST_KEYS + q;
             if (jj < n && kq)
-                k_ld8(k, kdt, (((t0 + jj) * nkv + kh) * d) / 8 + lane, kv[q]);
+                kv_ld8(k, (((t0 + jj) * nkv + kh) * d) / 8 + lane, d, kv[q]);
             else
 #pragma unroll
                 for (int i = 0; i < 8; i++)
@@ -352,7 +387,7 @@ static __device__ __forceinline__ void fast_piece(const float *qs, float *sc, fl
         for (int q = 0; q < FAST_KEYS; q++) {
             const int jj = warp * FAST_KEYS + q;
             if (jj < n && vq)
-                k_ld8(v, vdt, (((t0 + jj) * nkv + kh) * dv) / 8 + lane, kv[q]);
+                kv_ld8(v, (((t0 + jj) * nkv + kh) * dv) / 8 + lane, dv, kv[q]);
         }
 #pragma unroll
         for (int q = 0; q < FAST_KEYS; q++) {
@@ -395,7 +430,7 @@ static __device__ __forceinline__ void fast_piece(const float *qs, float *sc, fl
 }
 
 static __global__ void __launch_bounds__(ATTN_THREADS)
-fast_rows(const void *q, int qdt, const void *k, int kdt, const void *v, int vdt, const int32_t *pos, void *out,
+fast_rows(const void *q, int qdt, kvsrc k, kvsrc v, const int32_t *pos, void *out,
           int odt, int64_t T, int64_t S, int64_t nh, int64_t nkv, int64_t d, int64_t dv, float scale)
 {
     __shared__ float qs[FAST_DIM], sc[ATTN_TILE], st[3], xch[FAST_WARPS * ATTN_MAX_GROUP * FAST_DIM];
@@ -416,7 +451,7 @@ fast_rows(const void *q, int qdt, const void *k, int kdt, const void *v, int vdt
     for (int64_t j0 = 0; j0 <= last; j0 += ATH_ATTN_SPLIT) {
         const int64_t j1 = j0 + ATH_ATTN_SPLIT < last + 1 ? j0 + ATH_ATTN_SPLIT : last + 1;
         float mp[ATTN_MAX_GROUP], lp[ATTN_MAX_GROUP], ap[ATTN_MAX_GROUP][8];
-        fast_piece(qs, sc, xch, st, 1, k, kdt, v, vdt, nkv, kh, d, dv, scale, j0, j1, mp, lp, ap);
+        fast_piece(qs, sc, xch, st, 1, k, v, nkv, kh, d, dv, scale, j0, j1, mp, lp, ap);
         if (warp == 0)
             attn_combine(&m, &l, acc, mp[0], lp[0], ap[0]);
     }
@@ -428,7 +463,7 @@ fast_rows(const void *q, int qdt, const void *k, int kdt, const void *v, int vdt
 }
 
 static __global__ void __launch_bounds__(ATTN_THREADS)
-fast_split(const void *q, int qdt, const void *k, int kdt, const void *v, int vdt, const int32_t *pos, float *part,
+fast_split(const void *q, int qdt, kvsrc k, kvsrc v, const int32_t *pos, float *part,
            int64_t T, int64_t S, int64_t nh, int64_t nkv, int64_t d, int64_t dv, float scale, int G)
 {
     __shared__ float qs[ATTN_MAX_GROUP * FAST_DIM], sc[ATTN_MAX_GROUP * ATTN_TILE], st[3 * ATTN_MAX_GROUP],
@@ -448,7 +483,7 @@ fast_split(const void *q, int qdt, const void *k, int kdt, const void *v, int vd
     }
     __syncthreads();
     float m[ATTN_MAX_GROUP], l[ATTN_MAX_GROUP], ap[ATTN_MAX_GROUP][8];
-    fast_piece(qs, sc, xch, st, G, k, kdt, v, vdt, nkv, kh, d, dv, scale, j0, j1, m, l, ap);
+    fast_piece(qs, sc, xch, st, G, k, v, nkv, kh, d, dv, scale, j0, j1, m, l, ap);
     if (warp != 0)
         return;
 #pragma unroll
@@ -465,12 +500,11 @@ fast_split(const void *q, int qdt, const void *k, int kdt, const void *v, int vd
     }
 }
 
-extern "C" ath_status ath_attn_launch(const ath_device *d, const ath_tensor *q, const ath_tensor *k,
-                                      const ath_tensor *v, const ath_tensor *pos, float scale, float *part,
-                                      ath_tensor *out)
+/* The launches, over keys and values as kvsrc. */
+static ath_status attn_run(const ath_device *d, const ath_tensor *q, kvsrc k, kvsrc v, int64_t S, int64_t nkv,
+                           int64_t dv, bool aligned, const ath_tensor *pos, float scale, float *part, ath_tensor *out)
 {
     const int64_t T = q->shape[0], nh = q->shape[1], hd = q->shape[2];
-    const int64_t S = k->shape[0], nkv = k->shape[1], dv = v->shape[2];
     const int32_t *p = pos ? (const int32_t *)pos->data : NULL;
     if (T * nh == 0 || dv == 0)
         return ATH_OK;
@@ -479,19 +513,16 @@ extern "C" ath_status ath_attn_launch(const ath_device *d, const ath_tensor *q, 
         return ATH_ERR_UNSUPPORTED;
     }
     ATH_CHECK(ath_gpu_use(d));
-    const bool fast = hd <= FAST_DIM && dv <= FAST_DIM && hd % 8 == 0 && dv % 8 == 0 &&
-                      (uintptr_t)k->data % 16 == 0 && (uintptr_t)v->data % 16 == 0;
+    const bool fast = hd <= FAST_DIM && dv <= FAST_DIM && hd % 8 == 0 && dv % 8 == 0 && aligned;
     if (fast && !part) {
-        fast_rows<<<(unsigned)(T * nh), ATTN_THREADS, 0, k_stream(d)>>>(q->data, q->dtype, k->data, k->dtype, v->data,
-                                                                       v->dtype, p, out->data, out->dtype, T, S, nh,
-                                                                       nkv, hd, dv, scale);
+        fast_rows<<<(unsigned)(T * nh), ATTN_THREADS, 0, k_stream(d)>>>(q->data, q->dtype, k, v, p, out->data,
+                                                                       out->dtype, T, S, nh, nkv, hd, dv, scale);
         return ath_gpu_launched("attn fast_rows");
     }
     if (!part) {
         const size_t smem = (size_t)(hd + ATTN_TILE) * sizeof(float);
-        attn_rows<<<(unsigned)(T * nh), ATTN_THREADS, smem, k_stream(d)>>>(
-            q->data, q->dtype, k->data, k->dtype, v->data, v->dtype, p, out->data, out->dtype, T, S, nh, nkv, hd, dv,
-            scale);
+        attn_rows<<<(unsigned)(T * nh), ATTN_THREADS, smem, k_stream(d)>>>(q->data, q->dtype, k, v, p, out->data,
+                                                                          out->dtype, T, S, nh, nkv, hd, dv, scale);
         return ath_gpu_launched("attn_rows");
     }
     /* G: the largest divisor of the group size up to ATTN_MAX_GROUP */
@@ -503,13 +534,32 @@ extern "C" ath_status ath_attn_launch(const ath_device *d, const ath_tensor *q, 
     const dim3 grid((unsigned)pieces, (unsigned)(nh / G), (unsigned)T);
     const size_t smem = (size_t)G * (hd + ATTN_TILE) * sizeof(float);
     if (fast)
-        fast_split<<<grid, ATTN_THREADS, 0, k_stream(d)>>>(q->data, q->dtype, k->data, k->dtype, v->data, v->dtype, p,
-                                                           part, T, S, nh, nkv, hd, dv, scale, G);
+        fast_split<<<grid, ATTN_THREADS, 0, k_stream(d)>>>(q->data, q->dtype, k, v, p, part, T, S, nh, nkv, hd, dv,
+                                                           scale, G);
     else
-        attn_split<<<grid, ATTN_THREADS, smem, k_stream(d)>>>(q->data, q->dtype, k->data, k->dtype, v->data, v->dtype,
-                                                             p, part, T, S, nh, nkv, hd, dv, scale, G);
+        attn_split<<<grid, ATTN_THREADS, smem, k_stream(d)>>>(q->data, q->dtype, k, v, p, part, T, S, nh, nkv, hd,
+                                                             dv, scale, G);
     ATH_CHECK(ath_gpu_launched("attn_split"));
     attn_merge<<<(unsigned)(T * nh), ATTN_THREADS, 0, k_stream(d)>>>(part, p, out->data, out->dtype, T, S, nh, dv,
                                                                     pieces);
     return ath_gpu_launched("attn_merge");
+}
+
+extern "C" ath_status ath_attn_launch(const ath_device *d, const ath_tensor *q, const ath_tensor *k,
+                                      const ath_tensor *v, const ath_tensor *pos, float scale, float *part,
+                                      ath_tensor *out)
+{
+    const kvsrc ks = {k->data, k->dtype, NULL, 0}, vs = {v->data, v->dtype, NULL, 0};
+    const bool aligned = (uintptr_t)k->data % 16 == 0 && (uintptr_t)v->data % 16 == 0;
+    return attn_run(d, q, ks, vs, k->shape[0], k->shape[1], v->shape[2], aligned, pos, scale, part, out);
+}
+
+extern "C" ath_status ath_attn_q8_launch(const ath_device *d, const ath_tensor *q, const ath_tensor *k,
+                                         const ath_tensor *ks, const ath_tensor *v, const ath_tensor *vs,
+                                         const ath_tensor *pos, float scale, float *part, ath_tensor *out)
+{
+    const kvsrc kq = {k->data, ATH_DTYPE_I8, (const float *)ks->data, q->dtype};
+    const kvsrc vq = {v->data, ATH_DTYPE_I8, (const float *)vs->data, q->dtype};
+    const bool aligned = (uintptr_t)k->data % 8 == 0 && (uintptr_t)v->data % 8 == 0;
+    return attn_run(d, q, kq, vq, k->shape[0], k->shape[1], v->shape[2], aligned, pos, scale, part, out);
 }

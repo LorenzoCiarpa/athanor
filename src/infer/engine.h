@@ -60,6 +60,9 @@ void ath_engine_close(ath_engine *e);
 /* The state of one sequence on the engine's device (ath_state_init_gpu),
  * reset. The pointer array goes into a. */
 ath_status ath_engine_state(ath_engine *e, ath_state *s, ath_dtype act, int32_t capacity, ath_arena *a);
+/* The same with the KV cache in kv: act, or ATH_DTYPE_I8 (step 14). */
+ath_status ath_engine_state_kv(ath_engine *e, ath_state *s, ath_dtype act, ath_dtype kv, int32_t capacity,
+                               ath_arena *a);
 
 /* ---- decoding (step 9) ----------------------------------------------------------
  *

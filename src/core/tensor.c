@@ -15,6 +15,7 @@ static const struct {
     [ATH_DTYPE_U8]      = {"u8", 1},
     [ATH_DTYPE_F8_E4M3] = {"f8_e4m3", 1},
     [ATH_DTYPE_F8_E5M2] = {"f8_e5m2", 1},
+    [ATH_DTYPE_I8]      = {"i8", 1},
 };
 
 size_t ath_dtype_size(ath_dtype dt)

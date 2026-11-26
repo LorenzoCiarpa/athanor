@@ -410,10 +410,34 @@ ATH_TEST(real_state_specs)
 }
 
 /* Tolerances of the f32 forward pass against the fp32 reference: about four
- * times the worst measured error (4.7e-5 for the residual stream, 2.7e-5 for
- * the logits), as for the exact op tolerances; tests/README.md, Tolerances. */
-#define TOL_F32_RESIDUAL 2e-4
-#define TOL_F32_LOGITS   1e-4
+ * times the worst measured error, as for the exact op tolerances
+ * (tests/README.md, Tolerances). Step 4's (Qwen3.5-0.8B: 4.7e-5 for the
+ * residual stream, 2.7e-5 for the logits) for every model not listed.
+ * Qwen3.5-9B (step 14): two positions of the chat prompt, the newline after
+ * <|im_end|> and the <|im_start|> after it, are ill-conditioned: whatever
+ * the device, their rounding error grows about tenfold through the layers
+ * while the other positions stay flat; worst 8.5e-5 and 1.1e-4 on the GPU,
+ * 2.0e-5 and 1.6e-5 on the CPU. */
+typedef struct {
+    const char *gguf;            /* the manifest's model.gguf; NULL: the default */
+    double      residual, logits;
+} f32_tol;
+
+static const f32_tol F32_TOL[] = {
+    {NULL, 2e-4, 1e-4},
+    {"Qwen3.5-9B-Q8_0.gguf", 4e-4, 5e-4},
+};
+
+static f32_tol f32_tol_for(const ath_json *manifest)
+{
+    const char *name = NULL;
+    if (ath_json_to_str(ath_json_path(manifest, "model.gguf"), &name, NULL) != ATH_OK)
+        name = NULL;
+    for (size_t i = 1; name && i < sizeof F32_TOL / sizeof F32_TOL[0]; i++)
+        if (!strcmp(name, F32_TOL[i].gguf))
+            return F32_TOL[i];
+    return F32_TOL[0];
+}
 
 typedef struct {
     /* in */
@@ -649,6 +673,7 @@ ATH_TEST(forward_golden)
     const size_t n_prompts = ath_json_count(recs);
     ATH_REQUIRE(n_prompts >= 1 && n_prompts <= MAX_PROMPTS && m.n_layers <= MAX_LAYERS);
     const int64_t V = m.vocab_size, H = m.hidden_size, L1 = m.n_layers + 1;
+    const f32_tol tol = f32_tol_for(manifest);
 
     prompt P[MAX_PROMPTS];
     for (size_t i = 0; i < n_prompts; i++)
@@ -788,13 +813,25 @@ ATH_TEST(forward_golden)
         char msg[300];
         if (j->act == ATH_DTYPE_F32) {
             for (int64_t l = 0; l < L1; l++)
-                if (!(j->err32[l] <= TOL_F32_RESIDUAL)) {
+                if (!(j->err32[l] <= tol.residual)) {
                     snprintf(msg, sizeof msg, "%s f32%s: residual entering layer %d: %.3g > %.3g", p->name, dev,
-                             (int)l, j->err32[l], TOL_F32_RESIDUAL);
+                             (int)l, j->err32[l], tol.residual);
                     ath_test_fail_(t_, __FILE__, __LINE__, msg);
                 }
-            if (!(lerr <= TOL_F32_LOGITS)) {
-                snprintf(msg, sizeof msg, "%s f32%s: logits %.3g > %.3g", p->name, dev, lerr, TOL_F32_LOGITS);
+            if (!(lerr <= tol.logits)) {
+                /* where: the worst position, and the worst of the others */
+                int64_t at = 0;
+                double w0 = -1, w1 = 0;
+                for (int64_t r = 0; r < j->n_run; r++) {
+                    const double e = score((const float *)j->logits + r * V, ATH_DTYPE_F32,
+                                           (const float *)p->logits32->data + r * V, ATH_DTYPE_F32, V, lrms);
+                    if (e > w0)
+                        w1 = w0 > w1 ? w0 : w1, w0 = e, at = r;
+                    else if (e > w1)
+                        w1 = e;
+                }
+                snprintf(msg, sizeof msg, "%s f32%s: logits %.3g > %.3g (position %lld; the other positions within %.3g)",
+                         p->name, dev, lerr, tol.logits, (long long)at, w1);
                 ath_test_fail_(t_, __FILE__, __LINE__, msg);
             }
             continue;
@@ -844,6 +881,8 @@ ATH_TEST(forward_golden)
     printf("  greedy: bf16 noise of the top-2 margin %.3f; columns greedy and ref count the positions where\n"
            "  athanor and the bf16 reference pick another token than the fp32 reference\n",
            noise);
+    printf("  f32 tolerances: residual stream %.0e, logits %.0e%s\n", tol.residual, tol.logits,
+           tol.gguf ? " (this model's: see F32_TOL)" : "");
     if (!full)
         printf("  first positions only (ATH_FORWARD_POSITIONS or DEBUG build): KL gate and greedy not checked\n");
     if (getenv("ATH_FORWARD_LAYERS"))

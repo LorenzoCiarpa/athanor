@@ -694,6 +694,70 @@ ATH_TEST(gpu_sample)
     gpu_close(&g);
 }
 
+/* The int8 KV cache (step 14): the GPU stores and reads back the
+ * reference's bits, and attention over an int8 cache gives, bit for bit,
+ * what attention gives over the cache it reads back as: one token and
+ * several, with and without split-K, the 16-byte path (head dim 256) and
+ * the generic one (100). */
+ATH_TEST(gpu_kv_q8)
+{
+    gpu g;
+    GPU_OR_SKIP(g);
+    enum { S = 300, NKV = 2, NH = 8 };
+    static const int64_t dims[] = {256, 100};
+    for (size_t di = 0; di < ATH_ARRAY_LEN(dims); di++)
+        for (int a = 0; a < 2; a++) {
+            const int64_t D = dims[di];
+            const ath_dtype act = a ? ATH_DTYPE_F32 : ATH_DTYPE_BF16;
+            ath_tensor ph = host(&g, ATH_DTYPE_I32, SHAPE(S));
+            for (int i = 0; i < S; i++)
+                ((int32_t *)ph.data)[i] = (i * 7) % S;                    /* a permutation: 7 and 300 coprime */
+            ath_tensor pd = up(&g, &ph);
+            ath_tensor cache[2], scl[2], cd[2], sd[2], back[2], backd[2];
+            for (int kv = 0; kv < 2; kv++) {
+                ath_tensor x = rand_t(&g, act, -2, 2, SHAPE(S, NKV, D));
+                for (int64_t i = 0; i < D; i++)
+                    ath_store_f32(x.data, act, (3 * NKV) * D + i, 0.0f);  /* a zero row */
+                ath_tensor xd = up(&g, &x);
+                cache[kv] = host(&g, ATH_DTYPE_I8, SHAPE(S, NKV, D));
+                scl[kv] = host(&g, ATH_DTYPE_F32, SHAPE(S, NKV));
+                ATH_REQUIRE_OK(ath_kv_store_ref(&x, &ph, &cache[kv], &scl[kv]));
+                cd[kv] = up(&g, &cache[kv]);
+                sd[kv] = up(&g, &scl[kv]);
+                ATH_REQUIRE_OK(ath_memset(&g.d, cd[kv].data, 0x5a, ath_tensor_nbytes(&cd[kv]), ATH_STREAM_COMPUTE));
+                ATH_REQUIRE_OK(ath_memset(&g.d, sd[kv].data, 0, ath_tensor_nbytes(&sd[kv]), ATH_STREAM_COMPUTE));
+                ATH_EXPECT_OK(ath_kv_store_gpu(&g.d, &xd, &pd, &cd[kv], &sd[kv]));
+                ATH_EXPECT(memcmp(down(&g, &cd[kv]).data, cache[kv].data, ath_tensor_nbytes(&cache[kv])) == 0);
+                ATH_EXPECT(memcmp(down(&g, &sd[kv]).data, scl[kv].data, ath_tensor_nbytes(&scl[kv])) == 0);
+                back[kv] = host(&g, act, SHAPE(S, NKV, D));
+                ATH_REQUIRE_OK(ath_kv_load_ref(&cache[kv], &scl[kv], &back[kv]));
+                backd[kv] = up(&g, &back[kv]);
+                ath_tensor bg = up(&g, &back[kv]);
+                ATH_REQUIRE_OK(ath_memset(&g.d, bg.data, 0, ath_tensor_nbytes(&bg), ATH_STREAM_COMPUTE));
+                ATH_EXPECT_OK(ath_kv_load_gpu(&g.d, &cd[kv], &sd[kv], &bg));
+                ATH_EXPECT(memcmp(down(&g, &bg).data, back[kv].data, ath_tensor_nbytes(&back[kv])) == 0);
+            }
+            /* attention: queries at positions, over the int8 cache and over what it reads back as */
+            static const int32_t qpos[] = {0, 63, 64, 299, 150};
+            for (int64_t T = 1; T <= 5; T += 4)
+                for (int split = 0; split < 2; split++) {
+                    ath_tensor q = rand_t(&g, act, -1, 1, SHAPE(T, NH, D)), qd = up(&g, &q);
+                    ath_tensor qp = host(&g, ATH_DTYPE_I32, SHAPE(T));
+                    memcpy(qp.data, qpos, (size_t)T * sizeof(int32_t));
+                    ath_tensor qpd = up(&g, &qp), oh = host(&g, act, SHAPE(T, NH, D));
+                    ath_tensor o1 = up(&g, &oh), o2 = up(&g, &oh);
+                    ath_dev_arena *scr = split ? &g.dev : NULL;
+                    ATH_EXPECT_OK(ath_attn_gpu(&g.d, &qd, &backd[0], &backd[1], &qpd, 0.0625f, scr, &o1));
+                    ATH_EXPECT_OK(ath_attn_q8_gpu(&g.d, &qd, &cd[0], &sd[0], &cd[1], &sd[1], &qpd, 0.0625f, scr, &o2));
+                    if (!same_bits(&g, &o1, &o2))
+                        printf("    kv_q8 d %lld %s T %lld %s: attention differs from the read-back cache's\n",
+                               (long long)D, a ? "f32" : "bf16", (long long)T, split ? "split" : "rows");
+                    ATH_EXPECT(same_bits(&g, &o1, &o2));
+                }
+        }
+    gpu_close(&g);
+}
+
 /* The presence penalty (step 13) on the GPU against the reference: the
  * step's token marked in seen first, then the same bits. */
 ATH_TEST(gpu_presence)
@@ -1317,7 +1381,7 @@ ATH_TEST(gpu_gdn_chunk)
 }
 
 static const ath_test_case tests[] = {
-    ATH_TEST_ENTRY(gpu_argument_checks), ATH_TEST_ENTRY(gpu_embed),       ATH_TEST_ENTRY(gpu_matmul),      ATH_TEST_ENTRY(gpu_gemv), ATH_TEST_ENTRY(gpu_matmul_q8_0), ATH_TEST_ENTRY(gpu_moe), ATH_TEST_ENTRY(gpu_moe_split), ATH_TEST_ENTRY(gpu_matmul_n), ATH_TEST_ENTRY(gpu_matmul_swiglu), ATH_TEST_ENTRY(gpu_scatter_rows), ATH_TEST_ENTRY(gpu_sample), ATH_TEST_ENTRY(gpu_presence),
+    ATH_TEST_ENTRY(gpu_argument_checks), ATH_TEST_ENTRY(gpu_embed),       ATH_TEST_ENTRY(gpu_matmul),      ATH_TEST_ENTRY(gpu_gemv), ATH_TEST_ENTRY(gpu_matmul_q8_0), ATH_TEST_ENTRY(gpu_moe), ATH_TEST_ENTRY(gpu_moe_split), ATH_TEST_ENTRY(gpu_matmul_n), ATH_TEST_ENTRY(gpu_matmul_swiglu), ATH_TEST_ENTRY(gpu_scatter_rows), ATH_TEST_ENTRY(gpu_sample), ATH_TEST_ENTRY(gpu_presence), ATH_TEST_ENTRY(gpu_kv_q8),
     ATH_TEST_ENTRY(gpu_norms),           ATH_TEST_ENTRY(gpu_add_rmsnorm),           ATH_TEST_ENTRY(gpu_rope),        ATH_TEST_ENTRY(gpu_elementwise),
     ATH_TEST_ENTRY(gpu_attn),            ATH_TEST_ENTRY(gpu_attn_mma),    ATH_TEST_ENTRY(gpu_conv),        ATH_TEST_ENTRY(gpu_gdn_gates),
     ATH_TEST_ENTRY(gpu_gdn),             ATH_TEST_ENTRY(gpu_gdn_chunk),

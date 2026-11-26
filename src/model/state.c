@@ -30,12 +30,22 @@ static bool act_ok(ath_dtype act)
 }
 
 /* Bytes of one buffer: the recurrent state is fp32 (it accumulates every
- * token of the sequence), the others hold activations. */
-static ath_status spec_bytes(const ath_state_spec *sp, ath_dtype act, int32_t capacity, size_t *out)
+ * token of the sequence), the others hold activations; a KV cache in int8
+ * (step 14) holds a byte per element and an f32 scale per row. */
+static ath_status spec_bytes(const ath_state_spec *sp, ath_dtype act, ath_dtype kv, int32_t capacity, size_t *out)
 {
-    const ath_dtype dt = sp->kind == ATH_STATE_RECURRENT ? ATH_DTYPE_F32 : act;
     if (sp->fixed < 0 || sp->per_token < 0 || capacity < 0)
         return ATH_ERR_RANGE;
+    if (sp->kind == ATH_STATE_KV && kv == ATH_DTYPE_I8) {
+        if (sp->row <= 0 || sp->per_token % (2 * sp->row))
+            return ATH_ERR_UNSUPPORTED;
+        const uint64_t cap = (uint64_t)capacity, pt = (uint64_t)sp->per_token, rows = pt / (uint64_t)sp->row;
+        if (pt && cap > SIZE_MAX / (pt + 4 * rows))
+            return ATH_ERR_RANGE;
+        *out = (size_t)(cap * (pt + 4 * rows));
+        return ATH_OK;
+    }
+    const ath_dtype dt = sp->kind == ATH_STATE_RECURRENT ? ATH_DTYPE_F32 : act;
     const uint64_t es = ath_dtype_size(dt), cap = (uint64_t)capacity;
     const uint64_t pt = (uint64_t)sp->per_token, fx = (uint64_t)sp->fixed;
     if (fx > SIZE_MAX / es || (pt && cap > (SIZE_MAX / es - fx) / pt))
@@ -44,14 +54,32 @@ static ath_status spec_bytes(const ath_state_spec *sp, ath_dtype act, int32_t ca
     return ATH_OK;
 }
 
+static bool kv_ok(ath_dtype act, ath_dtype kv)
+{
+    return kv == act || kv == ATH_DTYPE_I8;
+}
+
+size_t ath_state_buf_bytes(const ath_model *m, const ath_state *s, uint32_t i)
+{
+    size_t b = 0;
+    if (!m || !s || i >= m->n_states || spec_bytes(&m->states[i], s->act, s->kv, s->capacity, &b) != ATH_OK)
+        return 0;
+    return b;
+}
+
 ath_status ath_state_bytes(const ath_model *m, ath_dtype act, int32_t capacity, size_t *bytes)
 {
-    if (!m || !bytes || !act_ok(act) || capacity < 0)
+    return ath_state_bytes_kv(m, act, act, capacity, bytes);
+}
+
+ath_status ath_state_bytes_kv(const ath_model *m, ath_dtype act, ath_dtype kv, int32_t capacity, size_t *bytes)
+{
+    if (!m || !bytes || !act_ok(act) || !kv_ok(act, kv) || capacity < 0)
         return ATH_ERR_INVALID_ARG;
     size_t total = 0;
     for (uint32_t i = 0; i < m->n_states; i++) {
         size_t b;
-        ATH_CHECK(spec_bytes(&m->states[i], act, capacity, &b));
+        ATH_CHECK(spec_bytes(&m->states[i], act, kv, capacity, &b));
         b = (b + STATE_ALIGN - 1) / STATE_ALIGN * STATE_ALIGN;   /* as allocated */
         if (b > SIZE_MAX - total)
             return ATH_ERR_RANGE;
@@ -63,8 +91,8 @@ ath_status ath_state_bytes(const ath_model *m, ath_dtype act, int32_t capacity, 
 
 /* The buffers of one sequence in host memory (mem NULL) or in device
  * memory (mem set). */
-static ath_status init(ath_state *s, const ath_model *m, ath_dtype act, int32_t capacity, const ath_device *d,
-                       ath_dev_arena *mem, ath_arena *a)
+static ath_status init(ath_state *s, const ath_model *m, ath_dtype act, ath_dtype kv, int32_t capacity,
+                       const ath_device *d, ath_dev_arena *mem, ath_arena *a)
 {
     if (!s || !m || !a)
         return ATH_ERR_INVALID_ARG;
@@ -76,7 +104,11 @@ static ath_status init(ath_state *s, const ath_model *m, ath_dtype act, int32_t 
         ath_log(ATH_LOG_ERROR, "state: capacity %d; expected at least 1 token", capacity);
         return ATH_ERR_INVALID_ARG;
     }
-    *s = (ath_state){.act = act, .capacity = capacity, .dev = d};
+    if (!kv_ok(act, kv)) {
+        ath_log(ATH_LOG_ERROR, "state: KV dtype %s; expected the activation dtype or i8", ath_dtype_name(kv));
+        return ATH_ERR_TYPE;
+    }
+    *s = (ath_state){.act = act, .capacity = capacity, .dev = d, .kv = kv};
     s->buf = ath_arena_alloc(a, (m->n_states ? m->n_states : 1) * sizeof *s->buf, _Alignof(void *));
     if (!s->buf)
         return ATH_ERR_NOMEM;
@@ -91,7 +123,12 @@ static ath_status init(ath_state *s, const ath_model *m, ath_dtype act, int32_t 
         size_t off = 0;
         for (uint32_t i = 0; i < m->n_states; i++) {
             size_t b;
-            ath_status st = spec_bytes(&m->states[i], act, capacity, &b);
+            ath_status st = spec_bytes(&m->states[i], act, kv, capacity, &b);
+            if (st == ATH_ERR_UNSUPPORTED) {
+                ath_log(ATH_LOG_ERROR, "state: the KV state of layer %d cannot be held in int8",
+                        m->states[i].layer);
+                return st;
+            }
             if (st != ATH_OK) {
                 ath_log(ATH_LOG_ERROR, "state: %s state of layer %d does not fit in memory for %d tokens",
                         ath_state_kind_name(m->states[i].kind), m->states[i].layer, capacity);
@@ -119,15 +156,27 @@ static ath_status init(ath_state *s, const ath_model *m, ath_dtype act, int32_t 
 ath_status ath_state_init(ath_state *s, const ath_model *m, ath_dtype act, int32_t capacity,
                           ath_arena *a)
 {
-    return init(s, m, act, capacity, NULL, NULL, a);
+    return init(s, m, act, act, capacity, NULL, NULL, a);
+}
+
+ath_status ath_state_init_kv(ath_state *s, const ath_model *m, ath_dtype act, ath_dtype kv, int32_t capacity,
+                             ath_arena *a)
+{
+    return init(s, m, act, kv, capacity, NULL, NULL, a);
 }
 
 ath_status ath_state_init_gpu(ath_state *s, const ath_model *m, ath_dtype act, int32_t capacity,
                               const ath_device *d, ath_dev_arena *mem, ath_arena *a)
 {
+    return ath_state_init_gpu_kv(s, m, act, act, capacity, d, mem, a);
+}
+
+ath_status ath_state_init_gpu_kv(ath_state *s, const ath_model *m, ath_dtype act, ath_dtype kv, int32_t capacity,
+                                 const ath_device *d, ath_dev_arena *mem, ath_arena *a)
+{
     if (!d || !mem)
         return ATH_ERR_INVALID_ARG;
-    return init(s, m, act, capacity, d, mem, a);
+    return init(s, m, act, kv, capacity, d, mem, a);
 }
 
 ath_status ath_state_reset(ath_state *s, const ath_model *m)
@@ -141,7 +190,7 @@ ath_status ath_state_reset(ath_state *s, const ath_model *m)
         if (sp->kind == ATH_STATE_KV)
             continue;
         size_t b = 0;
-        ATH_CHECK(spec_bytes(sp, s->act, s->capacity, &b));
+        ATH_CHECK(spec_bytes(sp, s->act, s->kv, s->capacity, &b));
         if (s->dev)
             ATH_CHECK(ath_memset(s->dev, s->buf[i], 0, b, ATH_STREAM_COMPUTE));
         else
@@ -154,12 +203,12 @@ ath_status ath_state_reset(ath_state *s, const ath_model *m)
 
 ath_status ath_state_copy(ath_state *dst, const ath_state *src, const ath_model *m)
 {
-    if (!dst || !src || !m || dst->act != src->act || dst->capacity != src->capacity || !dst->buf || !src->buf ||
-        dst->dev != src->dev)
+    if (!dst || !src || !m || dst->act != src->act || dst->kv != src->kv || dst->capacity != src->capacity ||
+        !dst->buf || !src->buf || dst->dev != src->dev)
         return ATH_ERR_INVALID_ARG;
     for (uint32_t i = 0; i < m->n_states; i++) {
         size_t b;
-        ATH_CHECK(spec_bytes(&m->states[i], src->act, src->capacity, &b));
+        ATH_CHECK(spec_bytes(&m->states[i], src->act, src->kv, src->capacity, &b));
         if (src->dev)
             ATH_CHECK(ath_copy(src->dev, dst->buf[i], src->buf[i], b, ATH_STREAM_COMPUTE));
         else

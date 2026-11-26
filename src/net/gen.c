@@ -20,6 +20,7 @@ ath_status ath_gen_open(ath_gen *g, const char *dir, const ath_gen_opts *o, ath_
     g->chunk = o->chunk > 0 ? o->chunk : DEFAULT_CHUNK;
     ath_arena_init(&g->scratch, 0);
     ath_rng_init(&g->rng, o->seed);
+    const ath_dtype kv = o->kv8 ? ATH_DTYPE_I8 : ATH_DTYPE_BF16;
     ath_status st = ath_model_open(&g->m, a, dir);
     if (st != ATH_OK) {
         ath_arena_free(&g->scratch);
@@ -40,7 +41,7 @@ ath_status ath_gen_open(ath_gen *g, const char *dir, const ath_gen_opts *o, ath_
         /* the experts leave room for the state and its snapshot, besides
          * the working memory */
         size_t sb = 0;
-        ath_state_bytes(&g->m, ATH_DTYPE_BF16, g->ctx, &sb);
+        ath_state_bytes_kv(&g->m, ATH_DTYPE_BF16, o->kv8 ? ATH_DTYPE_I8 : ATH_DTYPE_BF16, g->ctx, &sb);
         const ath_place_opts po = {.slots = o->experts, .vram_reserve = ATH_PLACE_RESERVE + 2 * (uint64_t)sb,
                                    .draft = o->mtp};
         ath_log(ATH_LOG_INFO, "serve: a state of %d tokens takes %.2f GiB; two are kept", g->ctx,
@@ -57,18 +58,18 @@ ath_status ath_gen_open(ath_gen *g, const char *dir, const ath_gen_opts *o, ath_
         ath_device_mem(&g->engine->dev, &fr0, &tot0);
         ath_log(ATH_LOG_INFO, "serve: engine open; %.2f GiB of device memory free", (double)fr0 / 1073741824.0);
         g->exec = g->engine->exec;
-        st = ath_engine_state(g->engine, &g->state, ATH_DTYPE_BF16, g->ctx, a);
+        st = ath_engine_state_kv(g->engine, &g->state, ATH_DTYPE_BF16, kv, g->ctx, a);
         if (st == ATH_OK)
-            st = ath_engine_state(g->engine, &g->snap, ATH_DTYPE_BF16, g->ctx, a);
+            st = ath_engine_state_kv(g->engine, &g->snap, ATH_DTYPE_BF16, kv, g->ctx, a);
         uint64_t fr = 0, tot = 0;
         ath_device_mem(&g->engine->dev, &fr, &tot);
         ath_log(ATH_LOG_INFO, "serve: states %s; %.2f GiB of device memory free", st == ATH_OK ? "allocated" : "failed",
                 (double)fr / 1073741824.0);
     } else if (st == ATH_OK) {
         g->exec = (ath_exec){.pool = &g->pool};
-        st = ath_state_init(&g->state, &g->m, ATH_DTYPE_BF16, g->ctx, a);
+        st = ath_state_init_kv(&g->state, &g->m, ATH_DTYPE_BF16, kv, g->ctx, a);
         if (st == ATH_OK)
-            st = ath_state_init(&g->snap, &g->m, ATH_DTYPE_BF16, g->ctx, a);
+            st = ath_state_init_kv(&g->snap, &g->m, ATH_DTYPE_BF16, kv, g->ctx, a);
     }
     if (st == ATH_OK && o->mtp) {
         static const ath_sampler greedy = {0, 0, 1, 0, 0};

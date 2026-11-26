@@ -203,11 +203,17 @@ static ath_status attention(fwd *f, const ath_qwen35_layer *L, ath_tensor *x)
     const int64_t nh = c->n_heads, nkv = c->n_kv_heads, hd = c->head_dim;
     const ath_dtype act = f->act;
 
-    /* KV cache of this layer: keys [cap, nkv, hd], then values. */
+    /* KV cache of this layer: keys [cap, nkv, hd], then values; in int8
+     * (step 14) followed by their row scales [cap, nkv] */
     char *kv = f->s->buf[L->kv];
-    ath_tensor kc, vc;
-    ATH_CHECK(wrap(f, &kc, act, kv, 3, cap, nkv, hd));
-    ATH_CHECK(wrap(f, &vc, act, kv + ath_tensor_nbytes(&kc), 3, cap, nkv, hd));
+    const bool q8 = f->s->kv == ATH_DTYPE_I8;
+    ath_tensor kc, vc, ksc, vsc;
+    ATH_CHECK(wrap(f, &kc, f->s->kv, kv, 3, cap, nkv, hd));
+    ATH_CHECK(wrap(f, &vc, f->s->kv, kv + ath_tensor_nbytes(&kc), 3, cap, nkv, hd));
+    if (q8) {
+        ATH_CHECK(wrap(f, &ksc, ATH_DTYPE_F32, kv + 2 * ath_tensor_nbytes(&kc), 2, cap, nkv, 0));
+        ATH_CHECK(wrap(f, &vsc, ATH_DTYPE_F32, (char *)ksc.data + ath_tensor_nbytes(&ksc), 2, cap, nkv, 0));
+    }
 
     /* projections */
     ath_tensor qg, qg_rows, q, q_rows, gate, gate_rows, k, k_rows, v_new, v_flat;
@@ -259,13 +265,34 @@ static ath_status attention(fwd *f, const ath_qwen35_layer *L, ath_tensor *x)
         ATH_CHECK(ath_rope(f->dev, &qn3, &f->pos, c->rope_dim, (float)c->rope_theta, &qr));
         ATH_CHECK(ath_rope(f->dev, &kn3, &f->pos, c->rope_dim, (float)c->rope_theta, &k_new));
     }
-    ATH_CHECK(ath_scatter_rows(f->dev, &k_new, &f->pos, &kc));
-    ATH_CHECK(ath_scatter_rows(f->dev, &v_new, &f->pos, &vc));
+    if (q8) {
+        ATH_CHECK(ath_kv_store(f->dev, &k_new, &f->pos, &kc, &ksc));
+        ATH_CHECK(ath_kv_store(f->dev, &v_new, &f->pos, &vc, &vsc));
+    } else {
+        ATH_CHECK(ath_scatter_rows(f->dev, &k_new, &f->pos, &kc));
+        ATH_CHECK(ath_scatter_rows(f->dev, &v_new, &f->pos, &vc));
+    }
 
     /* attention up to each query's position, output gate, output projection */
     ath_tensor o, o_flat, gate_flat, og;
     ATH_CHECK(tmp(f, &o, act, 3, T, nh, hd));
-    ATH_CHECK(ath_attn(f->dev, &qr, &kc, &vc, &f->pos, (float)(1.0 / sqrt((double)hd)), f->da, &o));
+    const float scale = (float)(1.0 / sqrt((double)hd));
+    if (!q8) {
+        ATH_CHECK(ath_attn(f->dev, &qr, &kc, &vc, &f->pos, scale, f->da, &o));
+    } else if (f->dev && T >= ATH_ATTN_MMA_MIN_T) {
+        /* a prompt on a GPU: the rows it reads, [0, P + T), back in the
+         * activation dtype, then the tensor-core kernel (the same values
+         * the int8 kernels would read) */
+        const int64_t n = f->P + T;
+        ath_tensor kd, vd;
+        ATH_CHECK(tmp(f, &kd, act, 3, n, nkv, hd));
+        ATH_CHECK(tmp(f, &vd, act, 3, n, nkv, hd));
+        ATH_CHECK(ath_kv_load(f->dev, &kc, &ksc, &kd));
+        ATH_CHECK(ath_kv_load(f->dev, &vc, &vsc, &vd));
+        ATH_CHECK(ath_attn(f->dev, &qr, &kd, &vd, &f->pos, scale, f->da, &o));
+    } else {
+        ATH_CHECK(ath_attn_q8(f->dev, &qr, &kc, &ksc, &vc, &vsc, &f->pos, scale, f->da, &o));
+    }
     ATH_CHECK(view(&o, &o_flat, 2, T, nh * hd, 0));
     ATH_CHECK(view(&gate, &gate_flat, 2, T, nh * hd, 0));
     ATH_CHECK(tmp(f, &og, act, 2, T, nh * hd, 0));

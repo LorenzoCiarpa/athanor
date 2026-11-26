@@ -78,7 +78,7 @@ static const struct {
 } st_dtypes[] = {
     {"F32", ATH_DTYPE_F32},         {"F16", ATH_DTYPE_F16},
     {"BF16", ATH_DTYPE_BF16},       {"I32", ATH_DTYPE_I32},
-    {"I64", ATH_DTYPE_I64},         {"U8", ATH_DTYPE_U8},
+    {"I64", ATH_DTYPE_I64},         {"U8", ATH_DTYPE_U8},          {"I8", ATH_DTYPE_I8},
     {"F8_E4M3", ATH_DTYPE_F8_E4M3}, {"F8_E5M2", ATH_DTYPE_F8_E5M2},
 };
 

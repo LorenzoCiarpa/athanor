@@ -30,6 +30,7 @@ typedef enum {
     ATH_DTYPE_U8,
     ATH_DTYPE_F8_E4M3,     /* 4 exponent bits, 3 mantissa bits, no infinities (OCP "fn") */
     ATH_DTYPE_F8_E5M2,
+    ATH_DTYPE_I8,          /* step 14: the int8 KV cache, rows with a scale of their own */
     ATH_DTYPE_COUNT,       /* number of plain element types */
 
     /* Values 64..127 are quantized block formats: a block of elements
