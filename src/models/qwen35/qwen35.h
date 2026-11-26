@@ -10,6 +10,18 @@
 
 #include "model/model.h"
 
+/* The KV cache in int8 (step 14): a scale per 32 values of a key or value
+ * row (8 per head of 256), or per row when 32 does not divide it (the tiny
+ * test models). One scale per row of 256 cost 2.4 times the bf16 noise in
+ * KL, almost all of it in the values; groups of 32 cost 1.2 times
+ * (tests/README.md, KV cache in int8). */
+#define ATH_QWEN35_KV_GROUP 32
+
+static inline int64_t ath_qwen35_kv_group(int64_t head_dim)
+{
+    return head_dim % ATH_QWEN35_KV_GROUP == 0 ? ATH_QWEN35_KV_GROUP : head_dim;
+}
+
 typedef enum {
     ATH_QWEN35_GATED_DELTANET,   /* layer_types "linear_attention" */
     ATH_QWEN35_ATTENTION         /* layer_types "full_attention"   */

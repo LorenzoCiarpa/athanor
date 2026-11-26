@@ -31,15 +31,15 @@ static bool act_ok(ath_dtype act)
 
 /* Bytes of one buffer: the recurrent state is fp32 (it accumulates every
  * token of the sequence), the others hold activations; a KV cache in int8
- * (step 14) holds a byte per element and an f32 scale per row. */
+ * (step 14) holds a byte per element and an f32 scale per group. */
 static ath_status spec_bytes(const ath_state_spec *sp, ath_dtype act, ath_dtype kv, int32_t capacity, size_t *out)
 {
     if (sp->fixed < 0 || sp->per_token < 0 || capacity < 0)
         return ATH_ERR_RANGE;
     if (sp->kind == ATH_STATE_KV && kv == ATH_DTYPE_I8) {
-        if (sp->row <= 0 || sp->per_token % (2 * sp->row))
+        if (sp->group <= 0 || sp->per_token % (2 * sp->group))
             return ATH_ERR_UNSUPPORTED;
-        const uint64_t cap = (uint64_t)capacity, pt = (uint64_t)sp->per_token, rows = pt / (uint64_t)sp->row;
+        const uint64_t cap = (uint64_t)capacity, pt = (uint64_t)sp->per_token, rows = pt / (uint64_t)sp->group;
         if (pt && cap > SIZE_MAX / (pt + 4 * rows))
             return ATH_ERR_RANGE;
         *out = (size_t)(cap * (pt + 4 * rows));
@@ -216,6 +216,96 @@ ath_status ath_state_copy(ath_state *dst, const ath_state *src, const ath_model 
     }
     dst->n_past = src->n_past;
     dst->n_draft = src->n_draft;
+    return ATH_OK;
+}
+
+/* ---- snapshots (step 14) ---------------------------------------------------------- */
+
+/* The parts of buffer i a snapshot of rows tokens holds, as (offset, bytes)
+ * pairs within the buffer: the layout of model.h (keys, values, then in int8
+ * their scales), the first rows of each. */
+static int snap_parts(const ath_state_spec *sp, const ath_state *s, uint64_t rows, size_t off[4], size_t len[4])
+{
+    if (sp->kind != ATH_STATE_KV) {
+        size_t b = 0;
+        spec_bytes(sp, s->act, s->kv, s->capacity, &b);
+        off[0] = 0;
+        len[0] = b;
+        return 1;
+    }
+    const uint64_t C = (uint64_t)s->capacity, half = (uint64_t)sp->per_token / 2;
+    if (s->kv != ATH_DTYPE_I8) {
+        const uint64_t row = half * ath_dtype_size(s->act);
+        off[0] = 0, len[0] = rows * row;
+        off[1] = C * row, len[1] = rows * row;
+        return 2;
+    }
+    const uint64_t srow = half / (uint64_t)sp->group * sizeof(float);
+    off[0] = 0, len[0] = rows * half;
+    off[1] = C * half, len[1] = rows * half;
+    off[2] = 2 * C * half, len[2] = rows * srow;
+    off[3] = 2 * C * half + C * srow, len[3] = rows * srow;
+    return 4;
+}
+
+static int32_t snap_rows(int32_t n_past, int32_t n_draft)
+{
+    return n_past > n_draft ? n_past : n_draft;
+}
+
+static size_t snap_size(const ath_model *m, const ath_state *s, int32_t rows)
+{
+    size_t total = 0, off[4], len[4];
+    for (uint32_t i = 0; i < m->n_states; i++)
+        for (int p = 0, np = snap_parts(&m->states[i], s, (uint64_t)rows, off, len); p < np; p++)
+            total += len[p];
+    return total;
+}
+
+size_t ath_state_snap_bytes(const ath_model *m, const ath_state *s)
+{
+    if (!m || !s || !s->buf)
+        return 0;
+    return snap_size(m, s, snap_rows(s->n_past, s->n_draft));
+}
+
+/* Copy every part between the state and the snapshot (save: state to
+ * snapshot). */
+static ath_status snap_copy(ath_state *s, const ath_model *m, int32_t rows, char *snap, bool save)
+{
+    size_t at = 0, off[4], len[4];
+    for (uint32_t i = 0; i < m->n_states; i++)
+        for (int p = 0, np = snap_parts(&m->states[i], s, (uint64_t)rows, off, len); p < np; p++) {
+            char *b = (char *)s->buf[i] + off[p];
+            if (s->dev)
+                ATH_CHECK(ath_copy(s->dev, save ? snap + at : b, save ? b : snap + at, len[p], ATH_STREAM_COMPUTE));
+            else
+                memcpy(save ? snap + at : b, save ? b : snap + at, len[p]);
+            at += len[p];
+        }
+    return s->dev ? ath_stream_sync(s->dev, ATH_STREAM_COMPUTE) : ATH_OK;
+}
+
+ath_status ath_state_snap_save(const ath_state *s, const ath_model *m, void *dst, size_t bytes)
+{
+    if (!s || !m || !s->buf || !dst || bytes != ath_state_snap_bytes(m, s))
+        return ATH_ERR_INVALID_ARG;
+    return snap_copy((ath_state *)s, m, snap_rows(s->n_past, s->n_draft), dst, true);
+}
+
+ath_status ath_state_snap_load(ath_state *s, const ath_model *m, int32_t n_past, int32_t n_draft, const void *src,
+                               size_t bytes)
+{
+    if (!s || !m || !s->buf || !src || n_past < 0 || n_draft < 0)
+        return ATH_ERR_INVALID_ARG;
+    const int32_t rows = snap_rows(n_past, n_draft);
+    if (rows > s->capacity)
+        return ATH_ERR_RANGE;
+    if (bytes != snap_size(m, s, rows))
+        return ATH_ERR_INVALID_ARG;
+    ATH_CHECK(snap_copy(s, m, rows, (char *)src, false));
+    s->n_past = n_past;
+    s->n_draft = n_draft;
     return ATH_OK;
 }
 

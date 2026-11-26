@@ -204,15 +204,16 @@ static ath_status attention(fwd *f, const ath_qwen35_layer *L, ath_tensor *x)
     const ath_dtype act = f->act;
 
     /* KV cache of this layer: keys [cap, nkv, hd], then values; in int8
-     * (step 14) followed by their row scales [cap, nkv] */
+     * (step 14) followed by their scales [cap, nkv, hd / group] */
     char *kv = f->s->buf[L->kv];
     const bool q8 = f->s->kv == ATH_DTYPE_I8;
     ath_tensor kc, vc, ksc, vsc;
     ATH_CHECK(wrap(f, &kc, f->s->kv, kv, 3, cap, nkv, hd));
     ATH_CHECK(wrap(f, &vc, f->s->kv, kv + ath_tensor_nbytes(&kc), 3, cap, nkv, hd));
     if (q8) {
-        ATH_CHECK(wrap(f, &ksc, ATH_DTYPE_F32, kv + 2 * ath_tensor_nbytes(&kc), 2, cap, nkv, 0));
-        ATH_CHECK(wrap(f, &vsc, ATH_DTYPE_F32, (char *)ksc.data + ath_tensor_nbytes(&ksc), 2, cap, nkv, 0));
+        const int64_t nb = hd / ath_qwen35_kv_group(hd);
+        ATH_CHECK(wrap(f, &ksc, ATH_DTYPE_F32, kv + 2 * ath_tensor_nbytes(&kc), 3, cap, nkv, nb));
+        ATH_CHECK(wrap(f, &vsc, ATH_DTYPE_F32, (char *)ksc.data + ath_tensor_nbytes(&ksc), 3, cap, nkv, nb));
     }
 
     /* projections */

@@ -153,6 +153,18 @@ How a layer runs on a GPU (`ath_moe_experts_split`): the compute stream records 
 
 The expert path has one canonical order everywhere, so the bits do not depend on placement: `tests/test_gpu_ops.c` (`gpu_moe_split`) checks the split against the reference, bit for bit, directly and in a graph replayed after experts moved; `tests/test_engine.c` (`engine_moe_placement`) checks whole passes of Qwen3.6-35B-A3B.
 
+## The KV cache in int8 (step 14)
+
+An option beside the cache in the activation dtype (`--kv q8` in chat, bench and serve): a key or value row (one token, one KV head) in int8, in groups of g values that share an f32 scale. The Qwen models use g = 32: 8 scales per head of 256; on Qwen3.5-9B 18 KiB per token (16 of values, 2 of scales) instead of 32, 2.25 GiB at 131,072 tokens instead of 4.
+
+| File | Content |
+| --- | --- |
+| `kv.c` | `ath_kv_store_ref` / `_gpu`: a group x as q = rint(x · (1/s)), s = max\|x\| / 127, each a single correctly rounded fp32 operation; rows by position, as `scatter_rows`. `ath_kv_load_ref` / `_gpu`: the first n rows read back, q · s rounded to the output's dtype |
+| `cuda/kv.cu` | `kv_store`, a warp per group (the largest magnitude by a warp reduction, exact in any order); `kv_load`, a thread per value. The CPU's bits |
+| `attn.c`, `cuda/attn.cu` | `ath_attn_q8_ref` / `_gpu`: attention over the int8 cache, every key and value read back as `kv_load` reads it (the kernels take keys and values through one descriptor, `kvsrc`), so the output is, bit for bit, attention over the read-back cache. On the GPU the decode kernels (rows and split-K), whatever the number of queries; the fast ones when g is a multiple of 8 (8 values under one scale per 8-byte load). A prompt of `ATH_ATTN_MMA_MIN_T` tokens or more reads its rows back into scratch with `kv_load` and runs the tensor-core kernel over them |
+
+`tests/test_ops.c` (`kv_q8`) and `tests/test_gpu_ops.c` (`gpu_kv_q8`) check the stored values (within half a step of x, a zero group zero), the CPU's bits on the GPU, and attention over the int8 cache against attention over what it reads back as, bit for bit, for groups from 4 values to the whole row. Why groups of 32 and how far the cache moves the model's output: `tests/README.md`, KV cache in int8.
+
 ## Op list
 
 | Op | Content | Step |
@@ -165,6 +177,7 @@ The expert path has one canonical order everywhere, so the bits do not depend on
 | `attn` | causal attention with GQA: naive reference; split-K decode and tensor-core prefill on GPU | 3, 7, 9, 10 |
 | `conv` | short depthwise causal conv1d with state | 3, 7 (GPU) |
 | `scatter` | rows written at given rows (the KV cache by position) | 9 |
+| `kv` | the KV cache in int8: groups of a row with a scale each, stored by position and read back; attention over it (`attn_q8`) | 14 |
 | `gdn` | Gated DeltaNet: gates; recurrent reference (CPU and GPU decode), chunkwise-parallel GPU prefill; L2 norm of q and k inside (step 10) | 3, 7, 10 |
 | `moe` | router top-k, routed experts (canonical order: the same bits on CPU and GPU), weighted combination with the gated shared expert; the experts split between GPU and CPU | 12 |
 | `sample` | greedy, temperature, top-k, top-p, min-p (step 5); GPU sampling, greedy and top-k up to 64 (step 9); presence and repetition penalties later | 5, 9 |

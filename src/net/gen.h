@@ -15,12 +15,22 @@
  * a long session's prompt is run once. A much shorter prompt (an agent's
  * side request: a title, a summary) does not replace a longer snapshot,
  * unless the snapshot went unused twice in a row.
+ *
+ * Step 14 adds a store of more snapshots (src/infer/prefix.h): in host
+ * memory, and with a folder on disk, kept across restarts. The snapshot
+ * on the device goes there when a new one does not continue it (another
+ * conversation, a branch) and when the server stops; when two states do
+ * not fit in device memory (a long context) there is no snapshot on the
+ * device and every one goes to the store. A request starts from the
+ * longest prefix of its prompt that the state, the device's snapshot or
+ * the store holds.
  */
 #ifndef ATH_NET_GEN_H
 #define ATH_NET_GEN_H
 
 #include "core/rng.h"
 #include "infer/engine.h"
+#include "infer/prefix.h"
 #include "infer/spec.h"
 #include "model/model.h"
 #include "text/bpe.h"
@@ -80,6 +90,9 @@ typedef struct {
     bool    cpu;             /* run on the CPU even with a GPU                     */
     bool    mtp;             /* decode speculatively with the draft head (step 13) */
     bool    kv8;             /* the KV cache in int8 (step 14)                     */
+    const char *snap_dir;    /* prefix snapshots on disk (step 14); NULL: none     */
+    uint64_t snap_ram;       /* their budget in host memory, 0: the default        */
+    uint64_t snap_disk;      /* on disk, 0: the default                            */
 } ath_gen_opts;
 
 typedef struct {
@@ -92,6 +105,9 @@ typedef struct {
     ath_sampler     dec_sampler;     /* the sampler the decoder was recorded with       */
     ath_exec        exec;
     ath_state       state, snap;
+    bool            has_snap;        /* snap exists (a second state fits on the device) */
+    ath_prefix_store *store;         /* more snapshots, in host memory and on disk      */
+    bool            snap_persist;    /* the store has a folder                          */
     ath_tokens      seen;            /* the tokens the state holds                      */
     ath_tokens      snap_ids;        /* the tokens snap holds                           */
     size_t          snap_n;          /* their number; 0: no snapshot                    */

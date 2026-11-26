@@ -259,7 +259,8 @@ ATH_TEST(engine_pieces)
 /* The decoder (step 9): a recorded and replayed decode step gives the logits
  * of the same step run directly, bit for bit, and with the same uniform
  * numbers it chooses the tokens ath_sample_ref chooses on them: on the
- * host (top-k 0), on the GPU (top-k 3) and greedy. A full state is refused. */
+ * host (top-k 0), on the GPU (top-k 3) and greedy; with the KV cache in
+ * bf16 and in int8 (step 14). A full state is refused. */
 ATH_TEST(engine_decoder)
 {
     GPU_OR_SKIP();
@@ -280,10 +281,12 @@ ATH_TEST(engine_decoder)
     for (int i = 0; i < NG; i++)
         us[i] = ath_rng_uniform(&rng);
     static float want_l[NG][V];
-    for (size_t k = 0; k < ATH_ARRAY_LEN(ps); k++) {
+    for (size_t kk = 0; kk < 2 * ATH_ARRAY_LEN(ps); kk++) {
+        const size_t k = kk % ATH_ARRAY_LEN(ps);
+        const ath_dtype kv = kk < ATH_ARRAY_LEN(ps) ? ATH_DTYPE_BF16 : ATH_DTYPE_I8;   /* step 14: int8 KV too */
         /* directly: host logits, ath_sample_ref */
         ath_state d;
-        ATH_REQUIRE_OK(ath_engine_state(&e, &d, ATH_DTYPE_BF16, CAP, &t.a));
+        ATH_REQUIRE_OK(ath_engine_state_kv(&e, &d, ATH_DTYPE_BF16, kv, CAP, &t.a));
         ATH_REQUIRE_OK(ath_model_forward(m, &(ath_batch){.tokens = prompt, .n_tokens = NP - 1}, &d, NULL, &scratch, &e.exec));
         int32_t want[NG], tok = prompt[NP - 1];
         for (int i = 0; i < NG; i++) {
@@ -294,7 +297,7 @@ ATH_TEST(engine_decoder)
         }
         /* the decoder: the first step direct, the second recorded, the rest replayed */
         ath_state g;
-        ATH_REQUIRE_OK(ath_engine_state(&e, &g, ATH_DTYPE_BF16, CAP, &t.a));
+        ATH_REQUIRE_OK(ath_engine_state_kv(&e, &g, ATH_DTYPE_BF16, kv, CAP, &t.a));
         ATH_REQUIRE_OK(ath_model_forward(m, &(ath_batch){.tokens = prompt, .n_tokens = NP - 1}, &g, NULL, &scratch, &e.exec));
         ath_decoder dc;
         ATH_REQUIRE_OK(ath_decoder_open(&dc, &e, &g, &ps[k], &t.a));
@@ -307,7 +310,8 @@ ATH_TEST(engine_decoder)
             if (!dc.gpu_sampling)
                 same_logits += memcmp(dc.hlogits.data, want_l[i], sizeof want_l[i]) == 0;
         }
-        printf("    decoder, %-14s %d of %d tokens as directly%s\n", names[k], same_tokens, NG,
+        printf("    decoder, %-14s %-8s %d of %d tokens as directly%s\n", names[k],
+               kv == ATH_DTYPE_I8 ? "int8 KV" : "", same_tokens, NG,
                dc.gpu_sampling ? "" : same_logits == NG ? ", every logit the same bits" : ", logits DIFFER");
         ATH_EXPECT(same_tokens == NG);
         ATH_EXPECT(dc.gpu_sampling || same_logits == NG);
@@ -327,6 +331,59 @@ ATH_TEST(engine_decoder)
         }
         ATH_EXPECT(again == NG);
         ath_decoder_close(&dc);
+    }
+    ath_arena_free(&scratch);
+    ath_engine_close(&e);
+    tiny_close(&t);
+}
+
+/* Snapshots of device states (step 14): saved after 20 tokens, loaded into
+ * a state of another capacity, the state goes on with the same logits, bit
+ * for bit; with the KV cache in bf16 and in int8. The bytes are those of
+ * the same state on the CPU (the layout does not depend on the side). */
+ATH_TEST(engine_snapshots)
+{
+    GPU_OR_SKIP();
+    enum { N = 20, MORE = 6 };
+    static const int32_t ids[N + MORE] = {3, 15, 0, 7, 7, 2, 11, 9, 4, 14, 1, 8, 5, 6, 12, 13,
+                                          10, 3, 3, 9, 1, 0, 15, 2, 8, 4};
+    tiny_model t;
+    ATH_REQUIRE_OK(tiny_open(&t, 13));
+    const ath_model *m = &t.m;
+    ath_engine e;
+    ATH_REQUIRE_OK(ath_engine_open(&e, m, 0, &t.a));
+    ath_arena scratch;
+    ath_arena_init(&scratch, 0);
+    for (int k = 0; k < 2; k++) {
+        const ath_dtype kv = k ? ATH_DTYPE_I8 : ATH_DTYPE_BF16;
+        ath_state a, b, h;
+        ATH_REQUIRE_OK(ath_engine_state_kv(&e, &a, ATH_DTYPE_BF16, kv, 40, &t.a));
+        ATH_REQUIRE_OK(ath_engine_state_kv(&e, &b, ATH_DTYPE_BF16, kv, 64, &t.a));
+        ATH_REQUIRE_OK(ath_state_init_kv(&h, m, ATH_DTYPE_BF16, kv, 30, &t.a));
+        ATH_REQUIRE_OK(ath_model_forward(m, &(ath_batch){.tokens = ids, .n_tokens = N}, &a, NULL, &scratch, &e.exec));
+        const size_t bytes = ath_state_snap_bytes(m, &a);
+        ATH_EXPECT(bytes > 0 && bytes == ath_state_snap_bytes(m, &(ath_state){.act = ATH_DTYPE_BF16, .kv = kv,
+                                                                                 .capacity = 30, .n_past = N,
+                                                                                 .buf = h.buf}));
+        char *snap = malloc(bytes);
+        ATH_REQUIRE(snap);
+        ATH_REQUIRE_OK(ath_state_snap_save(&a, m, snap, bytes));
+        ATH_REQUIRE_OK(ath_state_snap_load(&b, m, N, 0, snap, bytes));
+        ATH_REQUIRE_OK(ath_state_snap_load(&h, m, N, 0, snap, bytes));   /* a host state takes it too */
+        int same = 0;
+        for (int i = N; i < N + MORE; i++) {
+            float la[V], lb[V];
+            ath_tensor ta = f32_tensor(la, 1, V), tb = f32_tensor(lb, 1, V);
+            ATH_REQUIRE_OK(ath_model_forward(m, &(ath_batch){.tokens = ids + i, .n_tokens = 1, .logits = &ta}, &a, NULL,
+                                             &scratch, &e.exec));
+            ATH_REQUIRE_OK(ath_model_forward(m, &(ath_batch){.tokens = ids + i, .n_tokens = 1, .logits = &tb}, &b, NULL,
+                                             &scratch, &e.exec));
+            same += memcmp(la, lb, sizeof la) == 0;
+        }
+        printf("    %s KV: %zu bytes after %d tokens; %d of %d steps after the load with the same logits\n",
+               k ? "int8" : "bf16", bytes, N, same, MORE);
+        ATH_EXPECT_EQ_INT(same, MORE);
+        free(snap);
     }
     ath_arena_free(&scratch);
     ath_engine_close(&e);
@@ -648,7 +705,8 @@ ATH_TEST(generate_golden)
 
 static const ath_test_case tests[] = {
     ATH_TEST_ENTRY(engine_without_gpu), ATH_TEST_ENTRY(engine_weights), ATH_TEST_ENTRY(engine_state),
-    ATH_TEST_ENTRY(engine_pieces),     ATH_TEST_ENTRY(engine_decoder), ATH_TEST_ENTRY(engine_decoder_presence),      ATH_TEST_ENTRY(generate_golden),
+    ATH_TEST_ENTRY(engine_pieces),     ATH_TEST_ENTRY(engine_decoder),
+    ATH_TEST_ENTRY(engine_snapshots), ATH_TEST_ENTRY(engine_decoder_presence),      ATH_TEST_ENTRY(generate_golden),
     ATH_TEST_ENTRY(engine_moe_placement),
 };
 

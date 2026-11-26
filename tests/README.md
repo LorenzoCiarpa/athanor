@@ -180,6 +180,33 @@ The two devices amplify at the same positions, by a factor of 4 to 20 over these
 ATH_MODEL_DIR=models/Qwen3.5-9B ATH_GOLDEN_DIR=tests/golden/data/qwen35-9b ./build/cuda/test_forward forward_golden
 ```
 
+### KV cache in int8 (step 14)
+
+The int8 cache (`src/ops/README.md`, The KV cache in int8) is lossy by design, so it is held to a bound, not to the bits.
+
+**The format.** The first version had one scale per row of 256 values, as decided at the start of the step. On the forward records it doubled the KL against the fp32 reference (0.8B on the GPU: 1.18e-3, against 4.4e-4 with the cache in bf16) and changed a greedy token above the bf16 noise. `tests/golden/kv_int8.py` measures what a cache does to the reference itself. It runs the bf16 reference with its keys and values replaced by what the cache reads back, and gives the mean KL against fp32 over `moe.py`'s 4 prompts (0.8B, 234 positions):
+
+| Cache | Mean KL | Against the bf16 reference |
+| --- | --- | --- |
+| bf16 (the bf16 reference) | 5.26e-4 | 1.00 |
+| int8, a scale per row of 256, keys and values | 1.28e-3 | 2.43 |
+| the same, keys only | 5.29e-4 | 1.00 |
+| the same, values only | 1.24e-3 | 2.36 |
+| int8, groups of 64 | 7.82e-4 | 1.49 |
+| int8, groups of 32 | 6.39e-4 | 1.21 |
+
+Keys survive one scale per row; values do not: a few large values in a row coarsen the step for all the others. Groups of 32 (the block of Q8_0) take most of the loss away for 2 KiB more per token on the 9B (18 KiB instead of 16.25).
+
+**The gate.** `forward_golden` runs each prompt a third time on each device: bf16 activations with the cache in int8 (`kv8` rows of the table). The run is held to the bf16 gate, with the bound the bf16 reference itself needs with the same cache. Its pooled KL must be at most 1.25 times the bf16 reference's (1.21 measured above, with margin), and the greedy token must be the fp32 reference's wherever the margin exceeds the bf16 noise. The int8 run is also compared with the bf16-cache run directly: mean KL between the two and greedy agreement, reported. Measured 2026-11-26:
+
+| Model, device | Pooled KL, int8 cache (bf16 cache) | Against the bf16 reference | Greedy above the noise | int8 against the bf16 cache: KL, the same greedy token |
+| --- | --- | --- | --- | --- |
+| 0.8B, CPU | 3.39e-4 (3.02e-4) | 0.68 | 0 differences of 104 | 4.9e-4, 118 of 119 |
+| 0.8B, GPU | 4.95e-4 (4.40e-4) | 0.99 | 0 differences of 104 | 4.0e-4, 117 of 119 |
+| 9B, GPU | 1.78e-4 (1.86e-4) | 0.47 | 0 differences of 206 | 1.7e-4, 232 of 234 |
+
+`test_engine` (`engine_decoder`) runs the recorded decode step over an int8 cache too: the tokens, and on the host the logits, of the same steps run directly, bit for bit.
+
 ## Engine
 
 Step 8 runs the forward pass on the GPU through the engine (`src/infer/engine.h`). Three checks hold it to the reference.
@@ -221,6 +248,17 @@ A `DEBUG=1` build runs 2 prompts of 8 steps.
 
 
 Step 9 (`engine_decoder`): the decoder's recorded and replayed steps give the logits of the same steps run directly, bit for bit, and with the same uniform numbers the tokens `ath_sample_ref` chooses, for host sampling (top-k 0), GPU sampling (top-k 3) and greedy; a full state is refused; a reset state decodes again with the same recording. `engine_pieces` now allows 5e-5 between a prompt fed in pieces and at once on the tiny random model (1.22e-5 measured): pieces of up to 8 tokens take the GEMV kernel and the decode fusions, the whole prompt cuBLASLt, and the random network amplifies the difference of their roundings (step 4 found it ill-conditioned). Against the CPU it is 2.8e-6. The real checkpoint's gates are the measure: 0 differences in 11,445 steps above the noise, and the GPU forward records at a pooled KL of 4.295e-4 (the bf16 reference's 5.005e-4; 2.4e-4 at step 8 and 2.477e-4 with the first step 9 kernels: the change is rounding luck on the ill-conditioned positions, as the f32 run shows: KL 3e-12, logits within 9.5e-6).
+
+## Prefix snapshots (step 14)
+
+`src/infer/prefix.h` keeps snapshots of a sequence at prefixes of its tokens, in host memory and on disk. Checked by:
+
+- `test_prefix` (CPU, tiny random models):
+  - `prefix_snapshot_roundtrip`: a state saved after 20 tokens has the size the specs give. Loaded into a larger state, it gives the logits of 6 more tokens bit for bit, with the KV cache in bf16 and in int8. A wrong size and a state too small for its rows are refused.
+  - `prefix_store_memory`: the longest prefix shorter than the prompt; the minimum length; a prefix saved twice kept once; the budget in host memory, where the least recently used leaves; a loaded snapshot goes on as the sequence it was taken from.
+  - `prefix_store_disk`: nothing is written before it must be. At close, only a conversation's latest turn is written, not the turns it supersedes. After a reopen, that turn read from disk goes on with the same logits. A branch point (a prefix continued two ways) is written with the rest. The folder's budget keeps the most recently used file. Files of another model or other dtypes are left alone and not used. A file whose payload was damaged passes the scan, is refused at load with the state untouched, and is deleted; a truncated file is not used.
+- `test_engine`, `engine_snapshots`: the same round trip for states on the device, bf16 and int8 KV; the snapshot of a device state loads into a host state too.
+- `test_net`, `serve_snapshots_resume` (Qwen3.5-0.8B): a server opened on a snapshot folder answers a conversation and stops; a new one on the same folder starts the same conversation from the snapshot on disk (89 prompt tokens cached) and gives the same greedy answer.
 
 ## Text
 

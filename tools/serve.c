@@ -46,8 +46,13 @@ void ath_cmd_serve_usage(FILE *out)
             "                       top-k 20; otherwise 0.7, 0.8, 20 and presence penalty\n"
             "                       1.5), which also fill what a request leaves out\n"
             "  --chunk <n>          prompt tokens per forward call (default 4096)\n"
-            "  --kv <bf16|q8>       the KV cache in bf16 (default) or int8 with a scale per\n"
-            "                       token and head: half the memory for long contexts\n"
+            "  --kv <bf16|q8>       the KV cache in bf16 (default) or in int8 with a scale per\n"
+            "                       32 values: about half the memory for long contexts\n"
+            "  --snapshots <dir>    keep prefix snapshots in dir too, across restarts: a\n"
+            "                       conversation or a system prompt seen before starts from\n"
+            "                       its snapshot (default: in host memory only)\n"
+            "  --snap-ram <GiB>     host memory for snapshots (default 8)\n"
+            "  --snap-disk <GiB>    disk space for snapshots in dir (default 64)\n"
             "  --mtp                decode speculatively with the model's draft head (multi-token\n"
             "                       prediction): the same tokens, fewer passes; without recorded\n"
             "                       graphs yet, so slower than the default decoder on a GPU\n"
@@ -114,6 +119,9 @@ int ath_cmd_serve(ath_arena *a, int argc, char **argv)
         else if (!strcmp(o, "--seed") && num(v, 0, 1.8e19, &x)) go.seed = (uint64_t)x, seed_set = true;
         else if (!strcmp(o, "--device") && (!strcmp(v, "cpu") || !strcmp(v, "gpu"))) device = v;
         else if (!strcmp(o, "--kv") && (!strcmp(v, "bf16") || !strcmp(v, "q8"))) go.kv8 = !strcmp(v, "q8");
+        else if (!strcmp(o, "--snapshots")) go.snap_dir = v;
+        else if (!strcmp(o, "--snap-ram") && num(v, 0.001, 1 << 20, &x)) go.snap_ram = (uint64_t)(x * 1073741824.0);
+        else if (!strcmp(o, "--snap-disk") && num(v, 0.001, 1 << 24, &x)) go.snap_disk = (uint64_t)(x * 1073741824.0);
         else if (o[0] == '-')
             return usage_error("bad option or value:", o);
         else if (!dir) {

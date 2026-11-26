@@ -21,6 +21,7 @@ static ath_status declare_states(ath_model *m, ath_arena *a, ath_qwen35_model *q
         return ATH_ERR_NOMEM;
 
     const int64_t kv = (int64_t)c->n_kv_heads * c->head_dim;
+    const int64_t kv_group = ath_qwen35_kv_group(c->head_dim);
     const int64_t conv_dim = 2 * (int64_t)c->lin_k_heads * c->lin_k_dim + (int64_t)c->lin_v_heads * c->lin_v_dim;
     m->n_states = 0;
     for (int32_t l = 0; l < c->n_layers; l++) {
@@ -28,7 +29,7 @@ static ath_status declare_states(ath_model *m, ath_arena *a, ath_qwen35_model *q
         if (c->mixer[l] == ATH_QWEN35_ATTENTION) {
             L->kv = (int32_t)m->n_states;
             m->states[m->n_states++] = (ath_state_spec){
-                .kind = ATH_STATE_KV, .layer = l, .per_token = 2 * kv, .row = c->head_dim};
+                .kind = ATH_STATE_KV, .layer = l, .per_token = 2 * kv, .group = kv_group};
         } else {
             L->conv_state = (int32_t)m->n_states;
             m->states[m->n_states++] = (ath_state_spec){
@@ -44,7 +45,7 @@ static ath_status declare_states(ath_model *m, ath_arena *a, ath_qwen35_model *q
     for (int32_t i = 0; i < q->n_draft; i++) {
         q->draft[i].kv = (int32_t)m->n_states;
         m->states[m->n_states++] = (ath_state_spec){
-            .kind = ATH_STATE_KV, .layer = c->n_layers + i, .per_token = 2 * kv, .row = c->head_dim};
+            .kind = ATH_STATE_KV, .layer = c->n_layers + i, .per_token = 2 * kv, .group = kv_group};
     }
     if (q->n_draft) {
         q->d_hidden = (int32_t)m->n_states;

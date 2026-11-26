@@ -38,7 +38,7 @@ Every name of the 35B's table applies (the norms stored as 1 + w, `ssm_a` as A =
 | Part | Size |
 | --- | --- |
 | KV cache, bf16 (8 layers × keys and values × 4 heads × 256) | 32 KiB per token: 4 GiB at 131,072 tokens |
-| KV cache, int8 with a scale per row (step 14) | 16.25 KiB per token: 2.03 GiB at 131,072 tokens |
+| KV cache, int8 with a scale per 32 values (step 14) | 18 KiB per token: 2.25 GiB at 131,072 tokens |
 | Gated DeltaNet recurrent state (24 layers × 32 heads × 128 × 128, f32) | 48 MiB, fixed |
 | Convolution state (24 layers × 3 × 8192, activation dtype) | 1.1 MiB in bf16, fixed |
 

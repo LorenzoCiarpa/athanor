@@ -5,7 +5,8 @@ The inference engine. Decode at batch 1 is limited by memory bandwidth, so the g
 | File | Content | Step |
 | --- | --- | --- |
 | `engine.h`, `engine.c` | a model on a GPU: the device opened, every param the forward pass reads copied there once, the `ath_exec` a GPU pass needs (device, weights, scratch), sequence states on the device; the decoder, one token at a time in a recorded graph with the choice on the device (step 9); the routed experts of a MoE model handed to a placement (`ath_engine_open_tier`, step 12), and the placement updated between decoder steps | 8 (load, states, exec), 9 (decoder), 12 |
-| `state.c` | paged KV cache, snapshots for prefix reuse; on-disk persistence of prefix snapshots (hash of token prefix → KV pages + recurrent and conv state), with a size budget and LRU eviction. The plain state of one sequence on a device is `ath_state_init_gpu` in `src/model/state.c` (step 8), next to the host one | 13, 14 |
+| `prefix.h`, `prefix.c` | snapshots of a sequence at prefixes of its tokens: trimmed states (`ath_state_snap_*`, `src/model/state.c`) in host memory and in a folder on disk, each under a byte budget, least recently used first out; the longest stored prefix of a prompt; files named by hash, written atomically, checked when read (below) | 14 |
+| `state.c` | paged KV cache: not yet. The state of one sequence, on the host or on a device, is in `src/model/state.c` (steps 4 and 8), with its snapshots (step 14) | — |
 | `sched.c` | request queue, small continuous batching for the server | 13 |
 | `tier.h`, `tier.c` | MoE expert placement (`ath_placement`, step 12): every routed expert in pinned RAM, regrouped for the CPU; slots in VRAM for as many as fit; the tables a pass reads (`ath_exec.experts`); the slots follow use between passes. Disk and a copy-or-compute cost model: not yet (below) | 12 |
 | `spec.h`, `spec.c` | speculative decoding with the model's draft head (the MTP head): a guess verified in the same pass as the next token, the tokens of plain decoding whatever the guesses; driven from the host for now | 13 |
@@ -17,7 +18,16 @@ The inference engine. Decode at batch 1 is limited by memory bandwidth, so the g
 | Full attention (one in four) | paged KV cache, quantizable | linear |
 | Gated DeltaNet (three in four) | recurrent matrix per head + conv state | constant |
 
-Hybrid models make prefix snapshots small: three layers in four keep a fixed-size recurrent and conv state, and only the attention layers keep KV pages that grow with the prefix. A snapshot saved on disk survives a restart, so a harness that resends a long system prompt and tool list resumes it instead of recomputing it (step 14).
+Hybrid models make prefix snapshots small: three layers in four keep a fixed-size recurrent and conv state, and only the attention layers keep KV rows that grow with the prefix. A snapshot saved on disk survives a restart, so a harness that resends a long system prompt and tool list resumes it instead of recomputing it (step 14).
+
+## Prefix snapshots (step 14)
+
+A recurrent state cannot be rolled back, so a prompt that begins with tokens already run starts from a snapshot taken after them. `athanor serve` and `athanor chat` keep one on the device (step 13); `prefix.c` keeps more:
+
+- **Trimmed.** A snapshot holds, of every KV buffer, the rows of the tokens it has (keys, values, and in int8 their scales), and every fixed buffer whole (`ath_state_snap_save`, `src/model/state.c`). Its bytes do not depend on the state's capacity, nor on the side: a snapshot of a device state loads into a host state and the other way round. Loaded into a state of the same model and dtypes, the sequence goes on with the same bits (`tests/test_prefix.c`, `tests/test_engine.c`).
+- **Host memory** (default 8 GiB, `--snap-ram`) and **disk** (`--snapshots <dir>`, default 64 GiB, `--snap-disk`), each least recently used first out. A prompt starts from the longest prefix held by the state, the device's snapshot or the store.
+- **What reaches the disk.** A snapshot goes there when it leaves host memory and when the program stops, unless it is superseded: a longer snapshot begins with its tokens, and they were only ever followed one way. The earlier turns of a conversation are not written; its latest turn and a prefix several prompts share (a system prompt) are. On a device with room for two states the snapshot there goes to the store only when a new one does not continue it, and when the program stops; without that room (a long context) every snapshot goes to the store.
+- **Files.** One per snapshot, named by the SHA-256 of the store's identity and the tokens. A header (magic, version, identity, dtypes, token counts, payload size and XXH64, its own XXH64), the tokens, the payload. The identity is a hash of the model (family, config, every tensor's name, dtype, shape, size, and its first and last 4 KiB) and the state's dtypes. Written under a temporary name, synced, renamed; the files' times record the order of use. A file of another model or other dtypes is left alone; a damaged or truncated one is not used, and one whose payload does not check out when loaded is deleted.
 
 ## MoE placement (step 12)
 

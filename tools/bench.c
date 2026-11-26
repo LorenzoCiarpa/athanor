@@ -75,8 +75,8 @@ void ath_cmd_bench_usage(FILE *out)
             "  --json <file>         write the report there\n"
             "  --direct              decode with one forward call per token and the logits on\n"
             "                        the host (step 8), not with the decoder's graph\n"
-            "  --kv <bf16|q8>        the KV cache in bf16 (default) or int8 with a scale per token\n"
-            "                        and head (step 14)\n"
+            "  --kv <bf16|q8>        the KV cache in bf16 (default) or in int8 with a scale per 32\n"
+            "                        values (step 14)\n"
             "  --mtp                 decode speculatively with the model's draft head (multi-token\n"
             "                        prediction, step 13): tg tests also report the guesses kept\n"
             "  --no-hash             do not hash the weight files for the report\n",

@@ -448,6 +448,7 @@ typedef struct {
     void                  *res_host;             /* GPU: the residual stream copied back */
     const char            *name;
     ath_dtype              act;
+    ath_dtype              kv;                   /* the KV cache: act, or int8 (step 14) */
     const int32_t         *tokens;
     int32_t                n_prompt, n_tokens;   /* positions in the record */
     int32_t                n_run;                /* positions this run computes */
@@ -460,6 +461,11 @@ typedef struct {
     int32_t                pos0;                 /* first position of the current call */
     double                 seconds;
 } job;
+
+static const char *run_name(const job *j)
+{
+    return j->act == ATH_DTYPE_F32 ? "f32" : j->kv == ATH_DTYPE_I8 ? "kv8" : "bf16";
+}
 
 /* Score of the residual stream entering `layer` against both reference runs,
  * for the positions of the current call. */
@@ -511,7 +517,8 @@ static void *run_job(void *arg)
     ath_state s;
     ath_hooks h = {.on_residual = compare_residual, .u = j};
     const ath_exec x = j->eng ? j->eng->exec : (ath_exec){.pool = j->pool};
-    j->st = j->eng ? ath_engine_state(j->eng, &s, j->act, j->n_run, &a) : ath_state_init(&s, j->m, j->act, j->n_run, &a);
+    j->st = j->eng ? ath_engine_state_kv(j->eng, &s, j->act, j->kv, j->n_run, &a)
+                   : ath_state_init_kv(&s, j->m, j->act, j->kv, j->n_run, &a);
     int32_t first = j->n_prompt < j->n_run ? j->n_prompt : j->n_run - 1;
     if (first < 1)
         first = 1;
@@ -599,6 +606,16 @@ static const ath_tensor *golden(ath_test *t_, const ath_safetensors *g, const ch
 }
 
 enum { MAX_PROMPTS = 4, MAX_LAYERS = 128 };
+enum { RUN_BF16, RUN_F32, RUN_KV8, RUNS };   /* the runs of each prompt, per device */
+
+/* The KV cache in int8 (step 14) is lossy by design: its run is held to the
+ * bf16 gate with the bound the bf16 reference itself would need with the
+ * same cache. tests/golden/kv_int8.py runs the reference in bf16 with its
+ * keys and values stored as athanor's int8 cache (groups of 32): on
+ * Qwen3.5-0.8B its mean KL is 1.21 times its own (6.39e-4 against 5.26e-4,
+ * 234 positions); with margin, 1.25. The greedy rule stays as it is: no
+ * other token where the margin exceeds the bf16 noise. */
+#define KV_INT8_KL 1.25
 
 typedef struct {
     const char       *id, *name;
@@ -679,8 +696,9 @@ ATH_TEST(forward_golden)
     for (size_t i = 0; i < n_prompts; i++)
         ATH_REQUIRE(read_prompt(t_, ath_json_at(recs, i), &g, &a, &P[i]));
 
-    /* two runs per prompt, bf16 and f32 activations, on the CPU; then the
-     * same on the GPU when there is one */
+    /* three runs per prompt on the CPU: bf16 and f32 activations, and bf16
+     * with the KV cache in int8 (step 14); then the same on the GPU when
+     * there is one */
     ath_pool pool = {.n_threads = 0};   /* started below, once nothing can return early */
     ath_engine *eng = NULL;
     if (ath_gpu_count() > 0) {
@@ -688,19 +706,20 @@ ATH_TEST(forward_golden)
         ATH_REQUIRE(eng);
         ATH_REQUIRE_OK(ath_engine_open(eng, &m, 0, &a));
     }
-    job J[4 * MAX_PROMPTS];
-    pthread_t th[2 * MAX_PROMPTS];
-    const int n_cpu = 2 * (int)n_prompts, n_jobs = eng ? 2 * n_cpu : n_cpu;
+    job J[2 * RUNS * MAX_PROMPTS];
+    pthread_t th[RUNS * MAX_PROMPTS];
+    const int n_cpu = RUNS * (int)n_prompts, n_jobs = eng ? 2 * n_cpu : n_cpu;
     for (int k = 0; k < n_jobs; k++) {
         const int kc = k % n_cpu;
-        prompt *p = &P[kc / 2];
+        prompt *p = &P[kc / RUNS];
         job *j = &J[k];
         /* ATH_FORWARD_GPU_ONLY: the GPU runs only, for a model the CPU's
          * reference ops would take hours on (Qwen3.6-35B-A3B, step 12) */
         int32_t n_run = k < n_cpu && getenv("ATH_FORWARD_GPU_ONLY") && eng ? 0 : positions_to_run(p->n_tokens);
         *j = (job){
             .m = &m, .g = &g, .pool = &pool, .eng = k >= n_cpu ? eng : NULL, .name = p->name,
-            .act = kc % 2 ? ATH_DTYPE_F32 : ATH_DTYPE_BF16,
+            .act = kc % RUNS == RUN_F32 ? ATH_DTYPE_F32 : ATH_DTYPE_BF16,
+            .kv = kc % RUNS == RUN_KV8 ? ATH_DTYPE_I8 : kc % RUNS == RUN_F32 ? ATH_DTYPE_F32 : ATH_DTYPE_BF16,
             .tokens = p->tokens, .n_prompt = p->n_prompt, .n_tokens = p->n_tokens, .n_run = n_run,
             .res = p->res, .res32 = p->res32, .rms = p->rms, .rms32 = p->rms32,
         };
@@ -709,7 +728,7 @@ ATH_TEST(forward_golden)
         j->err32 = ath_arena_zalloc(&a, (size_t)L1 * sizeof(double), 8);
         j->res_host = j->eng ? ath_arena_alloc(&a, (size_t)(n_run ? n_run : 1) * (size_t)H * sizeof(float), 64) : NULL;
         ATH_REQUIRE(j->logits && j->err && j->err32 && (!j->eng || j->res_host));
-        if (k < n_cpu && kc % 2 == 0)   /* RMS of each layer's stream over the positions run */
+        if (k < n_cpu && kc % RUNS == RUN_BF16)   /* RMS of each layer's stream over the positions run */
             for (int64_t l = 0, nr = positions_to_run(p->n_tokens); l < L1; l++) {
                 const size_t at = (size_t)(l * p->n_tokens) * (size_t)H;
                 p->rms[l] = rms_of((const char *)p->res->data + at * ath_dtype_size(p->res->dtype), p->res->dtype,
@@ -756,13 +775,18 @@ ATH_TEST(forward_golden)
 
     float *row = ath_arena_alloc(&a, (size_t)V * sizeof(float), 64);   /* a bf16 reference row, widened */
     ATH_REQUIRE(row);
-    double all_kl[2] = {0}, all_ref[2] = {0};   /* sums over every position of every prompt (bf16 runs), per device */
-    int all_n[2] = {0}, all_bad[2] = {0}, all_checked[2] = {0};
+    /* sums over every position of every prompt, per device and bf16 run (bf16
+     * KV, int8 KV): [2 * device + (int8 KV)] */
+    double all_kl[4] = {0}, all_ref[4] = {0};
+    int all_n[4] = {0}, all_bad[4] = {0}, all_checked[4] = {0};
+    /* the int8 KV runs against the bf16 KV runs, per device */
+    double kv_kl[2] = {0}, kv_kl_max[2] = {0};
+    int kv_same[2] = {0}, kv_n[2] = {0};
     printf("  %-6s %-8s %9s  %5s  %-9s %-9s %-9s  %-9s %-9s  %-7s %-7s %-6s\n", "prompt", "act", "positions", "s",
            "KL mean", "KL max", "ref mean", "ref max", "logits", "greedy", "ref", "res");
     for (int k = 0; k < n_jobs; k++) {
         const job *j = &J[k];
-        const prompt *p = &P[(k % n_cpu) / 2];
+        const prompt *p = &P[(k % n_cpu) / RUNS];
         if (j->n_run == 0)
             continue;
         double kl_sum = 0, kl_max = 0, ref_sum = 0, ref_max = 0;
@@ -788,7 +812,7 @@ ATH_TEST(forward_golden)
             ath_differs += differs;
             if (getenv("ATH_FORWARD_DETAIL"))
                 printf("  position %-6s %-4s%s %3d  KL %.2e  ref %.2e  top-2 margin %6.3f%s%s\n", p->name,
-                       j->act == ATH_DTYPE_F32 ? "f32" : "bf16", j->eng ? " gpu" : "", t, kl, klr, margin,
+                       run_name(j), j->eng ? " gpu" : "", t, kl, klr, margin,
                        differs ? "  athanor differs" : "", argmax_f32(row, V) != x ? "  reference differs" : "");
             if (margin > noise) {
                 greedy_checked++;
@@ -807,7 +831,7 @@ ATH_TEST(forward_golden)
             }
         const char *dev = j->eng ? " gpu" : "";
         printf("  %-6s %-4s%-4s %4d of %-3d %5.1f  %-9.2e %-9.2e %-9.2e  %-9.2e %-9.2e  %2d of %-2d %-7d %.2e (layer %d)\n",
-               p->name, j->act == ATH_DTYPE_F32 ? "f32" : "bf16", dev, j->n_run, j->n_tokens, j->seconds, kl_mean,
+               p->name, run_name(j), dev, j->n_run, j->n_tokens, j->seconds, kl_mean,
                kl_max, ref_mean, ref_max, lerr, ath_differs, j->n_run, ref_differs, res_worst, res_layer);
 
         char msg[300];
@@ -844,20 +868,35 @@ ATH_TEST(forward_golden)
                 ath_test_fail_(t_, __FILE__, __LINE__, msg);
             }
         }
-        const int d = j->eng != NULL;
+        const int d = 2 * (j->eng != NULL) + (j->kv == ATH_DTYPE_I8);
+        if (j->kv == ATH_DTYPE_I8) {
+            const job *jb = &J[k - (RUN_KV8 - RUN_BF16)];   /* the same prompt with the KV cache in bf16 */
+            for (int32_t t = 0; t < j->n_run && t < jb->n_run; t++) {
+                const float *a16 = jb->logits + (size_t)t * (size_t)V, *a8 = j->logits + (size_t)t * (size_t)V;
+                const double kl = kl_row(a16, ATH_DTYPE_F32, a8, V);
+                kv_kl[d / 2] += kl;
+                kv_kl_max[d / 2] = fmax(kv_kl_max[d / 2], kl);
+                kv_same[d / 2] += argmax_f32(a16, V) == argmax_f32(a8, V);
+                kv_n[d / 2]++;
+            }
+        }
         all_kl[d] += kl_sum;
         all_ref[d] += ref_sum;
         all_n[d] += j->n_run;
         all_bad[d] += greedy_bad;
         all_checked[d] += greedy_checked;
     }
-    for (int d = 0; d < (eng ? 2 : 1); d++) {
-        if (all_n[d] == 0)
+    for (int g = 0; g < (eng ? 4 : 2); g++) {
+        if (all_n[g] == 0)
             continue;
-        printf("  bf16 on the %s, all %d positions run: mean KL %.3e, bf16 reference %.3e (ratio %.2f); greedy\n"
+        const char *what = g % 2 ? "bf16 with the KV cache in int8" : "bf16", *dn = g / 2 ? "GPU" : "CPU";
+        printf("  %s on the %s, all %d positions run: mean KL %.3e, bf16 reference %.3e (ratio %.2f); greedy\n"
                "  token differs from the fp32 reference at %d of %d positions whose top-2 margin exceeds the bf16 noise\n",
-               d ? "GPU" : "CPU", all_n[d], all_kl[d] / all_n[d], all_ref[d] / all_n[d], all_kl[d] / all_ref[d],
-               all_bad[d], all_checked[d]);
+               what, dn, all_n[g], all_kl[g] / all_n[g], all_ref[g] / all_n[g], all_kl[g] / all_ref[g], all_bad[g],
+               all_checked[g]);
+        if (g % 2 && kv_n[g / 2])
+            printf("  int8 KV against bf16 KV on the %s: mean KL %.3e (max %.3e), the same greedy token at %d of %d\n",
+                   dn, kv_kl[g / 2] / kv_n[g / 2], kv_kl_max[g / 2], kv_same[g / 2], kv_n[g / 2]);
         /* ATH_FORWARD_NO_KL_GATE: a model of random weights (tests/golden/tiny_moe.py), where
          * athanor's and the bf16 reference's errors are rounding noise of the same size and
          * which is smaller is chance (ratios 0.14 to 1.65 over five seeds, step 12): reported,
@@ -866,14 +905,17 @@ ATH_TEST(forward_golden)
             printf("  (KL rule not gated: ATH_FORWARD_NO_KL_GATE)\n");
         else if (full) {
             char msg[200];
-            if (!(all_kl[d] <= all_ref[d])) {
-                snprintf(msg, sizeof msg, "bf16 %s: mean KL %.3g > bf16 reference %.3g", d ? "GPU" : "CPU",
-                         all_kl[d] / all_n[d], all_ref[d] / all_n[d]);
+            /* the int8 cache: as far from fp32 as the bf16 reference would be with
+             * it (KV_INT8_KL) */
+            const double bound = g % 2 ? KV_INT8_KL : 1.0;
+            if (!(all_kl[g] <= bound * all_ref[g])) {
+                snprintf(msg, sizeof msg, "%s %s: mean KL %.3g > %.2f times the bf16 reference's %.3g", what, dn,
+                         all_kl[g] / all_n[g], bound, all_ref[g] / all_n[g]);
                 ath_test_fail_(t_, __FILE__, __LINE__, msg);
             }
-            if (all_bad[d]) {
-                snprintf(msg, sizeof msg, "bf16 %s: greedy token differs at %d of %d positions above the noise",
-                         d ? "GPU" : "CPU", all_bad[d], all_checked[d]);
+            if (all_bad[g]) {
+                snprintf(msg, sizeof msg, "%s %s: greedy token differs at %d of %d positions above the noise", what,
+                         dn, all_bad[g], all_checked[g]);
                 ath_test_fail_(t_, __FILE__, __LINE__, msg);
             }
         }
@@ -889,7 +931,7 @@ ATH_TEST(forward_golden)
         for (int k = 0; k < n_jobs; k++)
             for (int64_t l = 0; l < L1; l++)
                 printf("  layer %-6s %-4s%s %2d  vs bf16 ref %.2e  vs fp32 ref %.2e\n", J[k].name,
-                       J[k].act == ATH_DTYPE_F32 ? "f32" : "bf16", J[k].eng ? " gpu" : "", (int)l, J[k].err[l],
+                       run_name(&J[k]), J[k].eng ? " gpu" : "", (int)l, J[k].err[l],
                        J[k].err32[l]);
 
 out:

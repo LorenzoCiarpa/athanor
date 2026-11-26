@@ -21,6 +21,7 @@
 #include "net/http.h"
 
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
@@ -848,6 +849,85 @@ ATH_TEST(serve_mtp_same_answers)
     ath_arena_free(&a);
 }
 
+/* ---- prefix snapshots across a restart (step 14) ------------------------------------ */
+
+/* One greedy answer to msgs from a server opened on the snapshot folder
+ * dir and then stopped: the answer, the cached prompt tokens. */
+static bool answer_once(ath_test *t_, const char *dir, const ath_msg *msgs, int32_t n, const char **out,
+                        int32_t *cached, ath_arena *a)
+{
+    static ath_gen g;
+    const ath_gen_opts go = {.ctx = 1024, .experts = -1, .seed = 1, .snap_dir = dir};
+    if (ath_gen_open(&g, model_dir(), &go, a) != ATH_OK) {
+        ATH_EXPECT(!"gen opens");
+        return false;
+    }
+    collect c;
+    ath_buf_init(&c.text, a);
+    const ath_gen_sink sink = {.text = c_text, .thinking = c_think, .tool_begin = c_begin, .tool_args = c_text,
+                               .tool_end = c_end, .u = &c};
+#ifdef ATH_DEBUG
+    const int32_t max_tokens = 8;
+#else
+    const int32_t max_tokens = 32;
+#endif
+    ath_gen_request r = {.msgs = msgs, .n_msgs = n, .sampler = {0, 0, 1, 0, 0}, .max_tokens = max_tokens};
+    ath_gen_result res;
+    const bool ok = ath_gen_run(&g, &r, &sink, &res, a) == ATH_OK;
+    ath_gen_close(&g);   /* writes the snapshot to dir */
+    *out = ath_buf_str(&c.text);
+    *cached = res.cached_tokens;
+    ATH_EXPECT(ok);
+    return ok;
+}
+
+/* A server stopped and started again on the same snapshot folder starts a
+ * conversation it has seen from the snapshot on disk: the prompt's stable
+ * part cached, the same answer as the first time. */
+ATH_TEST(serve_snapshots_resume)
+{
+    char cfg[1024];
+    if (!model_file(cfg, sizeof cfg, "config.json"))
+        ATH_SKIP("no checkpoint (ATH_MODEL_DIR)");
+    ath_arena a;
+    ath_arena_init(&a, 0);
+    tmpdir d;
+    ATH_REQUIRE(tmpdir_make(&d));
+    char dir[600];
+    snprintf(dir, sizeof dir, "%s/snapshots", d.path);
+    static const char sys[] =
+        "You are a careful assistant for a small library. You answer questions about books, authors and opening "
+        "hours. You keep answers short, you never invent titles, and when you do not know something you say so. "
+        "The library opens at nine and closes at six, every day but Sunday.";
+    const ath_msg conv[] = {{.role = ATH_MSG_SYSTEM, .content = sys},
+                            {.role = ATH_MSG_USER, .content = "When do you open?"},
+                            {.role = ATH_MSG_ASSISTANT, .content = "At nine."},
+                            {.role = ATH_MSG_USER, .content = "And on Sunday?"}};
+    const char *first = NULL, *again = NULL;
+    int32_t cached1 = -1, cached2 = -1;
+    if (answer_once(t_, dir, conv, 4, &first, &cached1, &a) && answer_once(t_, dir, conv, 4, &again, &cached2, &a)) {
+        printf("    first run: %d tokens cached; after a restart: %d tokens cached from disk; answers %s\n", cached1,
+               cached2, strcmp(first, again) ? "DIFFER" : "the same");
+        printf("    answer: %.60s\n", first);
+        ATH_EXPECT_EQ_INT(cached1, 0);
+        ATH_EXPECT(cached2 >= 64);
+        ATH_EXPECT_STR_EQ(again, first);
+    }
+    /* the folder and its snapshot */
+    DIR *dd = opendir(dir);
+    int files = 0;
+    char p[1200];
+    for (const struct dirent *de; dd && (de = readdir(dd));)
+        if (strcmp(de->d_name, ".") && strcmp(de->d_name, "..") && snprintf(p, sizeof p, "%s/%s", dir, de->d_name) > 0)
+            files += unlink(p) == 0;
+    if (dd)
+        closedir(dd);
+    ATH_EXPECT_EQ_INT(files, 1);
+    rmdir(dir);
+    rmdir(d.path);
+    ath_arena_free(&a);
+}
+
 static const ath_test_case tests[] = {
     ATH_TEST_ENTRY(http_parse_whole_and_pipelined),
     ATH_TEST_ENTRY(http_parse_split),
@@ -860,6 +940,7 @@ static const ath_test_case tests[] = {
     ATH_TEST_ENTRY(http_loopback),
     ATH_TEST_ENTRY(serve_real_model),
     ATH_TEST_ENTRY(serve_mtp_same_answers),
+    ATH_TEST_ENTRY(serve_snapshots_resume),
 };
 
 int main(int argc, char **argv)

@@ -838,77 +838,86 @@ ATH_TEST(scatter_rows)
 
 /* ---- the int8 KV cache (step 14) ------------------------------------------- */
 
-/* Stored rows: scale max|x| / 127, each value within half a scale step of
- * x, a zero row all zero; read back as q · s in the output's dtype; and
- * attention over the int8 cache equals attention over the cache it reads
- * back as, bit for bit. */
+/* Stored groups (g values of a row, a scale each; g = 16 is the whole row):
+ * scale max|x| / 127, each value within half a scale step of x, a zero
+ * group all zero; read back as q · s in the output's dtype; and attention
+ * over the int8 cache equals attention over the cache it reads back as, bit
+ * for bit, with the keys and the values in groups of different sizes. */
 ATH_TEST(kv_q8)
 {
     enum { S = 40, NKV = 2, D = 16, T = 3, NH = 4 };
-    for (int a = 0; a < 2; a++) {
-        const ath_dtype act = a ? ATH_DTYPE_F32 : ATH_DTYPE_BF16;
-        ath_tensor x = random_tensor(act, 3, (int64_t[]){S, NKV, D});
-        for (int64_t i = 0; i < D; i++)
-            ath_store_f32(x.data, act, (5 * NKV + 1) * D + i, 0.0f);   /* row (5, 1): zero */
-        int32_t pv[S];
-        for (int i = 0; i < S; i++)
-            pv[i] = S - 1 - i;                                         /* stored in reverse order */
-        ath_tensor pos = ids_tensor(S, pv);
-        ath_tensor kc = Z(ATH_DTYPE_I8, SHAPE(S, NKV, D)), ks = Z(ATH_DTYPE_F32, SHAPE(S, NKV));
-        ATH_REQUIRE_OK(ath_kv_store_ref(&x, &pos, &kc, &ks));
-        ath_tensor back = Z(act, SHAPE(S, NKV, D));
-        ATH_REQUIRE_OK(ath_kv_load_ref(&kc, &ks, &back));
-        int bad = 0;
-        for (int64_t t = 0; t < S; t++)
-            for (int64_t h = 0; h < NKV; h++) {
-                const int64_t row = (int64_t)pv[t] * NKV + h;
-                float amax = 0;
-                for (int64_t i = 0; i < D; i++)
-                    amax = fmaxf(amax, fabsf(at(&x, (t * NKV + h) * D + i)));
-                const float sc = ((const float *)ks.data)[row];
-                const int bad0 = bad;
-                bad += sc != amax / 127.0f;
-                for (int64_t i = 0; i < D; i++) {
-                    const float xv = at(&x, (t * NKV + h) * D + i);
-                    const int8_t q = ((const int8_t *)kc.data)[row * D + i];
-                    /* half a step, and the rounding of x · (1 / s): two fp32 roundings
-                     * of a number up to 127, under 3e-5 of a step */
-                    const int far = fabsf(xv - (float)q * sc) > 0.5f * sc * (1 + 1e-4f);
-                    const int wrong = at(&back, row * D + i) != ath_round_to(act, (float)q * sc);
-                    if ((far || wrong) && bad == bad0)
-                        printf("    kv_q8 %s: row %lld element %lld: x %.9g q %d scale %.9g (max %.9g) back %.9g%s%s\n",
-                               a ? "f32" : "bf16", (long long)row, (long long)i, xv, q, sc, amax,
-                               at(&back, row * D + i), far ? " far" : "", wrong ? " wrong" : "");
-                    bad += far + wrong;
+    static const int64_t groups[] = {16, 8, 4};
+    for (int a = 0; a < 2; a++)
+        for (int gi = 0; gi < 3; gi++) {
+            const ath_dtype act = a ? ATH_DTYPE_F32 : ATH_DTYPE_BF16;
+            const int64_t G = groups[gi], NB = D / G, gv = groups[(gi + 1) % 3];
+            ath_tensor x = random_tensor(act, 3, (int64_t[]){S, NKV, D});
+            for (int64_t i = 0; i < G; i++)
+                ath_store_f32(x.data, act, (5 * NKV + 1) * D + i, 0.0f);   /* group (5, 1, 0): zero */
+            int32_t pv[S];
+            for (int i = 0; i < S; i++)
+                pv[i] = S - 1 - i;                                         /* stored in reverse order */
+            ath_tensor pos = ids_tensor(S, pv);
+            ath_tensor kc = Z(ATH_DTYPE_I8, SHAPE(S, NKV, D)), ks = Z(ATH_DTYPE_F32, SHAPE(S, NKV, NB));
+            ATH_REQUIRE_OK(ath_kv_store_ref(&x, &pos, &kc, &ks));
+            ath_tensor back = Z(act, SHAPE(S, NKV, D));
+            ATH_REQUIRE_OK(ath_kv_load_ref(&kc, &ks, &back));
+            int bad = 0;
+            for (int64_t t = 0; t < S; t++)
+                for (int64_t b = 0; b < NKV * NB; b++) {   /* the groups of token t */
+                    const int64_t grp = (int64_t)pv[t] * NKV * NB + b, xb = (t * NKV * NB + b) * G;
+                    float amax = 0;
+                    for (int64_t i = 0; i < G; i++)
+                        amax = fmaxf(amax, fabsf(at(&x, xb + i)));
+                    const float sc = ((const float *)ks.data)[grp];
+                    const int bad0 = bad;
+                    bad += sc != amax / 127.0f;
+                    for (int64_t i = 0; i < G; i++) {
+                        const float xv = at(&x, xb + i);
+                        const int8_t q = ((const int8_t *)kc.data)[grp * G + i];
+                        /* half a step, and the rounding of x · (1 / s): two fp32 roundings
+                         * of a number up to 127, under 3e-5 of a step */
+                        const int far = fabsf(xv - (float)q * sc) > 0.5f * sc * (1 + 1e-4f);
+                        const int wrong = at(&back, grp * G + i) != ath_round_to(act, (float)q * sc);
+                        if ((far || wrong) && bad == bad0)
+                            printf("    kv_q8 %s g %lld: group %lld element %lld: x %.9g q %d scale %.9g (max %.9g) "
+                                   "back %.9g%s%s\n",
+                                   a ? "f32" : "bf16", (long long)G, (long long)grp, (long long)i, xv, q, sc, amax,
+                                   at(&back, grp * G + i), far ? " far" : "", wrong ? " wrong" : "");
+                        bad += far + wrong;
+                    }
                 }
-            }
-        ATH_EXPECT_EQ_INT(bad, 0);
-        ATH_EXPECT(((const float *)ks.data)[(S - 1 - 5) * NKV + 1] == 0.0f);
-        /* attention: the int8 cache against the cache it reads back as */
-        ath_tensor v = random_tensor(act, 3, (int64_t[]){S, NKV, D});
-        ath_tensor vc = Z(ATH_DTYPE_I8, SHAPE(S, NKV, D)), vs = Z(ATH_DTYPE_F32, SHAPE(S, NKV));
-        ATH_REQUIRE_OK(ath_kv_store_ref(&v, &pos, &vc, &vs));
-        ath_tensor vback = Z(act, SHAPE(S, NKV, D));
-        ATH_REQUIRE_OK(ath_kv_load_ref(&vc, &vs, &vback));
-        ath_tensor q = random_tensor(act, 3, (int64_t[]){T, NH, D});
-        ath_tensor qp = ids_tensor(T, (const int32_t[]){0, 17, S - 1});
-        ath_tensor o1 = Z(act, SHAPE(T, NH, D)), o2 = Z(act, SHAPE(T, NH, D));
-        ATH_REQUIRE_OK(ath_attn_ref(&q, &back, &vback, &qp, 0.25f, &o1));
-        ATH_REQUIRE_OK(ath_attn_q8_ref(&q, &kc, &ks, &vc, &vs, &qp, 0.25f, &o2));
-        ATH_EXPECT(same_bits(&o1, &o2));
-        /* a smaller output reads the first rows */
-        ath_tensor first = Z(act, SHAPE(7, NKV, D));
-        ATH_REQUIRE_OK(ath_kv_load_ref(&kc, &ks, &first));
-        ATH_EXPECT(memcmp(first.data, back.data, ath_tensor_nbytes(&first)) == 0);
-    }
-    /* argument checks: a float cache, a position outside it, a row of another length */
+            ATH_EXPECT_EQ_INT(bad, 0);
+            ATH_EXPECT(((const float *)ks.data)[((S - 1 - 5) * NKV + 1) * NB] == 0.0f);
+            /* attention: the int8 cache against the cache it reads back as */
+            ath_tensor v = random_tensor(act, 3, (int64_t[]){S, NKV, D});
+            ath_tensor vc = Z(ATH_DTYPE_I8, SHAPE(S, NKV, D)), vs = Z(ATH_DTYPE_F32, SHAPE(S, NKV, D / gv));
+            ATH_REQUIRE_OK(ath_kv_store_ref(&v, &pos, &vc, &vs));
+            ath_tensor vback = Z(act, SHAPE(S, NKV, D));
+            ATH_REQUIRE_OK(ath_kv_load_ref(&vc, &vs, &vback));
+            ath_tensor q = random_tensor(act, 3, (int64_t[]){T, NH, D});
+            ath_tensor qp = ids_tensor(T, (const int32_t[]){0, 17, S - 1});
+            ath_tensor o1 = Z(act, SHAPE(T, NH, D)), o2 = Z(act, SHAPE(T, NH, D));
+            ATH_REQUIRE_OK(ath_attn_ref(&q, &back, &vback, &qp, 0.25f, &o1));
+            ATH_REQUIRE_OK(ath_attn_q8_ref(&q, &kc, &ks, &vc, &vs, &qp, 0.25f, &o2));
+            ATH_EXPECT(same_bits(&o1, &o2));
+            /* a smaller output reads the first rows */
+            ath_tensor first = Z(act, SHAPE(7, NKV, D));
+            ATH_REQUIRE_OK(ath_kv_load_ref(&kc, &ks, &first));
+            ATH_EXPECT(memcmp(first.data, back.data, ath_tensor_nbytes(&first)) == 0);
+        }
+    /* argument checks: a float cache, a position outside it, a row of another
+     * length, scales that do not divide the row, scales of two dimensions */
     ath_tensor x = random_tensor(ATH_DTYPE_F32, 3, (int64_t[]){1, 2, 8});
-    ath_tensor kc = Z(ATH_DTYPE_I8, SHAPE(4, 2, 8)), ks = Z(ATH_DTYPE_F32, SHAPE(4, 2));
+    ath_tensor kc = Z(ATH_DTYPE_I8, SHAPE(4, 2, 8)), ks = Z(ATH_DTYPE_F32, SHAPE(4, 2, 2));
     ath_tensor kf = Z(ATH_DTYPE_F32, SHAPE(4, 2, 8)), k7 = Z(ATH_DTYPE_I8, SHAPE(4, 2, 7));
+    ath_tensor ks3 = Z(ATH_DTYPE_F32, SHAPE(4, 2, 3)), ks2 = Z(ATH_DTYPE_F32, SHAPE(4, 2));
     ath_tensor p4 = ids_tensor(1, (const int32_t[]){4}), p0 = ids_tensor(1, (const int32_t[]){0});
     ATH_EXPECT_STATUS(ath_kv_store_ref(&x, &p0, &kf, &ks), ATH_ERR_TYPE);
     ATH_EXPECT_STATUS(ath_kv_store_ref(&x, &p4, &kc, &ks), ATH_ERR_RANGE);
     ATH_EXPECT_STATUS(ath_kv_store_ref(&x, &p0, &k7, &ks), ATH_ERR_INVALID_ARG);
+    ATH_EXPECT_STATUS(ath_kv_store_ref(&x, &p0, &kc, &ks3), ATH_ERR_INVALID_ARG);
+    ATH_EXPECT_STATUS(ath_kv_store_ref(&x, &p0, &kc, &ks2), ATH_ERR_INVALID_ARG);
 }
 
 static const ath_test_case tests[] = {

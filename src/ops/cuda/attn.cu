@@ -45,34 +45,35 @@
 #define ATTN_KREG (ATH_ATTN_MAX_DV / ATH_WARP)
 
 /* Keys or values as the kernels read them: f32 or bf16, or (step 14) an
- * int8 cache with a scale per row (one token, one KV head) read back as
- * q · s rounded to rnd, the queries' dtype; the arithmetic after the load
- * is the same either way, so attention over an int8 cache gives the bits it
- * gives over the cache those values make. */
+ * int8 cache with a scale per group of g values (of one token and one KV
+ * head) read back as q · s rounded to rnd, the queries' dtype; the
+ * arithmetic after the load is the same either way, so attention over an
+ * int8 cache gives the bits it gives over the cache those values make. */
 typedef struct {
     const void  *p;
     int          dt;     /* ATH_DTYPE_F32, ATH_DTYPE_BF16 or ATH_DTYPE_I8 */
-    const float *s;      /* I8: the row scales                            */
+    const float *s;      /* I8: the group scales                          */
     int          rnd;    /* I8: the dtype the values round to             */
+    int64_t      g;      /* I8: values per scale                          */
 } kvsrc;
 
-/* Element i of a [S, nkv, n] buffer whose rows have n elements. */
-static __device__ __forceinline__ float kv_ld(kvsrc a, int64_t i, int64_t n)
+/* Element i of a [S, nkv, n] buffer. */
+static __device__ __forceinline__ float kv_ld(kvsrc a, int64_t i)
 {
     if (a.dt == ATH_DTYPE_I8)
-        return k_round(a.rnd, __fmul_rn((float)((const int8_t *)a.p)[i], a.s[i / n]));
+        return k_round(a.rnd, __fmul_rn((float)((const int8_t *)a.p)[i], a.s[i / a.g]));
     return k_ld(a.p, a.dt, i);
 }
 
-/* Elements 8e … 8e + 7, in one row (n a multiple of 8). */
-static __device__ __forceinline__ void kv_ld8(kvsrc a, int64_t e, int64_t n, float f[8])
+/* Elements 8e … 8e + 7, in one row (n a multiple of 8; I8: g too). */
+static __device__ __forceinline__ void kv_ld8(kvsrc a, int64_t e, float f[8])
 {
     if (a.dt != ATH_DTYPE_I8) {
         k_ld8(a.p, a.dt, e, f);
         return;
     }
     const uint2 u = ((const uint2 *)a.p)[e];
-    const float s = a.s[8 * e / n];
+    const float s = a.s[8 * e / a.g];
     const uint32_t w[2] = {u.x, u.y};
 #pragma unroll
     for (int i = 0; i < 8; i++)
@@ -113,7 +114,7 @@ static __device__ __forceinline__ void attn_piece(const float *qs, float *sc, in
             float kr[ATTN_KREG];
 #pragma unroll
             for (int i = 0; i < ATTN_KREG; i++)
-                kr[i] = lane + (int64_t)i * ATH_WARP < d ? kv_ld(k, kb + lane + (int64_t)i * ATH_WARP, d) : 0.0f;
+                kr[i] = lane + (int64_t)i * ATH_WARP < d ? kv_ld(k, kb + lane + (int64_t)i * ATH_WARP) : 0.0f;
             for (int g = 0; g < G; g++) {
                 float s = 0.0f;
 #pragma unroll
@@ -151,7 +152,7 @@ static __device__ __forceinline__ void attn_piece(const float *qs, float *sc, in
 #pragma unroll
                 for (int r = 0; r < ATTN_PER_THREAD; r++) {
                     const int64_t i = tid + (int64_t)r * ATTN_THREADS;
-                    vv[q][r] = j0 + q < n && i < dv ? kv_ld(v, vb + i, dv) : 0.0f;
+                    vv[q][r] = j0 + q < n && i < dv ? kv_ld(v, vb + i) : 0.0f;
                 }
             }
 #pragma unroll
@@ -333,7 +334,7 @@ static __device__ __forceinline__ void fast_piece(const float *qs, float *sc, fl
         for (int q = 0; q < FAST_KEYS; q++) {
             const int jj = warp * FAST_KEYS + q;
             if (jj < n && kq)
-                kv_ld8(k, (((t0 + jj) * nkv + kh) * d) / 8 + lane, d, kv[q]);
+                kv_ld8(k, (((t0 + jj) * nkv + kh) * d) / 8 + lane, kv[q]);
             else
 #pragma unroll
                 for (int i = 0; i < 8; i++)
@@ -387,7 +388,7 @@ static __device__ __forceinline__ void fast_piece(const float *qs, float *sc, fl
         for (int q = 0; q < FAST_KEYS; q++) {
             const int jj = warp * FAST_KEYS + q;
             if (jj < n && vq)
-                kv_ld8(v, (((t0 + jj) * nkv + kh) * dv) / 8 + lane, dv, kv[q]);
+                kv_ld8(v, (((t0 + jj) * nkv + kh) * dv) / 8 + lane, kv[q]);
         }
 #pragma unroll
         for (int q = 0; q < FAST_KEYS; q++) {
@@ -549,7 +550,7 @@ extern "C" ath_status ath_attn_launch(const ath_device *d, const ath_tensor *q, 
                                       const ath_tensor *v, const ath_tensor *pos, float scale, float *part,
                                       ath_tensor *out)
 {
-    const kvsrc ks = {k->data, k->dtype, NULL, 0}, vs = {v->data, v->dtype, NULL, 0};
+    const kvsrc ks = {k->data, k->dtype, NULL, 0, 1}, vs = {v->data, v->dtype, NULL, 0, 1};
     const bool aligned = (uintptr_t)k->data % 16 == 0 && (uintptr_t)v->data % 16 == 0;
     return attn_run(d, q, ks, vs, k->shape[0], k->shape[1], v->shape[2], aligned, pos, scale, part, out);
 }
@@ -558,8 +559,10 @@ extern "C" ath_status ath_attn_q8_launch(const ath_device *d, const ath_tensor *
                                          const ath_tensor *ks, const ath_tensor *v, const ath_tensor *vs,
                                          const ath_tensor *pos, float scale, float *part, ath_tensor *out)
 {
-    const kvsrc kq = {k->data, ATH_DTYPE_I8, (const float *)ks->data, q->dtype};
-    const kvsrc vq = {v->data, ATH_DTYPE_I8, (const float *)vs->data, q->dtype};
-    const bool aligned = (uintptr_t)k->data % 8 == 0 && (uintptr_t)v->data % 8 == 0;
+    const int64_t gk = k->shape[2] / ks->shape[2], gv = v->shape[2] / vs->shape[2];
+    const kvsrc kq = {k->data, ATH_DTYPE_I8, (const float *)ks->data, q->dtype, gk};
+    const kvsrc vq = {v->data, ATH_DTYPE_I8, (const float *)vs->data, q->dtype, gv};
+    /* the 8-value loads of the fast kernels need 8 values under one scale */
+    const bool aligned = (uintptr_t)k->data % 8 == 0 && (uintptr_t)v->data % 8 == 0 && gk % 8 == 0 && gv % 8 == 0;
     return attn_run(d, q, kq, vq, k->shape[0], k->shape[1], v->shape[2], aligned, pos, scale, part, out);
 }

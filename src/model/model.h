@@ -128,16 +128,16 @@ typedef struct {
     int32_t        layer;
     int64_t        fixed;       /* elements independent of the sequence length (CONV, RECURRENT) */
     int64_t        per_token;   /* elements per token (KV: keys and values)                      */
-    int64_t        row;         /* KV: elements of one row of the cache (a token's key or value
-                                 * for one head), which an int8 cache scales as one (step 14);
-                                 * 0: the state cannot hold this KV in int8                      */
+    int64_t        group;       /* KV: elements of a row of the cache (a token's key or value for
+                                 * one head) that an int8 cache scales as one (step 14); it
+                                 * divides the row; 0: the state cannot hold this KV in int8    */
 } ath_state_spec;
 
 /* A KV buffer of capacity C holds the keys [C, per_token / 2] and then the
  * values [C, per_token / 2] (step 14 makes this layout part of the
  * contract, for snapshots that keep the first rows only). In an int8 cache
- * (ath_state.kv ATH_DTYPE_I8) both are int8, followed by the keys' row
- * scales [C, per_token / 2 / row] and the values' (f32): ops.h, kv.c. */
+ * (ath_state.kv ATH_DTYPE_I8) both are int8, followed by the keys' group
+ * scales [C, per_token / 2 / group] and the values' (f32): ops.h, kv.c. */
 
 /* ---- text (step 5) ------------------------------------------------------------
  *
@@ -432,6 +432,22 @@ ath_status ath_state_reset(ath_state *s, const ath_model *m);
  * capacity or device. On a device the copy is queued on its compute
  * stream, in order with the forward passes. */
 ath_status ath_state_copy(ath_state *dst, const ath_state *src, const ath_model *m);
+
+/* Snapshots (step 14): a state's contents trimmed to the tokens it holds,
+ * in host memory, for src/infer/prefix.h. Of each KV buffer the first
+ * rows (the larger of n_past and n_draft: the keys', the values', and in
+ * int8 their scales'), of every other buffer all of it; in buffer order.
+ * The bytes do not depend on the capacity: loaded into a state of the same
+ * model and dtypes that holds at least those rows, the state continues as
+ * the one saved would, bit for bit. A state on a device is copied over the
+ * compute stream and waited for. */
+size_t     ath_state_snap_bytes(const ath_model *m, const ath_state *s);
+ath_status ath_state_snap_save(const ath_state *s, const ath_model *m, void *dst, size_t bytes);
+/* Load a snapshot of n_past and n_draft tokens (bytes as ath_state_snap_bytes
+ * gave for them) into s. ATH_ERR_RANGE if s cannot hold its rows,
+ * ATH_ERR_INVALID_ARG if bytes is not its size. */
+ath_status ath_state_snap_load(ath_state *s, const ath_model *m, int32_t n_past, int32_t n_draft, const void *src,
+                               size_t bytes);
 
 /* Run the draft head's rows d (ath_draft): its cache at their positions, and
  * the guess of the last row in d->logits. Checks the arguments like

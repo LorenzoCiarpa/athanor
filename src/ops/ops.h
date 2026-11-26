@@ -232,13 +232,17 @@ ath_status ath_attn_gpu(const ath_device *d, const ath_tensor *q, const ath_tens
 
 /* ---- kv.c (step 14): the KV cache in int8 ---------------------------------------
  *
- * A cache [S, nkv, d] of ATH_DTYPE_I8 with a scale per row (one token, one
- * KV head) in scale [S, nkv] f32. A row x is stored as q = rint(x / s),
- * s = max|x| / 127 (all zero for a zero row), and a value reads back as
- * q · s rounded to the activation dtype (bf16 or f32): the int8 cache is
- * the activation-dtype cache those values make, and attention over it
- * (ath_attn_q8) gives, bit for bit, what ath_attn gives over that cache.
- * The same arithmetic on the CPU and the GPU: the same bits. */
+ * A cache [S, nkv, d] of ATH_DTYPE_I8 with a scale per group of g
+ * consecutive values of a row (one token, one KV head) in scale
+ * [S, nkv, d / g] f32; g follows from the two shapes (it divides d). A
+ * group x is stored as q = rint(x / s), s = max|x| / 127 (all zero for a
+ * zero group), and a value reads back as q · s rounded to the activation
+ * dtype (bf16 or f32): the int8 cache is the activation-dtype cache those
+ * values make, and attention over it (ath_attn_q8) gives, bit for bit, what
+ * ath_attn gives over that cache. The same arithmetic on the CPU and the
+ * GPU: the same bits. The Qwen models use g = 32 (a scale per row of 256
+ * cost 2.4 times the bf16 noise in KL, almost all of it in the values:
+ * tests/README.md, KV cache in int8). */
 
 /* The rows of x [T, nkv, d] (f32 or bf16) into the rows pos[t] of cache and
  * scale. On the GPU pos is in device memory: a row whose position is
@@ -251,8 +255,9 @@ ath_status ath_kv_store_gpu(const ath_device *d, const ath_tensor *x, const ath_
 ath_status ath_kv_load_ref(const ath_tensor *cache, const ath_tensor *scale, ath_tensor *out);
 ath_status ath_kv_load_gpu(const ath_device *d, const ath_tensor *cache, const ath_tensor *scale, ath_tensor *out);
 /* ath_attn over int8 keys k [S, nkv, d] and values v [S, nkv, dv] with
- * their scales ks, vs [S, nkv], read back in q's dtype. On the GPU the
- * kernels of short batches (decode), whatever the number of queries. */
+ * their scales ks [S, nkv, d / g], vs [S, nkv, dv / gv], read back in q's
+ * dtype. On the GPU the kernels of short batches (decode), whatever the
+ * number of queries; the fast ones when g and gv are multiples of 8. */
 ath_status ath_attn_q8_ref(const ath_tensor *q, const ath_tensor *k, const ath_tensor *ks, const ath_tensor *v,
                            const ath_tensor *vs, const ath_tensor *pos, float scale, ath_tensor *out);
 ath_status ath_attn_q8_gpu(const ath_device *d, const ath_tensor *q, const ath_tensor *k, const ath_tensor *ks,

@@ -28,6 +28,7 @@
 #include "core/json.h"
 #include "core/rng.h"
 #include "infer/engine.h"
+#include "infer/prefix.h"
 #include "infer/spec.h"
 #include "model/model.h"
 #include "ops/ops.h"
@@ -64,7 +65,12 @@ void ath_cmd_chat_usage(FILE *out)
             "                       (default: as many as fit; the rest run on the CPU)\n"
             "  --f32                f32 activations instead of bf16 (slower)\n"
             "  --kv <bf16|q8>       the KV cache in the activation dtype (default) or in int8\n"
-            "                       with a scale per token and head (half the memory)\n"
+            "                       with a scale per 32 values (about half the memory)\n"
+            "  --snapshots <dir>    keep prefix snapshots in dir too, across runs: a system\n"
+            "                       prompt or conversation seen before starts from its snapshot\n"
+            "                       (default: in host memory only; with -p, only with a dir)\n"
+            "  --snap-ram <GiB>     host memory for snapshots (default 8)\n"
+            "  --snap-disk <GiB>    disk space for snapshots in dir (default 64)\n"
             "  --mtp                decode speculatively with the model's draft head: the same\n"
             "                       tokens, fewer passes (on a GPU slower than the default\n"
             "                       decoder until its passes are recorded too)\n"
@@ -72,8 +78,9 @@ void ath_cmd_chat_usage(FILE *out)
 }
 
 typedef struct {
-    const char  *dir, *prompt, *system, *tools_file, *device;
+    const char  *dir, *prompt, *system, *tools_file, *device, *snap_dir;
     bool         think, f32, stats, mtp, kv8;
+    double       snap_ram, snap_disk;   /* GiB, 0: the defaults */
     ath_sampler  sampler;
     bool         temp_set, top_p_set;
     uint64_t     seed;
@@ -154,8 +161,12 @@ typedef struct {
     ath_spec        *spec;          /* with --mtp: the speculative decoder (step 13)  */
     ath_exec         exec;          /* where the forward pass runs                   */
     ath_state        state, snap;
+    bool             has_snap;      /* snap exists (not with -p, nor when a second
+                                     * state does not fit on the device)              */
+    ath_prefix_store *store;        /* more snapshots, in host memory and on disk     */
     ath_tokens       seen;          /* the tokens the state holds                    */
-    size_t           snap_n;        /* the first snap_n of them are in snap; 0: none  */
+    ath_tokens       snap_ids;      /* the tokens snap holds                          */
+    size_t           snap_n;        /* their number; 0: none                          */
     ath_tensor       logits;
     ath_arena       *scratch;
     ath_rng          rng;
@@ -185,31 +196,74 @@ static ath_status feed(session *s, const int32_t *ids, size_t from, size_t to, b
     return ath_model_forward(&s->m, &b, &s->state, NULL, s->scratch, &s->exec);
 }
 
+static size_t common_prefix(const ath_tokens *a, const ath_tokens *b)
+{
+    size_t n = 0;
+    while (n < a->n && n < b->n && a->ids[n] == b->ids[n])
+        n++;
+    return n;
+}
+
+static ath_status set_tokens(ath_tokens *dst, const int32_t *ids, size_t n)
+{
+    dst->n = 0;
+    for (size_t i = 0; i < n; i++)
+        ATH_CHECK(ath_tokens_push(dst, ids[i]));
+    return ATH_OK;
+}
+
+/* Keep the state, which holds ids[0, stable), as the snapshot: in snap,
+ * the one there going to the store first unless the new one continues it;
+ * without snap, in the store (step 14). */
+static ath_status keep_snapshot(session *s, const ath_tokens *ids, size_t stable)
+{
+    if (!s->has_snap) {
+        if (ath_prefix_save(s->store, ids->ids, &s->state) != ATH_OK)
+            fprintf(stderr, "athanor chat: the snapshot of %zu tokens could not be stored\n", stable);
+        return ATH_OK;
+    }
+    const bool continues = s->snap_n <= stable && common_prefix(&s->snap_ids, ids) >= s->snap_n;
+    if (s->snap_n && !continues && ath_prefix_save(s->store, s->snap_ids.ids, &s->snap) != ATH_OK)
+        fprintf(stderr, "athanor chat: the snapshot of %zu tokens could not be stored\n", s->snap_n);
+    ATH_CHECK(ath_state_copy(&s->snap, &s->state, &s->m));
+    ATH_CHECK(set_tokens(&s->snap_ids, ids->ids, stable));
+    s->snap_n = stable;
+    return ATH_OK;
+}
+
 /* Bring the state to ids[0 .. stable) and then ids[stable .. n), keeping a
- * copy at stable. Returns the prompt tokens actually run in *ran. */
+ * copy at stable. It starts from the longest prefix of ids at hand: the
+ * state itself, the snapshot, a snapshot of the store (step 14), else the
+ * start. Returns the prompt tokens actually run in *ran. */
 static ath_status prefill(session *s, const ath_tokens *ids, size_t stable, size_t *ran)
 {
-    size_t common = 0;
-    while (common < s->seen.n && common < ids->n && s->seen.ids[common] == ids->ids[common])
-        common++;
-    if (common < s->seen.n) {
-        if (s->snap_n && s->snap_n <= common) {
-            ATH_CHECK(ath_state_copy(&s->state, &s->snap, &s->m));
-            s->seen.n = s->snap_n;
-        } else {
-            ATH_CHECK(ath_state_reset(&s->state, &s->m));
-            s->seen.n = 0;
+    const size_t goes_on = s->seen.n < ids->n && common_prefix(&s->seen, ids) == s->seen.n ? s->seen.n : 0;
+    const size_t from_snap =
+        s->has_snap && s->snap_n && s->snap_n < ids->n && common_prefix(&s->snap_ids, ids) >= s->snap_n ? s->snap_n
+                                                                                                       : 0;
+    const size_t stored = (size_t)ath_prefix_find(s->store, ids->ids, (int32_t)ids->n);
+    if (goes_on && goes_on >= from_snap && goes_on >= stored) {
+        /* the state goes on */
+    } else if (stored > from_snap && stored > goes_on &&
+               ath_prefix_load(s->store, ids->ids, (int32_t)stored, (int32_t)ids->n, &s->state) == ATH_OK) {
+        if (s->opt->stats) {
+            ath_prefix_stats ps;
+            ath_prefix_get_stats(s->store, &ps);
+            fprintf(stderr, "[%zu tokens from a stored snapshot: %.0f MiB from %s in %.2f s]\n", stored,
+                    (double)ps.load_bytes / 1048576.0, ps.load_disk ? "disk" : "host memory", ps.load_s);
         }
+        ATH_CHECK(set_tokens(&s->seen, ids->ids, stored));
+    } else if (from_snap) {
+        ATH_CHECK(ath_state_copy(&s->state, &s->snap, &s->m));
+        ATH_CHECK(set_tokens(&s->seen, s->snap_ids.ids, s->snap_n));
+    } else {
+        ATH_CHECK(ath_state_reset(&s->state, &s->m));
+        s->seen.n = 0;
     }
     size_t start = s->seen.n;
-    if (start >= ids->n) {   /* nothing new: the last token's logits are needed */
-        ATH_CHECK(ath_state_reset(&s->state, &s->m));
-        s->seen.n = 0, start = 0;
-    }
     if (start < stable) {
         ATH_CHECK(feed(s, ids->ids, start, stable, false));
-        ATH_CHECK(ath_state_copy(&s->snap, &s->state, &s->m));
-        s->snap_n = stable;
+        ATH_CHECK(keep_snapshot(s, ids, stable));
     }
     ATH_CHECK(feed(s, ids->ids, start > stable ? start : stable, ids->n, true));
     *ran = ids->n - start;
@@ -290,9 +344,10 @@ static ath_status turn(session *s, history *h, ath_arena *tmp)
     /* The stable part, where a copy of the state is kept: the conversation
      * up to the last message, without the assistant's header that follows
      * (the next turn renders this answer differently), when its tokens are
-     * a prefix of the prompt's. A single prompt (-p) keeps no copy. */
+     * a prefix of the prompt's. A single prompt (-p) keeps no copy, unless
+     * snapshots go to disk (step 14: the system prompt, for the next run). */
     size_t stable_n = 0;
-    if (!o->prompt && ath_model_chat(&s->m, h->msgs, h->n, s->tools, s->n_tools, 0, &stable) == ATH_OK &&
+    if ((!o->prompt || o->snap_dir) && ath_model_chat(&s->m, h->msgs, h->n, s->tools, s->n_tools, 0, &stable) == ATH_OK &&
         ath_tokenizer_encode(&s->tok, stable.data, stable.len, &stable_ids, s->scratch) == ATH_OK &&
         stable_ids.n <= ids.n && !memcmp(stable_ids.ids, ids.ids, stable_ids.n * sizeof *ids.ids))
         stable_n = stable_ids.n;
@@ -467,6 +522,9 @@ static int parse_options(options *o, int argc, char **argv)
         else if (!strcmp(a, "--experts") && num(v, 0, 1e6, &x)) o->experts = (int32_t)x;
         else if (!strcmp(a, "--device") && (!strcmp(v, "cpu") || !strcmp(v, "gpu"))) o->device = v;
         else if (!strcmp(a, "--kv") && (!strcmp(v, "bf16") || !strcmp(v, "q8"))) o->kv8 = !strcmp(v, "q8");
+        else if (!strcmp(a, "--snapshots")) o->snap_dir = v;
+        else if (!strcmp(a, "--snap-ram") && num(v, 0.001, 1 << 20, &x)) o->snap_ram = x;
+        else if (!strcmp(a, "--snap-disk") && num(v, 0.001, 1 << 24, &x)) o->snap_disk = x;
         else if (a[0] == '-')
             return usage_error("bad option or value:", a);
         else if (!o->dir) {
@@ -587,8 +645,11 @@ int ath_cmd_chat(ath_arena *a, int argc, char **argv)
     if (st == ATH_OK && s->engine) {
         s->exec = s->engine->exec;
         st = ath_engine_state_kv(s->engine, &s->state, act, kv, o.ctx, a);
-        if (st == ATH_OK && !o.prompt)
-            st = ath_engine_state_kv(s->engine, &s->snap, act, kv, o.ctx, a);
+        /* the snapshot on the device when a second state fits; otherwise
+         * snapshots go to the store only (step 14) */
+        s->has_snap = st == ATH_OK && !o.prompt && ath_engine_state_kv(s->engine, &s->snap, act, kv, o.ctx, a) == ATH_OK;
+        if (st == ATH_OK && !o.prompt && !s->has_snap)
+            fprintf(stderr, "athanor chat: no room for a second state on the device; snapshots in host memory\n");
         if (st == ATH_OK && !o.mtp) {
             ath_decoder *dec = ath_arena_zalloc(a, sizeof *dec, _Alignof(ath_decoder));
             st = dec ? ath_decoder_open(dec, s->engine, &s->state, &o.sampler, a) : ATH_ERR_NOMEM;
@@ -602,6 +663,13 @@ int ath_cmd_chat(ath_arena *a, int argc, char **argv)
         st = ath_state_init_kv(&s->state, &s->m, act, kv, o.ctx, a);
         if (st == ATH_OK && !o.prompt)
             st = ath_state_init_kv(&s->snap, &s->m, act, kv, o.ctx, a);
+        s->has_snap = st == ATH_OK && !o.prompt;
+    }
+    if (st == ATH_OK) {
+        const ath_prefix_opts po = {.dir = o.snap_dir,
+                                    .ram_bytes = (uint64_t)(o.snap_ram * 1073741824.0),
+                                    .disk_bytes = (uint64_t)(o.snap_disk * 1073741824.0)};
+        st = ath_prefix_open(&s->store, &s->m, act, kv, &po);
     }
     if (st == ATH_OK)
         st = ath_pool_init(&s->pool, o.threads, a);
@@ -617,6 +685,7 @@ int ath_cmd_chat(ath_arena *a, int argc, char **argv)
     }
     if (st == ATH_OK) {
         ath_tokens_init(&s->seen, a);
+        ath_tokens_init(&s->snap_ids, a);
         s->eos[0] = ath_tokenizer_added(&s->tok, "<|im_end|>");
         s->eos[1] = ath_tokenizer_added(&s->tok, "<|endoftext|>");
         rc = run(s, a);
@@ -624,6 +693,11 @@ int ath_cmd_chat(ath_arena *a, int argc, char **argv)
     } else {
         fprintf(stderr, "athanor chat: %s\n", ath_status_str(st));
     }
+    /* the snapshot outlives the run through the store */
+    if (s->store && o.snap_dir && s->has_snap && s->snap_n &&
+        ath_prefix_save(s->store, s->snap_ids.ids, &s->snap) != ATH_OK)
+        fprintf(stderr, "athanor chat: the snapshot of %zu tokens could not be stored\n", s->snap_n);
+    ath_prefix_close(s->store);
     if (s->dec)
         ath_decoder_close(s->dec);
     if (s->spec) {

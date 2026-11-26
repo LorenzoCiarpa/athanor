@@ -59,17 +59,27 @@ ath_status ath_gen_open(ath_gen *g, const char *dir, const ath_gen_opts *o, ath_
         ath_log(ATH_LOG_INFO, "serve: engine open; %.2f GiB of device memory free", (double)fr0 / 1073741824.0);
         g->exec = g->engine->exec;
         st = ath_engine_state_kv(g->engine, &g->state, ATH_DTYPE_BF16, kv, g->ctx, a);
-        if (st == ATH_OK)
-            st = ath_engine_state_kv(g->engine, &g->snap, ATH_DTYPE_BF16, kv, g->ctx, a);
+        /* the snapshot on the device, when a second state fits (step 14:
+         * otherwise snapshots go to the store only) */
+        g->has_snap = st == ATH_OK && ath_engine_state_kv(g->engine, &g->snap, ATH_DTYPE_BF16, kv, g->ctx, a) == ATH_OK;
         uint64_t fr = 0, tot = 0;
         ath_device_mem(&g->engine->dev, &fr, &tot);
-        ath_log(ATH_LOG_INFO, "serve: states %s; %.2f GiB of device memory free", st == ATH_OK ? "allocated" : "failed",
+        ath_log(ATH_LOG_INFO, "serve: %s; %.2f GiB of device memory free",
+                st != ATH_OK      ? "the state does not fit"
+                : g->has_snap     ? "state and snapshot allocated"
+                                  : "state allocated; no room for a snapshot on the device (snapshots in host memory)",
                 (double)fr / 1073741824.0);
     } else if (st == ATH_OK) {
         g->exec = (ath_exec){.pool = &g->pool};
         st = ath_state_init_kv(&g->state, &g->m, ATH_DTYPE_BF16, kv, g->ctx, a);
         if (st == ATH_OK)
             st = ath_state_init_kv(&g->snap, &g->m, ATH_DTYPE_BF16, kv, g->ctx, a);
+        g->has_snap = st == ATH_OK;
+    }
+    if (st == ATH_OK) {
+        const ath_prefix_opts po = {.dir = o->snap_dir, .ram_bytes = o->snap_ram, .disk_bytes = o->snap_disk};
+        st = ath_prefix_open(&g->store, &g->m, ATH_DTYPE_BF16, kv, &po);
+        g->snap_persist = o->snap_dir && o->snap_dir[0];
     }
     if (st == ATH_OK && o->mtp) {
         static const ath_sampler greedy = {0, 0, 1, 0, 0};
@@ -93,6 +103,12 @@ ath_status ath_gen_open(ath_gen *g, const char *dir, const ath_gen_opts *o, ath_
 
 void ath_gen_close(ath_gen *g)
 {
+    /* the snapshot on the device outlives the server through the store */
+    if (g->store && g->snap_persist && g->has_snap && g->snap_n &&
+        ath_prefix_save(g->store, g->snap_ids.ids, &g->snap) != ATH_OK)
+        ath_log(ATH_LOG_WARN, "serve: the snapshot of %zu tokens could not be stored", g->snap_n);
+    ath_prefix_close(g->store);
+    g->store = NULL;
     if (g->mtp)
         ath_spec_close(&g->spec);
     g->mtp = false;
@@ -169,16 +185,27 @@ static ath_status set_tokens(ath_tokens *dst, const int32_t *ids, size_t n)
     return ATH_OK;
 }
 
-/* Bring the state to the start of what is new in ids: on from the state
- * when it holds a prefix of ids, else from the snapshot when that is one,
- * else from the start. The tokens kept in *kept. */
+/* Bring the state to the start of what is new in ids, from the longest
+ * prefix of ids at hand: the state itself, the snapshot on the device, a
+ * snapshot of the store (step 14), else the start. The tokens kept in
+ * *kept. */
 static ath_status reuse(ath_gen *g, const ath_tokens *ids, size_t *kept)
 {
     const bool snap_fits = g->snap_n && g->snap_n < ids->n && common_prefix(&g->snap_ids, ids) >= g->snap_n;
     /* requests in a row that could not start from the snapshot */
     g->snap_misses = g->snap_n && !snap_fits ? g->snap_misses + 1 : 0;
-    if (g->seen.n < ids->n && common_prefix(&g->seen, ids) == g->seen.n) {
+    const size_t goes_on = g->seen.n < ids->n && common_prefix(&g->seen, ids) == g->seen.n ? g->seen.n : 0;
+    const size_t from_snap = snap_fits ? g->snap_n : 0;
+    const size_t stored = (size_t)ath_prefix_find(g->store, ids->ids, (int32_t)ids->n);
+    if (goes_on && goes_on >= from_snap && goes_on >= stored) {
         /* the state goes on */
+    } else if (stored > from_snap && stored > goes_on &&
+               ath_prefix_load(g->store, ids->ids, (int32_t)stored, (int32_t)ids->n, &g->state) == ATH_OK) {
+        ath_prefix_stats ps;
+        ath_prefix_get_stats(g->store, &ps);
+        ath_log(ATH_LOG_INFO, "serve: %zu tokens from a stored snapshot (%.0f MiB from %s in %.2f s)", stored,
+                (double)ps.load_bytes / 1048576.0, ps.load_disk ? "disk" : "host memory", ps.load_s);
+        ATH_CHECK(set_tokens(&g->seen, ids->ids, stored));
     } else if (snap_fits) {
         ATH_CHECK(ath_state_copy(&g->state, &g->snap, &g->m));
         ATH_CHECK(set_tokens(&g->seen, g->snap_ids.ids, g->snap_n));
@@ -187,6 +214,27 @@ static ath_status reuse(ath_gen *g, const ath_tokens *ids, size_t *kept)
         g->seen.n = 0;
     }
     *kept = g->seen.n;
+    return ATH_OK;
+}
+
+/* Keep the state, which holds ids[0, stable), as the snapshot: on the
+ * device, the one there going to the store first unless the new one
+ * continues it; without a snapshot on the device, in the store. A store
+ * that cannot take it (memory) costs a later prefill, not the request. */
+static ath_status keep_snapshot(ath_gen *g, const ath_tokens *ids, size_t stable)
+{
+    if (!g->has_snap) {
+        if (ath_prefix_save(g->store, ids->ids, &g->state) != ATH_OK)
+            ath_log(ATH_LOG_WARN, "serve: the snapshot of %zu tokens could not be stored", stable);
+        g->snap_n = 0;
+        return ATH_OK;
+    }
+    const bool continues = g->snap_n <= stable && common_prefix(&g->snap_ids, ids) >= g->snap_n;
+    if (g->snap_n && !continues && ath_prefix_save(g->store, g->snap_ids.ids, &g->snap) != ATH_OK)
+        ath_log(ATH_LOG_WARN, "serve: the snapshot of %zu tokens could not be stored", g->snap_n);
+    ATH_CHECK(ath_state_copy(&g->snap, &g->state, &g->m));
+    ATH_CHECK(set_tokens(&g->snap_ids, ids->ids, stable));
+    g->snap_n = stable;
     return ATH_OK;
 }
 
@@ -204,9 +252,7 @@ static ath_status prefill(ath_gen *g, const ath_tokens *ids, size_t stable, cons
         ATH_CHECK(feed(g, ids->ids, start, stable, false, sink, cancel));
         if (*cancel)
             return ATH_OK;
-        ATH_CHECK(ath_state_copy(&g->snap, &g->state, &g->m));
-        ATH_CHECK(set_tokens(&g->snap_ids, ids->ids, stable));
-        g->snap_n = stable;
+        ATH_CHECK(keep_snapshot(g, ids, stable));
         g->snap_misses = 0;
         if (sink->wait && !sink->wait(sink->u)) {
             *cancel = true;
